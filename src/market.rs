@@ -53,9 +53,99 @@ impl BinanceClient {
         interval: &str,
         limit: u32,
     ) -> Result<Vec<Candle>, String> {
+        self.get_klines_from(&self.base_url, symbol, interval, limit).await
+    }
+
+    /// Fetch klines from the production Binance API (public, no auth needed).
+    /// Useful for backtesting when the configured base_url is a testnet with limited history.
+    pub async fn get_klines_public(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> Result<Vec<Candle>, String> {
+        self.get_klines_from("https://api.binance.com", symbol, interval, limit).await
+    }
+
+    /// Fetch extended kline history by paginating backwards. Returns up to `total` candles.
+    /// Uses the production API.
+    pub async fn get_klines_extended(
+        &self,
+        symbol: &str,
+        interval: &str,
+        total: usize,
+    ) -> Result<Vec<Candle>, String> {
+        let base_url = "https://api.binance.com";
+        let mut all_candles: Vec<Candle> = Vec::new();
+        let mut end_time: Option<u64> = None;
+
+        while all_candles.len() < total {
+            let limit = 1000.min(total - all_candles.len()) as u32;
+            let url = match end_time {
+                Some(et) => format!(
+                    "{base_url}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}&endTime={et}"
+                ),
+                None => format!(
+                    "{base_url}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+                ),
+            };
+
+            let response: Vec<Vec<serde_json::Value>> = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("HTTP error: {e}"))?
+                .json()
+                .await
+                .map_err(|e| format!("JSON parse error: {e}"))?;
+
+            if response.is_empty() {
+                break;
+            }
+
+            let batch: Vec<Candle> = response
+                .into_iter()
+                .filter_map(|k| {
+                    if k.len() < 7 { return None; }
+                    Some(Candle {
+                        open_time: k[0].as_u64()?,
+                        open: k[1].as_str()?.parse().ok()?,
+                        high: k[2].as_str()?.parse().ok()?,
+                        low: k[3].as_str()?.parse().ok()?,
+                        close: k[4].as_str()?.parse().ok()?,
+                        volume: k[5].as_str()?.parse().ok()?,
+                        close_time: k[6].as_u64()?,
+                    })
+                })
+                .collect();
+
+            if batch.is_empty() {
+                break;
+            }
+
+            // Next page ends just before the earliest candle in this batch
+            end_time = Some(batch[0].open_time.saturating_sub(1));
+
+            // Prepend batch (we're walking backwards)
+            let mut combined = batch;
+            combined.append(&mut all_candles);
+            all_candles = combined;
+        }
+
+        Ok(all_candles)
+    }
+
+    async fn get_klines_from(
+        &self,
+        base_url: &str,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> Result<Vec<Candle>, String> {
         let url = format!(
             "{}/api/v3/klines?symbol={}&interval={}&limit={}",
-            self.base_url, symbol, interval, limit
+            base_url, symbol, interval, limit
         );
 
         let response: Vec<Vec<serde_json::Value>> = self

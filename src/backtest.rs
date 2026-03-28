@@ -43,9 +43,10 @@ pub async fn run(client: &BinanceClient, symbols: &[String]) {
 }
 
 async fn backtest_symbol(client: &BinanceClient, symbol: &str) -> Result<(), String> {
-    // Fetch maximum historical data
-    let daily = client.get_klines(symbol, "1d", 1000).await?;
-    let four_hour = client.get_klines(symbol, "4h", 1000).await?;
+    // Fetch maximum historical data from production API (testnet has limited history)
+    // Daily: 1000 candles = ~2.7 years. 4H: paginate to cover the same period (~6000 candles).
+    let daily = client.get_klines_public(symbol, "1d", 1000).await?;
+    let four_hour = client.get_klines_extended(symbol, "4h", 6000).await?;
 
     if daily.len() < 210 {
         return Err(format!("Only {} daily candles available, need 210+", daily.len()));
@@ -68,6 +69,13 @@ async fn backtest_symbol(client: &BinanceClient, symbol: &str) -> Result<(), Str
     let mut position: Option<SimPosition> = None;
     let mut peak_balance = balance;
     let mut max_drawdown = 0.0_f64;
+
+    // Diagnostics: count how often each condition is true
+    let mut diag_evaluated = 0u32;
+    let mut diag_trend = 0u32;
+    let mut diag_rsi = 0u32;
+    let mut diag_macd = 0u32;
+    let mut diag_rr = 0u32;
 
     // Walk through daily candles from index 200 onward (need 200 for EMA200 warmup)
     for i in 200..daily.len() {
@@ -120,6 +128,18 @@ async fn backtest_symbol(client: &BinanceClient, symbol: &str) -> Result<(), Str
             Some(s) => s,
             None => continue,
         };
+
+        // Track condition hits for diagnostics
+        diag_evaluated += 1;
+        let trend_ok = snap.current_price > snap.ema_50 && snap.ema_50 > snap.ema_200;
+        let rsi_ok = snap.rsi_14 >= 35.0 && snap.rsi_14 <= 55.0;
+        let macd_ok = snap.macd_crossed_bullish_recently;
+        let stop_dist = snap.current_price - snap.swing_low;
+        let rr_ok = stop_dist > 0.0; // RR is always 2.0 by construction
+        if trend_ok { diag_trend += 1; }
+        if rsi_ok { diag_rsi += 1; }
+        if macd_ok { diag_macd += 1; }
+        if rr_ok { diag_rr += 1; }
 
         let signal = strategy::evaluate(symbol, &snap);
 
@@ -202,7 +222,14 @@ async fn backtest_symbol(client: &BinanceClient, symbol: &str) -> Result<(), Str
         });
     }
 
-    // --- Print report ---
+    // --- Print diagnostics & report ---
+    println!();
+    println!("  Signal Diagnostics ({diag_evaluated} days evaluated):");
+    println!("    Trend  (price > EMA50 > EMA200): {diag_trend:>4} days ({:.1}%)", diag_trend as f64 / diag_evaluated.max(1) as f64 * 100.0);
+    println!("    RSI    (35-55):                   {diag_rsi:>4} days ({:.1}%)", diag_rsi as f64 / diag_evaluated.max(1) as f64 * 100.0);
+    println!("    MACD   (bullish cross last 3):    {diag_macd:>4} days ({:.1}%)", diag_macd as f64 / diag_evaluated.max(1) as f64 * 100.0);
+    println!("    R:R    (stop > 0):                {diag_rr:>4} days ({:.1}%)", diag_rr as f64 / diag_evaluated.max(1) as f64 * 100.0);
+
     print_report(symbol, &trades, balance, max_drawdown);
 
     Ok(())
