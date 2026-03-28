@@ -248,13 +248,13 @@ impl BinanceClient {
         let ts = self.timestamp_ms();
         let qty_str = format_quantity(quantity);
         let query = format!(
-            "symbol={symbol}&side={side}&type=MARKET&quantity={qty_str}&timestamp={ts}"
+            "symbol={symbol}&side={side}&type=MARKET&quantity={qty_str}&newOrderRespType=FULL&timestamp={ts}"
         );
         let sig = self.sign(&query);
         let body = format!("{query}&signature={sig}");
         let url = format!("{}/api/v3/order", self.base_url);
 
-        self.http
+        let result: serde_json::Value = self.http
             .post(&url)
             .header("X-MBX-APIKEY", &self.api_key)
             .header("Content-Type", "application/x-www-form-urlencoded")
@@ -264,7 +264,16 @@ impl BinanceClient {
             .map_err(|e| format!("HTTP error: {e}"))?
             .json()
             .await
-            .map_err(|e| format!("JSON parse error: {e}"))
+            .map_err(|e| format!("JSON parse error: {e}"))?;
+
+        if let Some(code) = result.get("code").and_then(|c| c.as_i64()) {
+            if code != 0 {
+                let msg = result["msg"].as_str().unwrap_or("unknown error");
+                return Err(format!("Binance API error {code}: {msg}"));
+            }
+        }
+
+        Ok(result)
     }
 
     /// Place an OCO sell order (take-profit limit + stop-loss limit).

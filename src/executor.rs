@@ -123,7 +123,10 @@ impl<'a> Executor<'a> {
             .await
         {
             Ok(result) => {
-                let sell_price = weighted_fill_price(&result).unwrap_or(0.0);
+                let sell_price = weighted_fill_price(&result).unwrap_or_else(|| {
+                    warn!("Could not parse fill price from response: {}", result);
+                    0.0
+                });
                 let pnl = (sell_price - position.entry_price) * position.quantity;
                 let pnl_pct =
                     (sell_price - position.entry_price) / position.entry_price * 100.0;
