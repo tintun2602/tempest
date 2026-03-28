@@ -264,6 +264,16 @@ async fn reconcile_positions(
                     }
                 };
 
+                // Skip dust balances (< $5 notional) — these are leftover
+                // fractional amounts, not real positions.
+                let notional = qty * price;
+                if notional < 5.0 {
+                    info!(
+                        "[RECONCILE] {asset}: skipping dust ({qty:.8} {asset} ≈ ${notional:.2})"
+                    );
+                    continue;
+                }
+
                 // Conservative 3% stop-loss and 6% take-profit from current price
                 let stop = price * 0.97;
                 let tp = price * 1.06;

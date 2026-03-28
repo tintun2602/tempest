@@ -157,21 +157,31 @@ impl<'a> Executor<'a> {
 }
 
 /// Compute volume-weighted average fill price from Binance order response.
+/// Falls back to cummulativeQuoteQty / executedQty if fills array is missing.
 fn weighted_fill_price(order: &serde_json::Value) -> Option<f64> {
-    let fills = order["fills"].as_array()?;
-    if fills.is_empty() {
-        return None;
+    // Primary: VWAP from fills array
+    if let Some(fills) = order["fills"].as_array() {
+        let mut total_cost = 0.0_f64;
+        let mut total_qty = 0.0_f64;
+        for fill in fills {
+            if let (Some(p), Some(q)) = (
+                fill["price"].as_str().and_then(|s| s.parse::<f64>().ok()),
+                fill["qty"].as_str().and_then(|s| s.parse::<f64>().ok()),
+            ) {
+                total_cost += p * q;
+                total_qty += q;
+            }
+        }
+        if total_qty > 0.0 {
+            return Some(total_cost / total_qty);
+        }
     }
-    let mut total_cost = 0.0_f64;
-    let mut total_qty = 0.0_f64;
-    for fill in fills {
-        let p: f64 = fill["price"].as_str()?.parse().ok()?;
-        let q: f64 = fill["qty"].as_str()?.parse().ok()?;
-        total_cost += p * q;
-        total_qty += q;
-    }
-    if total_qty > 0.0 {
-        Some(total_cost / total_qty)
+
+    // Fallback: cummulativeQuoteQty / executedQty
+    let quote_qty: f64 = order["cummulativeQuoteQty"].as_str()?.parse().ok()?;
+    let exec_qty: f64 = order["executedQty"].as_str()?.parse().ok()?;
+    if exec_qty > 0.0 {
+        Some(quote_qty / exec_qty)
     } else {
         None
     }
