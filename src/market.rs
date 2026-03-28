@@ -221,7 +221,7 @@ impl BinanceClient {
 
         let balances = resp["balances"]
             .as_array()
-            .ok_or("No balances array in response")?;
+            .ok_or_else(|| format!("No balances array in response: {resp}"))?;
 
         for b in balances {
             if b["asset"].as_str() == Some("USDT") {
@@ -373,7 +373,7 @@ impl BinanceClient {
 
         let balances = resp["balances"]
             .as_array()
-            .ok_or("No balances array in response")?;
+            .ok_or_else(|| format!("No balances array in response: {resp}"))?;
 
         let mut result = Vec::new();
         for b in balances {

@@ -1,5 +1,5 @@
 # ---- Build stage ----
-FROM rust:1.78-bookworm AS builder
+FROM rust:1.85-bookworm AS builder
 WORKDIR /app
 
 # Cache dependencies: copy manifests, build with a dummy main
