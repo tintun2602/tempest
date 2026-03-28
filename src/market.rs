@@ -28,7 +28,10 @@ impl BinanceClient {
             base_url: config.base_url.clone(),
             api_key: config.api_key.clone(),
             api_secret: config.api_secret.clone(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+                .build()
+                .expect("Failed to build HTTP client"),
         }
     }
 
