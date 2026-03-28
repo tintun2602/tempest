@@ -4,9 +4,9 @@ primary_region = "sjc"
 [build]
 
 [env]
-  BINANCE_BASE_URL = "https://testnet.binance.vision"
-  TRADING_PAIRS = "BTCUSDT,ETHUSDT,SOLUSDT"
-  POLL_INTERVAL_SECONDS = "300"
+  BINANCE_BASE_URL = "https://api.binance.com"
+  TRADING_PAIRS = "BTCUSDT"
+  POLL_INTERVAL_SECONDS = "14400"
   LOG_LEVEL = "info"
 
 [[vm]]
