@@ -1,0 +1,15 @@
+app = "binance-bot"
+primary_region = "sjc"
+
+[build]
+
+[env]
+  BINANCE_BASE_URL = "https://testnet.binance.vision"
+  TRADING_PAIRS = "BTCUSDT,ETHUSDT,SOLUSDT"
+  POLL_INTERVAL_SECONDS = "300"
+  LOG_LEVEL = "info"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  cpus = 1

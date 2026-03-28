@@ -4,27 +4,45 @@ pub struct Config {
     pub base_url: String,
     pub api_key: String,
     pub api_secret: String,
+    pub trading_pairs: Vec<String>,
+    pub poll_interval_secs: u64,
+    pub backtest_mode: bool,
 }
 
 impl Config {
-    pub fn new(base_url: String, api_key: String, api_secret: String) -> Self {
-        Self {
-            base_url,
-            api_key,
-            api_secret,
-        }
-    }
-
     pub fn from_env() -> Self {
-        dotenvy::dotenv().expect("Failed to load .env file");
+        dotenvy::dotenv().ok();
 
-        let base_url = env::var("BINANCE_BASE_URL").expect("Missing BINANCE_BASE_URL");
-        let api_key = env::var("BINANCE_API_KEY").expect("Missing BINANCE_API_KEY");
-        let api_secret = env::var("BINANCE_API_SECRET").expect("Missing BINANCE_API_SECRET");
+        let base_url = env::var("BINANCE_BASE_URL")
+            .unwrap_or_else(|_| "https://testnet.binance.vision".to_string());
+        let api_key = env::var("BINANCE_API_KEY").expect("BINANCE_API_KEY must be set");
+        let api_secret = env::var("BINANCE_API_SECRET").expect("BINANCE_API_SECRET must be set");
+
+        let pairs_str = env::var("TRADING_PAIRS")
+            .unwrap_or_else(|_| "BTCUSDT,ETHUSDT,SOLUSDT".to_string());
+        let trading_pairs: Vec<String> =
+            pairs_str.split(',').map(|s| s.trim().to_string()).collect();
+
+        let poll_interval_secs: u64 = env::var("POLL_INTERVAL_SECONDS")
+            .unwrap_or_else(|_| "300".to_string())
+            .parse()
+            .expect("POLL_INTERVAL_SECONDS must be a number");
+
+        let log_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+        if env::var("RUST_LOG").is_err() {
+            unsafe { env::set_var("RUST_LOG", &log_level) };
+        }
+
+        let backtest_mode = env::var("MODE").unwrap_or_default() == "backtest"
+            || env::args().any(|a| a == "--backtest");
+
         Self {
             base_url,
             api_key,
             api_secret,
+            trading_pairs,
+            poll_interval_secs,
+            backtest_mode,
         }
     }
 }
