@@ -36,6 +36,7 @@ fly.toml
 ## Setup
 
 1. Clone and create a `.env` file:
+
    ```
    BINANCE_API_KEY=your_key
    BINANCE_API_SECRET=your_secret
@@ -46,6 +47,7 @@ fly.toml
    ```
 
 2. Optional — Telegram alerts:
+
    ```
    TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
    TELEGRAM_CHAT_ID=your_chat_id
@@ -74,18 +76,21 @@ Fetches up to 1000 daily + 1000 4H candles per pair and prints a report with win
 ## Trading Logic
 
 ### Entry (BUY) — all must be true:
+
 1. Price > EMA(50) > EMA(200) on daily
 2. RSI(14) daily between 35 and 55
 3. MACD crossed bullish within last 3 four-hour candles
 4. Reward-to-risk ratio >= 2.0
 
 ### Exit (SELL) — any of:
+
 1. Stop-loss hit (nearest swing low)
 2. Take-profit hit (2x stop distance)
 3. RSI > 70 and MACD histogram negative
 4. `FORCE_CLOSE=true` environment variable
 
 ### Risk Rules (hardcoded, non-negotiable):
+
 - Max risk per trade: 1.5% of USDT balance
 - Position size: `(balance * 0.015) / stop_distance`
 - Max simultaneous positions: 4
@@ -94,12 +99,14 @@ Fetches up to 1000 daily + 1000 4H candles per pair and prints a report with win
 ## Deployment
 
 ### Docker
+
 ```bash
 docker build -t tempest .
 docker run --env-file .env tempest
 ```
 
 ### Fly.io
+
 ```bash
 fly secrets set BINANCE_API_KEY=... BINANCE_API_SECRET=...
 fly deploy
@@ -107,14 +114,14 @@ fly deploy
 
 ## Dependencies
 
-| Crate | Purpose |
-|-------|---------|
-| `reqwest` | HTTP client for Binance REST API |
-| `tokio` | Async runtime |
-| `serde` / `serde_json` | JSON serialization |
-| `hmac` / `sha2` / `hex` | HMAC-SHA256 request signing |
-| `dotenvy` | Load `.env` config |
-| `tracing` / `tracing-subscriber` | Structured logging |
+| Crate                            | Purpose                          |
+| -------------------------------- | -------------------------------- |
+| `reqwest`                        | HTTP client for Binance REST API |
+| `tokio`                          | Async runtime                    |
+| `serde` / `serde_json`           | JSON serialization               |
+| `hmac` / `sha2` / `hex`          | HMAC-SHA256 request signing      |
+| `dotenvy`                        | Load `.env` config               |
+| `tracing` / `tracing-subscriber` | Structured logging               |
 
 ## License
 
