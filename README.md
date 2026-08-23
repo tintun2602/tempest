@@ -51,6 +51,9 @@ fly.toml
    TELEGRAM_CHAT_ID=your_chat_id
    ```
 
+   To trade a USDC pair instead, set `QUOTE_ASSET=USDC` and use a supported pair,
+   for example `TRADING_PAIRS=BTCUSDC`.
+
 3. Build and run:
    ```bash
    cargo run

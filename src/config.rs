@@ -4,6 +4,7 @@ pub struct Config {
     pub base_url: String,
     pub api_key: String,
     pub api_secret: String,
+    pub quote_asset: String,
     pub trading_pairs: Vec<String>,
     pub poll_interval_secs: u64,
     pub backtest_mode: bool,
@@ -17,6 +18,7 @@ impl Config {
             .unwrap_or_else(|_| "https://testnet.binance.vision".to_string());
         let api_key = env::var("BINANCE_API_KEY").expect("BINANCE_API_KEY must be set");
         let api_secret = env::var("BINANCE_API_SECRET").expect("BINANCE_API_SECRET must be set");
+        let quote_asset = env::var("QUOTE_ASSET").unwrap_or_else(|_| "USDT".to_string());
 
         let pairs_str = env::var("TRADING_PAIRS")
             .unwrap_or_else(|_| "BTCUSDT,ETHUSDT,SOLUSDT".to_string());
@@ -40,6 +42,7 @@ impl Config {
             base_url,
             api_key,
             api_secret,
+            quote_asset,
             trading_pairs,
             poll_interval_secs,
             backtest_mode,

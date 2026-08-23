@@ -5,6 +5,7 @@ use tracing::{debug, warn};
 pub struct Notifier {
     token: Option<String>,
     chat_id: Option<String>,
+    quote_asset: String,
     http: reqwest::Client,
 }
 
@@ -12,6 +13,7 @@ impl Notifier {
     pub fn from_env() -> Self {
         let token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
         let chat_id = std::env::var("TELEGRAM_CHAT_ID").ok();
+        let quote_asset = std::env::var("QUOTE_ASSET").unwrap_or_else(|_| "USDT".to_string());
 
         if token.is_some() && chat_id.is_some() {
             tracing::info!("Telegram notifications enabled");
@@ -22,8 +24,13 @@ impl Notifier {
         Self {
             token,
             chat_id,
+            quote_asset,
             http: reqwest::Client::new(),
         }
+    }
+
+    pub fn quote_asset(&self) -> &str {
+        &self.quote_asset
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -99,7 +106,8 @@ impl Notifier {
         let msg = format!(
             "{emoji} *SELL {symbol}*\n\
              Price: `{price:.2}`\n\
-             PnL: `{pnl:+.2}` USDT (`{pnl_pct:+.2}%`)"
+             PnL: `{pnl:+.2}` {} (`{pnl_pct:+.2}%`)"
+            , self.quote_asset
         );
         self.send(&msg).await;
     }
@@ -108,8 +116,9 @@ impl Notifier {
         let msg = format!(
             "\u{1f6d1} *HALT — Daily Drawdown Limit*\n\
              Drawdown: `{drawdown_pct:.2}%`\n\
-             Equity: `{equity:.2}` USDT\n\
+             Equity: `{equity:.2}` {}\n\
              _No new trades until next UTC midnight._"
+            , self.quote_asset
         );
         self.send(&msg).await;
     }
@@ -142,8 +151,9 @@ impl Notifier {
         let pairs_str = pairs.join(", ");
         let msg = format!(
             "\u{1f680} *Bot Started*\n\
-             Equity: `{equity:.2}` USDT\n\
+             Equity: `{equity:.2}` {}\n\
              Pairs: {pairs_str}"
+            , self.quote_asset
         );
         self.send(&msg).await;
     }

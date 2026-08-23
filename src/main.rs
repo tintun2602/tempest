@@ -43,15 +43,15 @@ async fn main() {
     let equity = match fetch_equity(&client, &config).await {
         Ok(eq) => {
             info!(
-                "Starting equity: {:.2} USDT ({:.2} free)",
-                eq.total, eq.free_usdt
+                "Starting equity: {:.2} {} ({:.2} free)",
+                eq.total, config.quote_asset, eq.free_quote
             );
             eq
         }
         Err(e) => {
             error!("Failed to fetch initial equity: {e}. Starting with 0.");
             Equity {
-                free_usdt: 0.0,
+                free_quote: 0.0,
                 total: 0.0,
             }
         }
@@ -172,7 +172,7 @@ async fn run_cycle(
                 }
                 let (qty, _) = risk_manager.calculate_position_size(
                     equity.total,
-                    equity.free_usdt,
+                    equity.free_quote,
                     signal.entry_price,
                     signal.stop_loss,
                 );
@@ -212,10 +212,11 @@ async fn run_cycle(
     }
 
     info!(
-        "Cycle complete | open positions: {} | equity: {:.2} USDT ({:.2} free)",
+        "Cycle complete | open positions: {} | equity: {:.2} {} ({:.2} free)",
         risk_manager.positions.len(),
         equity.total,
-        equity.free_usdt
+        config.quote_asset,
+        equity.free_quote
     );
     Ok(())
 }
@@ -223,7 +224,7 @@ async fn run_cycle(
 /// Portfolio value split into the cash that can fund new entries and the total
 /// that risk limits are measured against.
 struct Equity {
-    free_usdt: f64,
+    free_quote: f64,
     total: f64,
 }
 
@@ -233,11 +234,11 @@ struct Equity {
 /// A pricing failure is an error rather than a skipped asset: silently omitting
 /// a position understates equity and would trip the drawdown halt.
 async fn fetch_equity(client: &BinanceClient, config: &Config) -> Result<Equity, String> {
-    let account = client.get_account().await?;
-    let mut total = account.free_usdt;
+    let account = client.get_account(&config.quote_asset).await?;
+    let mut total = account.free_quote;
 
     for (asset, qty) in &account.assets {
-        let symbol = format!("{asset}USDT");
+        let symbol = format!("{asset}{}", config.quote_asset);
         if !config.trading_pairs.contains(&symbol) {
             continue;
         }
@@ -249,7 +250,7 @@ async fn fetch_equity(client: &BinanceClient, config: &Config) -> Result<Equity,
     }
 
     Ok(Equity {
-        free_usdt: account.free_usdt,
+        free_quote: account.free_quote,
         total,
     })
 }
@@ -266,7 +267,7 @@ async fn reconcile_positions(
 ) {
     info!("[RECONCILE] Scanning exchange for existing positions...");
 
-    let held = match client.get_nonzero_balances().await {
+    let held = match client.get_nonzero_balances(&config.quote_asset).await {
         Ok(b) => b,
         Err(e) => {
             error!("[RECONCILE] Failed to fetch balances: {e}");
@@ -280,7 +281,7 @@ async fn reconcile_positions(
 
     for (asset, qty) in &held {
         // Match asset to a configured trading pair (e.g. "BTC" -> "BTCUSDT")
-        let symbol = format!("{asset}USDT");
+        let symbol = format!("{asset}{}", config.quote_asset);
         if !config.trading_pairs.contains(&symbol) {
             continue;
         }

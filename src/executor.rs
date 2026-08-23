@@ -131,8 +131,8 @@ impl<'a> Executor<'a> {
                 let pnl_pct =
                     (sell_price - position.entry_price) / position.entry_price * 100.0;
                 info!(
-                    "SELL filled: {} @ {:.2} | PnL {:.2} USDT ({:+.2}%)",
-                    symbol, sell_price, pnl, pnl_pct
+                    "SELL filled: {} @ {:.2} | PnL {:.2} {} ({:+.2}%)",
+                    symbol, sell_price, pnl, self.notifier.quote_asset(), pnl_pct
                 );
                 self.notifier
                     .notify_sell(symbol, sell_price, pnl, pnl_pct)

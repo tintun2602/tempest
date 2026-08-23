@@ -19,7 +19,7 @@ pub struct Candle {
 /// balance (free + locked, so assets reserved by an open OCO still count).
 #[derive(Debug, Clone)]
 pub struct AccountSnapshot {
-    pub free_usdt: f64,
+    pub free_quote: f64,
     pub assets: Vec<(String, f64)>,
 }
 
@@ -213,7 +213,7 @@ impl BinanceClient {
     /// non-zero non-USDT asset. `get_nonzero_balances` is a thin wrapper over
     /// this — prefer this when both halves of the snapshot are needed, since
     /// each call costs a separate signed request.
-    pub async fn get_account(&self) -> Result<AccountSnapshot, String> {
+    pub async fn get_account(&self, quote_asset: &str) -> Result<AccountSnapshot, String> {
         let ts = self.timestamp_ms();
         let query = format!("timestamp={ts}");
         let sig = self.sign(&query);
@@ -237,7 +237,7 @@ impl BinanceClient {
             .as_array()
             .ok_or_else(|| format!("No balances array in response: {resp}"))?;
 
-        let mut free_usdt = 0.0;
+        let mut free_quote = 0.0;
         let mut assets = Vec::new();
 
         for b in balances {
@@ -251,14 +251,14 @@ impl BinanceClient {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0);
 
-            if asset == "USDT" {
-                free_usdt = free;
+            if asset == quote_asset {
+                free_quote = free;
             } else if free + locked > 0.0 {
                 assets.push((asset.to_string(), free + locked));
             }
         }
 
-        Ok(AccountSnapshot { free_usdt, assets })
+        Ok(AccountSnapshot { free_quote, assets })
     }
 
     /// Place a market order (BUY or SELL).
@@ -386,8 +386,11 @@ impl BinanceClient {
     }
 
     /// Get all non-zero non-USDT balances (asset name → free + locked amount).
-    pub async fn get_nonzero_balances(&self) -> Result<Vec<(String, f64)>, String> {
-        Ok(self.get_account().await?.assets)
+    pub async fn get_nonzero_balances(
+        &self,
+        quote_asset: &str,
+    ) -> Result<Vec<(String, f64)>, String> {
+        Ok(self.get_account(quote_asset).await?.assets)
     }
 }
 
@@ -414,6 +417,7 @@ mod tests {
             base_url: "https://testnet.binance.vision".to_string(),
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
+            quote_asset: "USDT".to_string(),
             trading_pairs: vec![],
             poll_interval_secs: 300,
             backtest_mode: false,
