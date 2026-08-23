@@ -71,7 +71,7 @@ cargo run -- --backtest
 MODE=backtest cargo run
 ```
 
-Fetches up to 1000 daily + 1000 4H candles per pair and prints a report with win rate, profit factor, max drawdown, and a full trade log.
+Fetches up to 1000 daily + 1000 4H candles per pair and prints a report with win rate, profit factor, max drawdown, a full trade log, and a Monte Carlo stress analysis. The Monte Carlo section resamples historical trade returns to estimate final-balance ranges, drawdown, and losing streaks; it does not predict future performance.
 
 ## Trading Logic
 

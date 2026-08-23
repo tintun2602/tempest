@@ -1,9 +1,11 @@
 use crate::market::{BinanceClient, Candle};
 use crate::risk::RiskManager;
 use crate::strategy::{self, Signal};
+use rand::Rng;
 use tracing::info;
 
 const STARTING_BALANCE: f64 = 10_000.0;
+const MONTE_CARLO_RUNS: usize = 10_000;
 
 #[derive(Debug)]
 struct SimTrade {
@@ -234,8 +236,79 @@ async fn backtest_symbol(client: &BinanceClient, symbol: &str) -> Result<(), Str
     println!("    R:R    (stop > 0):                {diag_rr:>4} days ({:.1}%)", diag_rr as f64 / diag_evaluated.max(1) as f64 * 100.0);
 
     print_report(symbol, &trades, balance, max_drawdown);
+    print_monte_carlo_report(&trades);
 
     Ok(())
+}
+
+fn print_monte_carlo_report(trades: &[SimTrade]) {
+    if trades.is_empty() {
+        println!("\nMonte Carlo: skipped (no completed trades)");
+        return;
+    }
+
+    let returns: Vec<f64> = trades.iter().map(|trade| trade.pnl_pct / 100.0).collect();
+    let mut final_balances = Vec::with_capacity(MONTE_CARLO_RUNS);
+    let mut max_drawdowns = Vec::with_capacity(MONTE_CARLO_RUNS);
+    let mut worst_losing_streak = Vec::with_capacity(MONTE_CARLO_RUNS);
+    let mut rng = rand::thread_rng();
+
+    for _ in 0..MONTE_CARLO_RUNS {
+        let mut balance = STARTING_BALANCE;
+        let mut peak = balance;
+        let mut max_drawdown: f64 = 0.0;
+        let mut losing_streak = 0usize;
+        let mut longest_losing_streak = 0usize;
+
+        for _ in 0..returns.len() {
+            let trade_return = returns[rng.gen_range(0..returns.len())];
+            balance *= 1.0 + trade_return;
+            peak = peak.max(balance);
+            if peak > 0.0 {
+                max_drawdown = max_drawdown.max((peak - balance) / peak);
+            }
+
+            if trade_return < 0.0 {
+                losing_streak += 1;
+                longest_losing_streak = longest_losing_streak.max(losing_streak);
+            } else {
+                losing_streak = 0;
+            }
+        }
+
+        final_balances.push(balance);
+        max_drawdowns.push(max_drawdown * 100.0);
+        worst_losing_streak.push(longest_losing_streak as f64);
+    }
+
+    final_balances.sort_by(f64::total_cmp);
+    max_drawdowns.sort_by(f64::total_cmp);
+    worst_losing_streak.sort_by(f64::total_cmp);
+
+    println!("\n  Monte Carlo ({} runs, trade returns resampled):", MONTE_CARLO_RUNS);
+    println!(
+        "    Final balance p5 / p50 / p95: {:.2} / {:.2} / {:.2}",
+        percentile(&final_balances, 0.05),
+        percentile(&final_balances, 0.50),
+        percentile(&final_balances, 0.95)
+    );
+    println!(
+        "    Max drawdown p5 / p50 / p95:   {:.2}% / {:.2}% / {:.2}%",
+        percentile(&max_drawdowns, 0.05),
+        percentile(&max_drawdowns, 0.50),
+        percentile(&max_drawdowns, 0.95)
+    );
+    println!(
+        "    Losing streak p50 / p95:        {:.0} / {:.0} trades",
+        percentile(&worst_losing_streak, 0.50),
+        percentile(&worst_losing_streak, 0.95)
+    );
+    println!("    Note: ignores fees, slippage, and changing market conditions.");
+}
+
+fn percentile(sorted_values: &[f64], percentile: f64) -> f64 {
+    let index = ((sorted_values.len() - 1) as f64 * percentile).round() as usize;
+    sorted_values[index]
 }
 
 fn print_report(symbol: &str, trades: &[SimTrade], final_balance: f64, max_drawdown: f64) {
@@ -304,5 +377,19 @@ fn print_report(symbol: &str, trades: &[SimTrade], final_balance: f64, max_drawd
                 t.pnl_pct
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percentile;
+
+    #[test]
+    fn percentile_returns_nearest_sorted_value() {
+        let values = [10.0, 20.0, 30.0, 40.0, 50.0];
+
+        assert_eq!(percentile(&values, 0.0), 10.0);
+        assert_eq!(percentile(&values, 0.5), 30.0);
+        assert_eq!(percentile(&values, 1.0), 50.0);
     }
 }
