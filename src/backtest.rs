@@ -145,7 +145,10 @@ async fn backtest_symbol(client: &BinanceClient, symbol: &str) -> Result<(), Str
 
         match signal.signal {
             Signal::Buy if position.is_none() => {
+                // Simulated cash and equity are the same number here: the sim holds
+                // at most one position and books PnL on exit.
                 let (qty, _) = risk_manager.calculate_position_size(
+                    balance,
                     balance,
                     signal.entry_price,
                     signal.stop_loss,

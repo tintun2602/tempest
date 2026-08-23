@@ -15,6 +15,14 @@ pub struct Candle {
     pub close_time: u64,
 }
 
+/// Spot account snapshot: free USDT plus every other asset with a non-zero
+/// balance (free + locked, so assets reserved by an open OCO still count).
+#[derive(Debug, Clone)]
+pub struct AccountSnapshot {
+    pub free_usdt: f64,
+    pub assets: Vec<(String, f64)>,
+}
+
 pub struct BinanceClient {
     base_url: String,
     api_key: String,
@@ -201,8 +209,11 @@ impl BinanceClient {
             .ok_or_else(|| "Failed to parse price".to_string())
     }
 
-    /// Get the free USDT balance from the account.
-    pub async fn get_usdt_balance(&self) -> Result<f64, String> {
+    /// Fetch the whole account in one signed request: free USDT and every
+    /// non-zero non-USDT asset. `get_nonzero_balances` is a thin wrapper over
+    /// this — prefer this when both halves of the snapshot are needed, since
+    /// each call costs a separate signed request.
+    pub async fn get_account(&self) -> Result<AccountSnapshot, String> {
         let ts = self.timestamp_ms();
         let query = format!("timestamp={ts}");
         let sig = self.sign(&query);
@@ -226,16 +237,28 @@ impl BinanceClient {
             .as_array()
             .ok_or_else(|| format!("No balances array in response: {resp}"))?;
 
+        let mut free_usdt = 0.0;
+        let mut assets = Vec::new();
+
         for b in balances {
-            if b["asset"].as_str() == Some("USDT") {
-                return b["free"]
-                    .as_str()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| "Failed to parse USDT balance".to_string());
+            let asset = b["asset"].as_str().unwrap_or("");
+            let free: f64 = b["free"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let locked: f64 = b["locked"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+
+            if asset == "USDT" {
+                free_usdt = free;
+            } else if free + locked > 0.0 {
+                assets.push((asset.to_string(), free + locked));
             }
         }
 
-        Ok(0.0)
+        Ok(AccountSnapshot { free_usdt, assets })
     }
 
     /// Place a market order (BUY or SELL).
@@ -362,47 +385,9 @@ impl BinanceClient {
             .map_err(|e| format!("JSON parse error: {e}"))
     }
 
-    /// Get all non-zero balances from the account (asset name → free amount).
+    /// Get all non-zero non-USDT balances (asset name → free + locked amount).
     pub async fn get_nonzero_balances(&self) -> Result<Vec<(String, f64)>, String> {
-        let ts = self.timestamp_ms();
-        let query = format!("timestamp={ts}");
-        let sig = self.sign(&query);
-        let url = format!(
-            "{}/api/v3/account?{query}&signature={sig}",
-            self.base_url
-        );
-
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .map_err(|e| format!("HTTP error: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("JSON parse error: {e}"))?;
-
-        let balances = resp["balances"]
-            .as_array()
-            .ok_or_else(|| format!("No balances array in response: {resp}"))?;
-
-        let mut result = Vec::new();
-        for b in balances {
-            let asset = b["asset"].as_str().unwrap_or("");
-            let free: f64 = b["free"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0);
-            let locked: f64 = b["locked"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0);
-            if free + locked > 0.0 && asset != "USDT" {
-                result.push((asset.to_string(), free + locked));
-            }
-        }
-        Ok(result)
+        Ok(self.get_account().await?.assets)
     }
 }
 

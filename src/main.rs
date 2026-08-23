@@ -40,20 +40,28 @@ async fn main() {
 
     let notifier = Notifier::from_env();
 
-    let balance = match client.get_usdt_balance().await {
-        Ok(b) => {
-            info!("Starting USDT balance: {:.2}", b);
-            b
+    let equity = match fetch_equity(&client, &config).await {
+        Ok(eq) => {
+            info!(
+                "Starting equity: {:.2} USDT ({:.2} free)",
+                eq.total, eq.free_usdt
+            );
+            eq
         }
         Err(e) => {
-            error!("Failed to fetch initial balance: {e}. Starting with 0.");
-            0.0
+            error!("Failed to fetch initial equity: {e}. Starting with 0.");
+            Equity {
+                free_usdt: 0.0,
+                total: 0.0,
+            }
         }
     };
 
-    notifier.notify_startup(balance, &config.trading_pairs).await;
+    notifier
+        .notify_startup(equity.total, &config.trading_pairs)
+        .await;
 
-    let mut risk_manager = RiskManager::new(balance);
+    let mut risk_manager = RiskManager::new(equity.total);
 
     // Reconcile: detect positions held from a prior crash that lack OCO protection
     reconcile_positions(&client, &config, &mut risk_manager, &notifier).await;
@@ -84,14 +92,19 @@ async fn run_cycle(
         return Ok(());
     }
 
-    // ---- Balance & drawdown ----
-    let balance = client.get_usdt_balance().await?;
-    risk_manager.check_day_reset(balance);
+    // ---- Equity & drawdown ----
+    // Drawdown is measured against total equity — free USDT plus the
+    // mark-to-market value of open positions. Measuring free USDT alone counts
+    // every entry as a loss the size of the position notional, which trips the
+    // 5% halt after a single trade.
+    let equity = fetch_equity(client, config).await?;
+    risk_manager.check_day_reset(equity.total);
 
-    if risk_manager.check_drawdown(balance) {
+    if risk_manager.check_drawdown(equity.total) {
         warn!("HALTED — daily drawdown limit exceeded. No new trades until next UTC day.");
-        let dd_pct = (risk_manager.day_open_balance - balance) / risk_manager.day_open_balance * 100.0;
-        notifier.notify_halt(dd_pct, balance).await;
+        notifier
+            .notify_halt(risk_manager.drawdown_pct(equity.total), equity.total)
+            .await;
         return Ok(());
     }
     if risk_manager.halted {
@@ -158,7 +171,8 @@ async fn run_cycle(
                     continue;
                 }
                 let (qty, _) = risk_manager.calculate_position_size(
-                    balance,
+                    equity.total,
+                    equity.free_usdt,
                     signal.entry_price,
                     signal.stop_loss,
                 );
@@ -198,11 +212,46 @@ async fn run_cycle(
     }
 
     info!(
-        "Cycle complete | open positions: {} | balance: {:.2} USDT",
+        "Cycle complete | open positions: {} | equity: {:.2} USDT ({:.2} free)",
         risk_manager.positions.len(),
-        balance
+        equity.total,
+        equity.free_usdt
     );
     Ok(())
+}
+
+/// Portfolio value split into the cash that can fund new entries and the total
+/// that risk limits are measured against.
+struct Equity {
+    free_usdt: f64,
+    total: f64,
+}
+
+/// Total equity: free USDT plus the mark-to-market value of every held asset
+/// that maps to a configured trading pair.
+///
+/// A pricing failure is an error rather than a skipped asset: silently omitting
+/// a position understates equity and would trip the drawdown halt.
+async fn fetch_equity(client: &BinanceClient, config: &Config) -> Result<Equity, String> {
+    let account = client.get_account().await?;
+    let mut total = account.free_usdt;
+
+    for (asset, qty) in &account.assets {
+        let symbol = format!("{asset}USDT");
+        if !config.trading_pairs.contains(&symbol) {
+            continue;
+        }
+        let price = client
+            .get_price(&symbol)
+            .await
+            .map_err(|e| format!("cannot price {symbol} for equity: {e}"))?;
+        total += qty * price;
+    }
+
+    Ok(Equity {
+        free_usdt: account.free_usdt,
+        total,
+    })
 }
 
 /// On startup, check the Binance account for non-zero asset balances that correspond
@@ -240,15 +289,32 @@ async fn reconcile_positions(
         match client.get_open_orders(&symbol).await {
             Ok(orders) if !orders.is_empty() => {
                 let price = client.get_price(&symbol).await.unwrap_or(0.0);
-                info!(
-                    "[RECONCILE] {asset}: found existing OCO — registered at {qty:.6} {asset} (~${price:.2})"
-                );
+                // Recover the real protective levels from the live orders. Registering
+                // 0.0 here would make `check_exits` read `price >= take_profit` as a
+                // hit and liquidate the position on the very next cycle.
+                let (stop_loss, take_profit) = parse_protective_levels(&orders);
+
+                if stop_loss == 0.0 && take_profit == 0.0 {
+                    warn!(
+                        "[RECONCILE] {asset}: {} open order(s) but no SL/TP could be parsed — \
+                         leaving the exchange orders to manage this position",
+                        orders.len()
+                    );
+                } else {
+                    info!(
+                        "[RECONCILE] {asset}: found existing OCO — registered at {qty:.6} {asset} \
+                         (~${price:.2}, SL {stop_loss:.2}, TP {take_profit:.2})"
+                    );
+                }
+
                 risk_manager.open_position(Position {
                     symbol: symbol.clone(),
+                    // Estimated: the true fill price is not persisted anywhere, so PnL
+                    // reported when this position closes is measured from today's mark.
                     entry_price: price,
                     quantity: *qty,
-                    stop_loss: 0.0,
-                    take_profit: 0.0,
+                    stop_loss,
+                    take_profit,
                     entry_time: 0,
                 });
                 restored += 1;
@@ -303,12 +369,15 @@ async fn reconcile_positions(
                     }
                 };
 
+                // Track the levels either way: when the OCO failed the exchange is
+                // holding nothing, so the bot's own `check_exits` is the only stop
+                // this position has.
                 risk_manager.open_position(Position {
                     symbol,
                     entry_price: price,
                     quantity: *qty,
-                    stop_loss: if oco_ok { stop } else { 0.0 },
-                    take_profit: if oco_ok { tp } else { 0.0 },
+                    stop_loss: stop,
+                    take_profit: tp,
                     entry_time: 0,
                 });
 
@@ -341,4 +410,82 @@ async fn reconcile_positions(
     }
 
     notifier.notify_reconcile(restored, emergency, failed).await;
+}
+
+/// Extract `(stop_loss, take_profit)` from a symbol's open sell orders.
+///
+/// An OCO sell is two orders: a LIMIT_MAKER holding the target and a
+/// STOP_LOSS_LIMIT whose `stopPrice` is the trigger. A level that cannot be
+/// found is returned as `0.0`, which `check_exits` treats as unset.
+fn parse_protective_levels(orders: &[serde_json::Value]) -> (f64, f64) {
+    let mut stop_loss = 0.0;
+    let mut take_profit = 0.0;
+
+    for order in orders {
+        if order["side"].as_str() != Some("SELL") {
+            continue;
+        }
+        let price = order["price"]
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let stop_price = order["stopPrice"]
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        match order["type"].as_str().unwrap_or("") {
+            "STOP_LOSS" | "STOP_LOSS_LIMIT" if stop_price > 0.0 => stop_loss = stop_price,
+            "LIMIT_MAKER" | "LIMIT" | "TAKE_PROFIT" | "TAKE_PROFIT_LIMIT" if price > 0.0 => {
+                take_profit = price
+            }
+            _ => {}
+        }
+    }
+
+    (stop_loss, take_profit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_protective_levels_from_oco() {
+        let orders = vec![
+            json!({
+                "side": "SELL",
+                "type": "LIMIT_MAKER",
+                "price": "62000.00",
+                "stopPrice": "0.00"
+            }),
+            json!({
+                "side": "SELL",
+                "type": "STOP_LOSS_LIMIT",
+                "price": "56888.00",
+                "stopPrice": "57000.00"
+            }),
+        ];
+        let (sl, tp) = parse_protective_levels(&orders);
+        assert!((sl - 57_000.0).abs() < 1e-9);
+        assert!((tp - 62_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_protective_levels_unrecognised_orders() {
+        // A stray buy order carries no protection — both levels stay unset so
+        // `check_exits` leaves the position alone.
+        let orders = vec![json!({ "side": "BUY", "type": "LIMIT", "price": "50000.00" })];
+        let (sl, tp) = parse_protective_levels(&orders);
+        assert_eq!(sl, 0.0);
+        assert_eq!(tp, 0.0);
+    }
+
+    #[test]
+    fn test_parse_protective_levels_empty() {
+        let (sl, tp) = parse_protective_levels(&[]);
+        assert_eq!(sl, 0.0);
+        assert_eq!(tp, 0.0);
+    }
 }

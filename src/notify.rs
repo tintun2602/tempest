@@ -104,11 +104,11 @@ impl Notifier {
         self.send(&msg).await;
     }
 
-    pub async fn notify_halt(&self, drawdown_pct: f64, balance: f64) {
+    pub async fn notify_halt(&self, drawdown_pct: f64, equity: f64) {
         let msg = format!(
             "\u{1f6d1} *HALT — Daily Drawdown Limit*\n\
              Drawdown: `{drawdown_pct:.2}%`\n\
-             Balance: `{balance:.2}` USDT\n\
+             Equity: `{equity:.2}` USDT\n\
              _No new trades until next UTC midnight._"
         );
         self.send(&msg).await;
@@ -138,11 +138,11 @@ impl Notifier {
         self.send(&msg).await;
     }
 
-    pub async fn notify_startup(&self, balance: f64, pairs: &[String]) {
+    pub async fn notify_startup(&self, equity: f64, pairs: &[String]) {
         let pairs_str = pairs.join(", ");
         let msg = format!(
             "\u{1f680} *Bot Started*\n\
-             Balance: `{balance:.2}` USDT\n\
+             Equity: `{equity:.2}` USDT\n\
              Pairs: {pairs_str}"
         );
         self.send(&msg).await;
