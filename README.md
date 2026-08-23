@@ -1,4 +1,6 @@
-# Binance Swing Trading Bot
+# Tempest
+
+A Binance swing trading bot.
 
 A Rust-based Binance spot trading bot for swing trading (1-7 day holds). Runs as a persistent polling loop, evaluates technical indicators, enforces strict risk management, and executes trades via the Binance REST API.
 
@@ -90,8 +92,8 @@ Fetches up to 1000 daily + 1000 4H candles per pair and prints a report with win
 
 ### Docker
 ```bash
-docker build -t binance-bot .
-docker run --env-file .env binance-bot
+docker build -t tempest .
+docker run --env-file .env tempest
 ```
 
 ### Fly.io

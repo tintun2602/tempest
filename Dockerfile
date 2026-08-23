@@ -16,5 +16,5 @@ RUN touch src/main.rs && cargo build --release
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/binance_bot /usr/local/bin/binance_bot
-CMD ["binance_bot"]
+COPY --from=builder /app/target/release/tempest /usr/local/bin/tempest
+CMD ["tempest"]
