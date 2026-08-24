@@ -12,6 +12,37 @@ pub struct Config {
     pub risk_per_trade: f64,
 }
 
+/// Every configured symbol must be quoted in `quote_asset`.
+///
+/// Deploying `TRADING_PAIRS=BTCUSDT` against a USDC account is not a runtime
+/// error anywhere else — the bot reads a zero USDC balance, sizes nothing, and
+/// looks merely idle.
+fn validate_pairs(quote_asset: &str, pairs: &[String]) -> Result<(), String> {
+    if quote_asset.is_empty() {
+        return Err("QUOTE_ASSET must not be empty".to_string());
+    }
+    if pairs.is_empty() {
+        return Err("TRADING_PAIRS must list at least one symbol".to_string());
+    }
+
+    let mismatched: Vec<&String> = pairs
+        .iter()
+        .filter(|symbol| {
+            // The base must be non-empty too, so "USDC" alone is rejected.
+            !symbol.ends_with(quote_asset) || symbol.len() <= quote_asset.len()
+        })
+        .collect();
+
+    if mismatched.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "QUOTE_ASSET is {quote_asset}, but these symbols are not quoted in it: {mismatched:?}. \
+             Either change QUOTE_ASSET or fix TRADING_PAIRS."
+        ))
+    }
+}
+
 impl Config {
     pub fn from_env() -> Self {
         dotenvy::dotenv().ok();
@@ -23,9 +54,19 @@ impl Config {
         let quote_asset = env::var("QUOTE_ASSET").unwrap_or_else(|_| "USDT".to_string());
 
         let pairs_str = env::var("TRADING_PAIRS")
-            .unwrap_or_else(|_| "BTCUSDT,ETHUSDT,SOLUSDT".to_string());
-        let trading_pairs: Vec<String> =
-            pairs_str.split(',').map(|s| s.trim().to_string()).collect();
+            .unwrap_or_else(|_| format!("BTC{quote_asset}"));
+        let trading_pairs: Vec<String> = pairs_str
+            .split(',')
+            .map(|s| s.trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // A symbol quoted in a different asset silently trades a pair the
+        // account cannot fund: balances are read in `quote_asset`, so the bot
+        // would see zero free cash and price equity against the wrong market.
+        if let Err(e) = validate_pairs(&quote_asset, &trading_pairs) {
+            panic!("Invalid configuration: {e}");
+        }
 
         let poll_interval_secs: u64 = env::var("POLL_INTERVAL_SECONDS")
             .unwrap_or_else(|_| "300".to_string())
@@ -57,5 +98,53 @@ impl Config {
             backtest_mode,
             risk_per_trade,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_pairs;
+
+    fn pairs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn matching_quote_asset_is_accepted() {
+        assert!(validate_pairs("USDC", &pairs(&["BTCUSDC", "ETHUSDC"])).is_ok());
+        assert!(validate_pairs("USDT", &pairs(&["BTCUSDT"])).is_ok());
+    }
+
+    #[test]
+    fn mismatched_quote_asset_is_rejected() {
+        // The exact bug shipped in fly.toml: a USDT pair on a USDC account.
+        let err = validate_pairs("USDC", &pairs(&["BTCUSDT"])).unwrap_err();
+        assert!(err.contains("BTCUSDT"), "got: {err}");
+        assert!(err.contains("USDC"), "got: {err}");
+    }
+
+    #[test]
+    fn one_bad_symbol_fails_the_whole_set() {
+        let err = validate_pairs("USDC", &pairs(&["BTCUSDC", "ETHUSDT"])).unwrap_err();
+        assert!(err.contains("ETHUSDT"));
+        assert!(!err.contains("BTCUSDC"), "should only name the offender");
+    }
+
+    #[test]
+    fn a_bare_quote_asset_is_not_a_symbol() {
+        // "USDC" ends with "USDC" but names no base asset.
+        assert!(validate_pairs("USDC", &pairs(&["USDC"])).is_err());
+    }
+
+    #[test]
+    fn empty_configuration_is_rejected() {
+        assert!(validate_pairs("USDC", &[]).is_err());
+        assert!(validate_pairs("", &pairs(&["BTCUSDC"])).is_err());
+    }
+
+    #[test]
+    fn quote_asset_must_be_a_suffix_not_a_substring() {
+        // USDC appears in the symbol but is not what it is quoted in.
+        assert!(validate_pairs("USDC", &pairs(&["USDCBTC"])).is_err());
     }
 }
