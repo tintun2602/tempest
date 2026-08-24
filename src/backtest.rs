@@ -190,7 +190,7 @@ async fn backtest_symbol<M: MarketDataProvider>(
     );
     let net = simulate(symbol, &daily, &four_hour, costs, risk_per_trade);
 
-    print_diagnostics(&net.diagnostics);
+    print_diagnostics(&net.diagnostics, 1);
     print_cost_impact(&gross, &net);
     if let Some(first) = net.first_bar {
         print_benchmark(&net, &buy_and_hold(&four_hour[first..], costs));
@@ -485,15 +485,17 @@ fn partial_daily(bars: &[Candle], day_open: u64) -> Option<Candle> {
     })
 }
 
-fn print_diagnostics(d: &Diagnostics) {
+fn print_diagnostics(d: &Diagnostics, symbols: usize) {
     let evaluated = d.evaluated.max(1) as f64;
+    // Each bar produces one evaluation per symbol.
+    let bars_per_day = BARS_PER_DAY * symbols.max(1) as f64;
     let pct = |n: u32| n as f64 / evaluated * 100.0;
 
     println!();
     println!(
-        "  Signal Diagnostics ({} four-hour bars evaluated, ~{:.0} days):",
+        "  Signal Diagnostics ({} evaluations over ~{:.0} days):",
         d.evaluated,
-        evaluated / BARS_PER_DAY
+        evaluated / bars_per_day
     );
     println!(
         "    Trend  (price > EMA50 > EMA200): {:>5} bars ({:.1}%)",
@@ -528,7 +530,7 @@ fn print_diagnostics(d: &Diagnostics) {
     if d.all_aligned > 0 {
         println!(
             "    Average gap between signals:     {:>5.0} days",
-            evaluated / BARS_PER_DAY / d.all_aligned as f64
+            evaluated / bars_per_day / d.all_aligned as f64
         );
     }
 }
@@ -1256,9 +1258,9 @@ async fn portfolio_backtest<M: MarketDataProvider>(
     println!("=============================================================");
     println!("  PORTFOLIO: {} symbols, shared balance", feeds.len());
     println!("=============================================================");
-    print_diagnostics(&result.diagnostics);
+    print_diagnostics(&result.diagnostics, feeds.len());
 
-    let hold = portfolio_buy_and_hold(&feeds, costs);
+    let hold = portfolio_buy_and_hold(&feeds, costs, result.first_bar.unwrap_or(0));
     let ret = |b: f64| (b - STARTING_BALANCE) / STARTING_BALANCE * 100.0;
 
     println!();
@@ -1290,17 +1292,26 @@ async fn portfolio_backtest<M: MarketDataProvider>(
 }
 
 /// Equal-weight buy and hold across the same symbols and window.
-fn portfolio_buy_and_hold(feeds: &[SymbolFeed], costs: &CostModel) -> (f64, f64) {
+///
+/// `first_bar` is where the strategy actually began trading. Holding from bar
+/// zero would credit the benchmark with the entire indicator warmup — a
+/// stretch the strategy sat out — and on this data that alone turned a losing
+/// benchmark into a +63% one.
+fn portfolio_buy_and_hold(
+    feeds: &[SymbolFeed],
+    costs: &CostModel,
+    first_bar: usize,
+) -> (f64, f64) {
     let per_symbol = STARTING_BALANCE / feeds.len() as f64;
     let bars = feeds.iter().map(|f| f.four_hour.len()).min().unwrap_or(0);
-    if bars == 0 {
+    if bars == 0 || first_bar >= bars {
         return (STARTING_BALANCE, 0.0);
     }
 
     let quantities: Vec<f64> = feeds
         .iter()
         .map(|f| {
-            let entry = costs.buy_fill(f.four_hour[0].close);
+            let entry = costs.buy_fill(f.four_hour[first_bar].close);
             if entry > 0.0 {
                 (per_symbol - costs.taker_cost(per_symbol)) / entry
             } else {
@@ -1311,7 +1322,7 @@ fn portfolio_buy_and_hold(feeds: &[SymbolFeed], costs: &CostModel) -> (f64, f64)
 
     let mut peak = STARTING_BALANCE;
     let mut max_drawdown: f64 = 0.0;
-    for j in 0..bars {
+    for j in first_bar..bars {
         let low: f64 = feeds
             .iter()
             .zip(&quantities)
