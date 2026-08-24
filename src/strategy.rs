@@ -1,5 +1,5 @@
 use crate::indicators;
-use crate::market::Candle;
+use crate::exchange::Candle;
 use serde::Serialize;
 use tracing::debug;
 
@@ -8,6 +8,12 @@ pub enum Signal {
     Buy,
     Sell,
     Hold,
+    /// Reserved. `main` already handles this arm, but `evaluate` never returns
+    /// one: the drawdown halt lives in `RiskManager::halted`, which stops
+    /// trading without going through the signal path. Producing it here would
+    /// change signal semantics, so it stays unconstructed until that is a
+    /// deliberate decision rather than a side effect.
+    #[allow(dead_code)]
     Halt,
 }
 

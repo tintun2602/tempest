@@ -1,20 +1,37 @@
-use crate::market::BinanceClient;
+//! Order execution: turns a `TradeSignal` into venue orders and keeps the
+//! `RiskManager`'s view of open positions in step with what actually filled.
+//!
+//! Generic over [`ExecutionProvider`], so the same code drives the live Binance
+//! REST client, a paper-trading simulator, or a test double.
+
+use crate::exchange::{ExecutionProvider, InstrumentProvider, Side, SymbolFilters};
 use crate::notify::Notifier;
 use crate::risk::{Position, RiskManager};
 use crate::strategy::TradeSignal;
 use tracing::{error, info, warn};
 
-pub struct Executor<'a> {
-    client: &'a BinanceClient,
+/// Stop-limit price is placed just under the trigger so the resting limit still
+/// crosses the book when the stop fires.
+const STOP_LIMIT_SLIP: f64 = 0.998;
+
+/// Reward-to-risk applied to the realised fill when setting the target.
+const REWARD_RISK_RATIO: f64 = 2.0;
+
+pub struct Executor<'a, E> {
+    client: &'a E,
     notifier: &'a Notifier,
 }
 
-impl<'a> Executor<'a> {
-    pub fn new(client: &'a BinanceClient, notifier: &'a Notifier) -> Self {
+impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
+    pub fn new(client: &'a E, notifier: &'a Notifier) -> Self {
         Self { client, notifier }
     }
 
-    /// Execute a BUY: market-buy, then place an OCO sell for SL + TP.
+    /// Execute a BUY: market-buy, then bracket it with a protective OCO sell.
+    ///
+    /// The position is registered either way — if the OCO is rejected the
+    /// bot's own `check_exits` is the only stop it has, so it must still be
+    /// tracked — but it is only flagged `protected` once the venue confirms.
     pub async fn execute_buy(
         &self,
         signal: &TradeSignal,
@@ -26,71 +43,110 @@ impl<'a> Executor<'a> {
             signal.asset, quantity, signal.entry_price, signal.stop_loss, signal.take_profit
         );
 
-        // 1. Market buy
-        let order = self
+        // Venue rules first: an order that violates a lot or notional filter is
+        // rejected outright, so it must be corrected before it is sent rather
+        // than discovered from a -1013 error.
+        let filters = self.client.filters(&signal.asset).await?;
+        let quantity = filters.round_quantity(quantity);
+        if let Err(rejection) = filters.check_order(quantity, signal.entry_price) {
+            let floor = filters.min_tradable_quantity(signal.entry_price);
+            return Err(format!(
+                "{}: {rejection}; the smallest tradable size here is {floor} {}                  (~{:.2} {})",
+                signal.asset,
+                filters.base_asset,
+                floor * signal.entry_price,
+                filters.quote_asset,
+            ));
+        }
+
+        let outcome = self
             .client
-            .market_order(&signal.asset, "BUY", quantity)
+            .market_order(&signal.asset, Side::Buy, quantity)
             .await?;
 
-        let fill_price = weighted_fill_price(&order).unwrap_or(signal.entry_price);
-        let executed_qty = order["executedQty"]
-            .as_str()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(quantity);
+        // A venue that reports no usable fill price leaves the pre-trade quote
+        // as the only reference we have.
+        let fill_price = if outcome.average_price > 0.0 {
+            outcome.average_price
+        } else {
+            warn!(
+                "{}: no fill price in order response, using signal entry {:.2}",
+                signal.asset, signal.entry_price
+            );
+            signal.entry_price
+        };
+        let executed_qty = outcome.filled_quantity;
 
         info!(
             "BUY filled: {} @ {:.2} qty {:.6}",
             signal.asset, fill_price, executed_qty
         );
 
-        // Recalculate SL / TP from actual fill
-        let stop_distance = fill_price - signal.stop_loss;
-        let actual_sl = signal.stop_loss;
-        let actual_tp = fill_price + 2.0 * stop_distance;
-        let stop_limit = actual_sl * 0.998; // slightly below trigger to ensure fill
+        // Re-derive the target from the realised fill, keeping the stop where
+        // the strategy put it (the swing low is a structural level, not an
+        // offset from our entry).
+        let stop_loss = signal.stop_loss;
+        let take_profit = fill_price + REWARD_RISK_RATIO * (fill_price - stop_loss);
 
-        // 2. OCO sell (take-profit + stop-loss)
-        match self
-            .client
-            .oco_sell(&signal.asset, executed_qty, actual_tp, actual_sl, stop_limit)
+        // Binance charges the spot BUY fee in the base asset, so less was
+        // received than was filled. Bracketing the gross amount is rejected for
+        // insufficient balance — which would leave the position unprotected.
+        let commission = outcome.commission_paid_in(&filters.base_asset);
+        let sellable = filters.round_quantity(executed_qty - commission);
+        if commission > 0.0 {
+            info!(
+                "{}: {commission} {} taken as fee; bracketing {sellable} of {executed_qty}",
+                signal.asset, filters.base_asset
+            );
+        }
+
+        let take_profit = filters.round_price(take_profit);
+        let stop_loss = filters.round_price(stop_loss);
+        let stop_limit = filters.round_price(stop_loss * STOP_LIMIT_SLIP);
+
+        let protected = match self
+            .oco_or_reason(&signal.asset, &filters, sellable, take_profit, stop_loss, stop_limit)
             .await
         {
             Ok(oco) => {
                 info!(
-                    "OCO placed for {}: id={:?}",
-                    signal.asset,
-                    oco.get("orderListId")
+                    "OCO confirmed for {}: list {} (SL {:.2} / TP {:.2})",
+                    signal.asset, oco.order_list_id, oco.stop_price, oco.take_profit_price
                 );
+                true
             }
             Err(e) => {
                 error!(
                     "OCO FAILED for {} — position is UNPROTECTED: {}",
                     signal.asset, e
                 );
+                self.notifier
+                    .notify_error(
+                        &format!("UNPROTECTED {}", signal.asset),
+                        &format!("OCO rejected: {e}"),
+                    )
+                    .await;
+                false
             }
-        }
+        };
 
-        // 3. Track the position locally
         risk_manager.open_position(Position {
             symbol: signal.asset.clone(),
             entry_price: fill_price,
             quantity: executed_qty,
-            stop_loss: actual_sl,
-            take_profit: actual_tp,
-            entry_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            stop_loss,
+            take_profit,
+            entry_time: now_ms(),
+            protected,
         });
 
-        // 4. Notify
         self.notifier
             .notify_buy(
                 &signal.asset,
                 fill_price,
                 executed_qty,
-                actual_sl,
-                actual_tp,
+                stop_loss,
+                take_profit,
                 &signal.confidence,
                 &signal.reasoning,
             )
@@ -99,7 +155,7 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
-    /// Close an existing position: cancel open orders, then market-sell.
+    /// Close an existing position: cancel the resting OCO, then market-sell.
     pub async fn execute_sell(
         &self,
         symbol: &str,
@@ -111,39 +167,80 @@ impl<'a> Executor<'a> {
 
         info!("SELL {} | qty {:.6}", symbol, position.quantity);
 
-        // Cancel any standing OCO / limit orders first
+        // The OCO reserves the base asset; it must go before the market sell
+        // can spend it.
         if let Err(e) = self.client.cancel_open_orders(symbol).await {
-            warn!("Failed to cancel open orders for {}: {}", symbol, e);
+            warn!("Failed to cancel open orders for {symbol}: {e}");
         }
 
-        // Market sell
+        // The tracked quantity can carry dust from fees or a reconciled
+        // balance; the venue only accepts whole steps.
+        let filters = self.client.filters(symbol).await?;
+        let sell_qty = filters.round_quantity(position.quantity);
+        if let Err(rejection) = filters.check_order(sell_qty, position.entry_price) {
+            warn!("{symbol}: position may be unsellable — {rejection}");
+        }
+
         match self
             .client
-            .market_order(symbol, "SELL", position.quantity)
+            .market_order(symbol, Side::Sell, sell_qty)
             .await
         {
-            Ok(result) => {
-                let sell_price = weighted_fill_price(&result).unwrap_or_else(|| {
-                    warn!("Could not parse fill price from response: {}", result);
-                    0.0
-                });
+            Ok(outcome) => {
+                let sell_price = outcome.average_price;
+                if sell_price <= 0.0 {
+                    warn!("{symbol}: could not determine sell fill price; PnL will read as 0");
+                }
                 let pnl = (sell_price - position.entry_price) * position.quantity;
-                let pnl_pct =
-                    (sell_price - position.entry_price) / position.entry_price * 100.0;
+                let pnl_pct = (sell_price - position.entry_price) / position.entry_price * 100.0;
                 info!(
-                    "SELL filled: {} @ {:.2} | PnL {:.2} {} ({:+.2}%)",
-                    symbol, sell_price, pnl, self.notifier.quote_asset(), pnl_pct
+                    "SELL filled: {symbol} @ {sell_price:.2} | PnL {pnl:.2} {}                      ({pnl_pct:+.2}%) | held {}",
+                    self.notifier.quote_asset(),
+                    format_holding_period(position.entry_time, now_ms())
                 );
                 self.notifier
                     .notify_sell(symbol, sell_price, pnl, pnl_pct)
                     .await;
                 Ok(())
             }
-            Err(e) => Err(format!("Market sell failed for {symbol}: {e}")),
+            // The position is already out of the risk manager at this point.
+            // Put it back so the next cycle retries rather than losing track of
+            // base asset the bot still holds.
+            Err(e) => {
+                error!("{symbol}: market sell failed, restoring tracked position");
+                risk_manager.open_position(position);
+                Err(format!("Market sell failed for {symbol}: {e}"))
+            }
         }
     }
 
-    /// Force-close every open position (used by FORCE_CLOSE and HALT).
+    /// Place the protective bracket, refusing to send one the venue is certain
+    /// to reject.
+    ///
+    /// An OCO is two orders, and *both* must clear the notional minimum. The
+    /// stop leg is the binding one, since it sits at the lower price.
+    async fn oco_or_reason(
+        &self,
+        symbol: &str,
+        filters: &SymbolFilters,
+        quantity: f64,
+        take_profit: f64,
+        stop_loss: f64,
+        stop_limit: f64,
+    ) -> Result<crate::exchange::OcoPlacement, String> {
+        filters
+            .check_order(quantity, stop_loss)
+            .map_err(|rejection| format!("stop leg would be rejected: {rejection}"))?;
+        filters
+            .check_order(quantity, take_profit)
+            .map_err(|rejection| format!("target leg would be rejected: {rejection}"))?;
+
+        self.client
+            .place_oco_sell(symbol, quantity, take_profit, stop_loss, stop_limit)
+            .await
+    }
+
+    /// Force-close every open position (used by FORCE_CLOSE).
     pub async fn close_all_positions(&self, risk_manager: &mut RiskManager) {
         let symbols: Vec<String> = risk_manager
             .positions
@@ -153,39 +250,483 @@ impl<'a> Executor<'a> {
 
         for symbol in symbols {
             if let Err(e) = self.execute_sell(&symbol, risk_manager).await {
-                error!("Force-close {} failed: {}", symbol, e);
+                error!("Force-close {symbol} failed: {e}");
             }
         }
     }
 }
 
-/// Compute volume-weighted average fill price from Binance order response.
-/// Falls back to cummulativeQuoteQty / executedQty if fills array is missing.
-fn weighted_fill_price(order: &serde_json::Value) -> Option<f64> {
-    // Primary: VWAP from fills array
-    if let Some(fills) = order["fills"].as_array() {
-        let mut total_cost = 0.0_f64;
-        let mut total_qty = 0.0_f64;
-        for fill in fills {
-            if let (Some(p), Some(q)) = (
-                fill["price"].as_str().and_then(|s| s.parse::<f64>().ok()),
-                fill["qty"].as_str().and_then(|s| s.parse::<f64>().ok()),
-            ) {
-                total_cost += p * q;
-                total_qty += q;
-            }
-        }
-        if total_qty > 0.0 {
-            return Some(total_cost / total_qty);
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How long a position was held, for the close log. Both arguments are epoch
+/// milliseconds.
+///
+/// Positions recovered by reconciliation carry `entry_time: 0` — their true
+/// entry is not persisted anywhere — and report as unknown rather than as a
+/// spurious 50-year hold.
+fn format_holding_period(entry_time: u64, now: u64) -> String {
+    if entry_time == 0 || now < entry_time {
+        return "unknown".to_string();
+    }
+    let minutes = (now - entry_time) / 60_000;
+    match minutes {
+        0..=59 => format!("{minutes}m"),
+        60..=2879 => format!("{}h{}m", minutes / 60, minutes % 60),
+        _ => format!("{}d{}h", minutes / 1440, (minutes % 1440) / 60),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exchange::{Fill, OcoPlacement, OrderOutcome};
+    use crate::strategy::Signal;
+    use std::sync::Mutex;
+
+    /// Scriptable stand-in for the venue. Records what was asked of it so tests
+    /// can assert on call order as well as on resulting state.
+    #[derive(Default)]
+    struct FakeExchange {
+        /// `(symbol, side, quantity)` per market order, in call order.
+        market_orders: Mutex<Vec<(String, Side, f64)>>,
+        /// `(symbol, quantity, take_profit, stop)` per OCO attempt.
+        oco_requests: Mutex<Vec<(String, f64, f64, f64)>>,
+        /// Every operation in the order it happened, for sequencing assertions.
+        call_log: Mutex<Vec<&'static str>>,
+
+        /// `(average_price, filled_quantity)` the venue reports for a fill.
+        fill: Option<(f64, f64)>,
+        /// Fee charged in the base asset, as Binance does for spot BUYs.
+        base_fee: f64,
+        oco_rejects: bool,
+        market_order_rejects: bool,
+    }
+
+    /// The real BTCUSDC rules: 1e-5 lot step, 0.01 tick, 5.00 USDC minimum.
+    fn btcusdc_filters() -> SymbolFilters {
+        SymbolFilters {
+            symbol: "BTCUSDC".into(),
+            base_asset: "BTC".into(),
+            quote_asset: "USDC".into(),
+            step_size: 0.00001,
+            min_qty: 0.00001,
+            max_qty: 9000.0,
+            tick_size: 0.01,
+            min_notional: 5.0,
         }
     }
 
-    // Fallback: cummulativeQuoteQty / executedQty
-    let quote_qty: f64 = order["cummulativeQuoteQty"].as_str()?.parse().ok()?;
-    let exec_qty: f64 = order["executedQty"].as_str()?.parse().ok()?;
-    if exec_qty > 0.0 {
-        Some(quote_qty / exec_qty)
-    } else {
-        None
+    impl InstrumentProvider for FakeExchange {
+        async fn filters(&self, _symbol: &str) -> Result<SymbolFilters, String> {
+            Ok(btcusdc_filters())
+        }
+    }
+
+    impl FakeExchange {
+        fn filling_at(price: f64, qty: f64) -> Self {
+            Self {
+                fill: Some((price, qty)),
+                ..Default::default()
+            }
+        }
+
+        fn log(&self, what: &'static str) {
+            self.call_log.lock().unwrap().push(what);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.call_log.lock().unwrap().clone()
+        }
+    }
+
+    impl ExecutionProvider for FakeExchange {
+        async fn market_order(
+            &self,
+            symbol: &str,
+            side: Side,
+            quantity: f64,
+        ) -> Result<OrderOutcome, String> {
+            self.log("market_order");
+            self.market_orders
+                .lock()
+                .unwrap()
+                .push((symbol.to_string(), side, quantity));
+
+            if self.market_order_rejects {
+                return Err("insufficient balance".into());
+            }
+
+            let (average_price, filled_quantity) = self.fill.unwrap_or((0.0, quantity));
+            Ok(OrderOutcome {
+                symbol: symbol.to_string(),
+                side,
+                filled_quantity,
+                average_price,
+                fills: vec![Fill {
+                    price: average_price,
+                    quantity: filled_quantity,
+                    commission: self.base_fee,
+                    commission_asset: "BTC".into(),
+                }],
+            })
+        }
+
+        async fn place_oco_sell(
+            &self,
+            symbol: &str,
+            quantity: f64,
+            take_profit_price: f64,
+            stop_price: f64,
+            _stop_limit_price: f64,
+        ) -> Result<OcoPlacement, String> {
+            self.log("place_oco_sell");
+            self.oco_requests.lock().unwrap().push((
+                symbol.to_string(),
+                quantity,
+                take_profit_price,
+                stop_price,
+            ));
+
+            if self.oco_rejects {
+                return Err("Binance API error -1013: Filter failure: MIN_NOTIONAL".into());
+            }
+            Ok(OcoPlacement {
+                order_list_id: 4242,
+                stop_price,
+                take_profit_price,
+            })
+        }
+
+        async fn cancel_open_orders(&self, _symbol: &str) -> Result<(), String> {
+            self.log("cancel_open_orders");
+            Ok(())
+        }
+
+        async fn open_orders(&self, _symbol: &str) -> Result<Vec<crate::exchange::OpenOrder>, String> {
+            self.log("open_orders");
+            Ok(Vec::new())
+        }
+    }
+
+    fn buy_signal() -> TradeSignal {
+        TradeSignal {
+            asset: "BTCUSDC".into(),
+            signal: Signal::Buy,
+            confidence: "HIGH".into(),
+            entry_price: 50_000.0,
+            stop_loss: 49_000.0,
+            take_profit: 52_000.0,
+            risk_reward_ratio: 2.0,
+            reasoning: "test".into(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn open_position(rm: &mut RiskManager, symbol: &str, qty: f64) {
+        rm.open_position(Position {
+            symbol: symbol.into(),
+            entry_price: 50_000.0,
+            quantity: qty,
+            stop_loss: 49_000.0,
+            take_profit: 52_000.0,
+            entry_time: 0,
+            protected: true,
+        });
+    }
+
+    // ----- BUY -----
+
+    #[tokio::test]
+    async fn buy_marks_position_protected_only_after_oco_confirms() {
+        let venue = FakeExchange::filling_at(50_100.0, 0.003);
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+
+        Executor::new(&venue, &notifier)
+            .execute_buy(&buy_signal(), 0.003, &mut rm)
+            .await
+            .unwrap();
+
+        let pos = &rm.positions[0];
+        assert!(pos.protected, "confirmed OCO must mark the position protected");
+        assert_eq!(pos.quantity, 0.003);
+        // Entry is the realised fill, not the pre-trade quote.
+        assert_eq!(pos.entry_price, 50_100.0);
+        assert_eq!(venue.calls(), vec!["market_order", "place_oco_sell"]);
+    }
+
+    #[tokio::test]
+    async fn buy_leaves_position_tracked_but_unprotected_when_oco_rejected() {
+        let venue = FakeExchange {
+            oco_rejects: true,
+            ..FakeExchange::filling_at(50_100.0, 0.003)
+        };
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+
+        // The buy itself still succeeded — the caller must not treat this as a
+        // failed entry, or it would re-buy on the next cycle.
+        Executor::new(&venue, &notifier)
+            .execute_buy(&buy_signal(), 0.003, &mut rm)
+            .await
+            .unwrap();
+
+        let pos = &rm.positions[0];
+        assert!(!pos.protected, "rejected OCO must never read as protected");
+        // Still tracked, and with live levels, so `check_exits` can act as the
+        // only remaining stop.
+        assert!(rm.has_position("BTCUSDC"));
+        assert_eq!(pos.stop_loss, 49_000.0);
+        assert!(pos.take_profit > 0.0);
+    }
+
+    #[tokio::test]
+    async fn take_profit_is_two_to_one_against_the_realised_fill() {
+        // Filled 100 above the quote: risk is 50_100 - 49_000 = 1_100, so the
+        // target must move to 50_100 + 2_200, not stay at the signal's 52_000.
+        let venue = FakeExchange::filling_at(50_100.0, 0.003);
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+
+        Executor::new(&venue, &notifier)
+            .execute_buy(&buy_signal(), 0.003, &mut rm)
+            .await
+            .unwrap();
+
+        assert!((rm.positions[0].take_profit - 52_300.0).abs() < 1e-6);
+        // The OCO is placed at exactly the levels the position records.
+        let (_, qty, tp, stop) = venue.oco_requests.lock().unwrap()[0].clone();
+        assert_eq!(qty, 0.003);
+        assert!((tp - 52_300.0).abs() < 1e-6);
+        assert_eq!(stop, 49_000.0);
+    }
+
+    #[tokio::test]
+    async fn buy_falls_back_to_signal_entry_when_venue_reports_no_fill_price() {
+        let venue = FakeExchange::default(); // average_price 0.0
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+
+        Executor::new(&venue, &notifier)
+            .execute_buy(&buy_signal(), 0.003, &mut rm)
+            .await
+            .unwrap();
+
+        assert_eq!(rm.positions[0].entry_price, 50_000.0);
+    }
+
+    #[tokio::test]
+    async fn failed_buy_registers_no_position() {
+        let venue = FakeExchange {
+            market_order_rejects: true,
+            ..Default::default()
+        };
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+
+        let result = Executor::new(&venue, &notifier)
+            .execute_buy(&buy_signal(), 0.003, &mut rm)
+            .await;
+
+        assert!(result.is_err());
+        assert!(rm.positions.is_empty());
+        // No OCO should be attempted over a position that does not exist.
+        assert_eq!(venue.calls(), vec!["market_order"]);
+    }
+
+    #[tokio::test]
+    async fn buy_quantity_is_rounded_down_to_the_venue_step() {
+        // 0.000123 is what 1.5%-of-equity sizing produces; it is not a legal
+        // multiple of the 1e-5 step and Binance would reject it with -1013.
+        let venue = FakeExchange::filling_at(50_000.0, 0.00012);
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(19.0);
+
+        Executor::new(&venue, &notifier)
+            .execute_buy(&buy_signal(), 0.000123, &mut rm)
+            .await
+            .unwrap();
+
+        let (_, _, sent_qty) = venue.market_orders.lock().unwrap()[0].clone();
+        assert_eq!(sent_qty, 0.00012, "quantity must be a whole step");
+    }
+
+    #[tokio::test]
+    async fn buy_below_min_notional_is_refused_before_reaching_the_venue() {
+        // 0.00003 BTC at 50,000 is 1.50 USDC, under the 5.00 minimum.
+        let venue = FakeExchange::filling_at(50_000.0, 0.00003);
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(19.0);
+
+        let err = Executor::new(&venue, &notifier)
+            .execute_buy(&buy_signal(), 0.00003, &mut rm)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("below the venue minimum"), "got: {err}");
+        // The point of pre-checking is that no doomed order is sent.
+        assert!(venue.calls().is_empty());
+        assert!(rm.positions.is_empty());
+        // And the operator is told what size would actually work.
+        assert!(err.contains("smallest tradable size"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn oco_brackets_only_what_the_fee_left_behind() {
+        // Binance takes the spot BUY fee in BTC, so bracketing the gross fill
+        // would be rejected for insufficient balance.
+        let venue = FakeExchange {
+            base_fee: 0.00000012,
+            ..FakeExchange::filling_at(50_000.0, 0.00012)
+        };
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(19.0);
+
+        Executor::new(&venue, &notifier)
+            .execute_buy(&buy_signal(), 0.00012, &mut rm)
+            .await
+            .unwrap();
+
+        // 0.00012 - 0.00000012 = 0.00011988, rounded down to a whole step.
+        let (_, oco_qty, _, _) = venue.oco_requests.lock().unwrap()[0].clone();
+        assert_eq!(oco_qty, 0.00011);
+        assert!(oco_qty < 0.00012);
+    }
+
+    #[tokio::test]
+    async fn oco_prices_are_snapped_to_the_tick() {
+        let venue = FakeExchange::filling_at(50_000.33, 0.00012);
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(19.0);
+
+        Executor::new(&venue, &notifier)
+            .execute_buy(&buy_signal(), 0.00012, &mut rm)
+            .await
+            .unwrap();
+
+        let (_, _, tp, stop) = venue.oco_requests.lock().unwrap()[0].clone();
+        // 50_000.33 + 2*(50_000.33 - 49_000) = 52_001.  Both legs must land on
+        // a whole cent.
+        assert_eq!((tp * 100.0).round() / 100.0, tp);
+        assert_eq!((stop * 100.0).round() / 100.0, stop);
+    }
+
+    #[tokio::test]
+    async fn oco_is_not_attempted_when_a_leg_cannot_clear_the_minimum() {
+        // A fill so small that the stop leg falls under 5.00 USDC. Sending it
+        // would be rejected, so the position must be reported unprotected
+        // rather than appearing to have a bracket.
+        let venue = FakeExchange::filling_at(50_000.0, 0.00002);
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(19.0);
+
+        Executor::new(&venue, &notifier)
+            .execute_buy(&buy_signal(), 0.00012, &mut rm)
+            .await
+            .unwrap();
+
+        assert!(!rm.positions[0].protected);
+        assert_eq!(venue.calls(), vec!["market_order"], "no doomed OCO sent");
+    }
+
+    // ----- SELL -----
+
+    #[tokio::test]
+    async fn sell_cancels_resting_oco_before_market_selling() {
+        // The resting OCO reserves the base asset; selling first would be
+        // rejected for insufficient balance.
+        let venue = FakeExchange::filling_at(51_000.0, 0.003);
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+        open_position(&mut rm, "BTCUSDC", 0.003);
+
+        Executor::new(&venue, &notifier)
+            .execute_sell("BTCUSDC", &mut rm)
+            .await
+            .unwrap();
+
+        assert_eq!(venue.calls(), vec!["cancel_open_orders", "market_order"]);
+        assert!(!rm.has_position("BTCUSDC"));
+        let (_, side, qty) = venue.market_orders.lock().unwrap()[0].clone();
+        assert_eq!(side, Side::Sell);
+        assert_eq!(qty, 0.003);
+    }
+
+    #[tokio::test]
+    async fn failed_sell_keeps_the_position_tracked() {
+        // The bot still holds the base asset. Dropping it from the risk manager
+        // would leave real exposure invisible to every later cycle.
+        let venue = FakeExchange {
+            market_order_rejects: true,
+            ..Default::default()
+        };
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+        open_position(&mut rm, "BTCUSDC", 0.003);
+
+        let result = Executor::new(&venue, &notifier)
+            .execute_sell("BTCUSDC", &mut rm)
+            .await;
+
+        assert!(result.is_err());
+        assert!(rm.has_position("BTCUSDC"), "position must survive a failed sell");
+        assert_eq!(rm.positions[0].quantity, 0.003);
+    }
+
+    #[tokio::test]
+    async fn selling_an_untracked_symbol_is_an_error_and_places_no_order() {
+        let venue = FakeExchange::default();
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+
+        assert!(
+            Executor::new(&venue, &notifier)
+                .execute_sell("BTCUSDC", &mut rm)
+                .await
+                .is_err()
+        );
+        assert!(venue.calls().is_empty());
+    }
+
+    #[test]
+    fn holding_period_is_unknown_for_reconciled_positions() {
+        // Reconciliation cannot recover the original entry time.
+        assert_eq!(format_holding_period(0, 1_700_000_000_000), "unknown");
+    }
+
+    #[test]
+    fn holding_period_never_reports_a_negative_span() {
+        // Clock skew must not produce a wrapped, enormous duration.
+        assert_eq!(format_holding_period(1_700_000_000_000, 1_699_000_000_000), "unknown");
+    }
+
+    #[test]
+    fn holding_period_scales_its_unit() {
+        let base = 1_700_000_000_000u64;
+        assert_eq!(format_holding_period(base, base + 45 * 60_000), "45m");
+        assert_eq!(format_holding_period(base, base + 150 * 60_000), "2h30m");
+        // A swing trade held four and a half days.
+        assert_eq!(format_holding_period(base, base + 6_480 * 60_000), "4d12h");
+    }
+
+    #[tokio::test]
+    async fn close_all_positions_empties_the_book() {
+        let venue = FakeExchange::filling_at(51_000.0, 1.0);
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+        open_position(&mut rm, "BTCUSDC", 0.003);
+        open_position(&mut rm, "ETHUSDC", 0.5);
+
+        Executor::new(&venue, &notifier)
+            .close_all_positions(&mut rm)
+            .await;
+
+        assert!(rm.positions.is_empty());
+        assert_eq!(venue.market_orders.lock().unwrap().len(), 2);
     }
 }

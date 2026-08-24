@@ -8,6 +8,8 @@ pub struct Config {
     pub trading_pairs: Vec<String>,
     pub poll_interval_secs: u64,
     pub backtest_mode: bool,
+    /// Fraction of equity risked per trade.
+    pub risk_per_trade: f64,
 }
 
 impl Config {
@@ -38,6 +40,13 @@ impl Config {
         let backtest_mode = env::var("MODE").unwrap_or_default() == "backtest"
             || env::args().any(|a| a == "--backtest");
 
+        // Percent, so RISK_PER_TRADE_PCT=5 means 5% of equity per trade.
+        let risk_per_trade = env::var("RISK_PER_TRADE_PCT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|pct| pct / 100.0)
+            .unwrap_or(crate::risk::DEFAULT_RISK_PER_TRADE);
+
         Self {
             base_url,
             api_key,
@@ -46,6 +55,7 @@ impl Config {
             trading_pairs,
             poll_interval_secs,
             backtest_mode,
+            risk_per_trade,
         }
     }
 }
