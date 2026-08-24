@@ -158,7 +158,11 @@ impl RiskManager {
             pos.quantity,
             pos.stop_loss,
             pos.take_profit,
-            if pos.protected { "OCO confirmed" } else { "UNPROTECTED" }
+            if pos.protected {
+                "OCO confirmed"
+            } else {
+                "UNPROTECTED"
+            }
         );
         self.positions.push(pos);
     }

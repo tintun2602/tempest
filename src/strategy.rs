@@ -1,5 +1,5 @@
-use crate::indicators;
 use crate::exchange::Candle;
+use crate::indicators;
 use serde::Serialize;
 use tracing::debug;
 
@@ -106,8 +106,15 @@ pub fn compute_indicators(
     });
 
     debug!(
-        ema_50, ema_200, rsi_14, macd_line, macd_signal, macd_histogram,
-        macd_crossed_bullish_recently, swing_low, current_price,
+        ema_50,
+        ema_200,
+        rsi_14,
+        macd_line,
+        macd_signal,
+        macd_histogram,
+        macd_crossed_bullish_recently,
+        swing_low,
+        current_price,
         "indicators computed"
     );
 

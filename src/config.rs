@@ -53,8 +53,7 @@ impl Config {
         let api_secret = env::var("BINANCE_API_SECRET").expect("BINANCE_API_SECRET must be set");
         let quote_asset = env::var("QUOTE_ASSET").unwrap_or_else(|_| "USDT".to_string());
 
-        let pairs_str = env::var("TRADING_PAIRS")
-            .unwrap_or_else(|_| format!("BTC{quote_asset}"));
+        let pairs_str = env::var("TRADING_PAIRS").unwrap_or_else(|_| format!("BTC{quote_asset}"));
         let trading_pairs: Vec<String> = pairs_str
             .split(',')
             .map(|s| s.trim().to_uppercase())

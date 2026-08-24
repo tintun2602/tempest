@@ -192,10 +192,19 @@ pub struct SymbolFilters {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderRejection {
     /// Quantity rounds to zero, or is under the venue minimum.
-    BelowMinQuantity { quantity: f64, min_qty: f64 },
-    AboveMaxQuantity { quantity: f64, max_qty: f64 },
+    BelowMinQuantity {
+        quantity: f64,
+        min_qty: f64,
+    },
+    AboveMaxQuantity {
+        quantity: f64,
+        max_qty: f64,
+    },
     /// Order value is under the venue minimum.
-    BelowMinNotional { notional: f64, min_notional: f64 },
+    BelowMinNotional {
+        notional: f64,
+        min_notional: f64,
+    },
 }
 
 impl std::fmt::Display for OrderRejection {
@@ -567,10 +576,16 @@ mod tests {
     fn price_rounding_handles_coarse_and_fine_ticks() {
         // A venue tick coarser than a cent: 2-decimal formatting would emit an
         // illegal price.
-        let coarse = SymbolFilters { tick_size: 0.1, ..btcusdc() };
+        let coarse = SymbolFilters {
+            tick_size: 0.1,
+            ..btcusdc()
+        };
         assert_eq!(coarse.round_price(123.45), 123.4);
         // And a sub-cent tick, where 2 decimals would destroy the price.
-        let fine = SymbolFilters { tick_size: 0.00000001, ..btcusdc() };
+        let fine = SymbolFilters {
+            tick_size: 0.00000001,
+            ..btcusdc()
+        };
         assert_eq!(fine.round_price(0.00001234), 0.00001234);
     }
 
@@ -626,8 +641,18 @@ mod tests {
             filled_quantity: 0.00012,
             average_price: 77_214.24,
             fills: vec![
-                Fill { price: 77_214.24, quantity: 0.00008, commission: 0.00000008, commission_asset: "BTC".into() },
-                Fill { price: 77_215.00, quantity: 0.00004, commission: 0.00000004, commission_asset: "BTC".into() },
+                Fill {
+                    price: 77_214.24,
+                    quantity: 0.00008,
+                    commission: 0.00000008,
+                    commission_asset: "BTC".into(),
+                },
+                Fill {
+                    price: 77_215.00,
+                    quantity: 0.00004,
+                    commission: 0.00000004,
+                    commission_asset: "BTC".into(),
+                },
             ],
         };
         assert!((outcome.commission_paid_in("BTC") - 0.00000012).abs() < 1e-12);

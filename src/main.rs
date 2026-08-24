@@ -11,15 +11,14 @@ mod strategy;
 use config::Config;
 use exchange::binance::BinanceClient;
 use exchange::{
-    AccountProvider, ExecutionProvider, InstrumentProvider, MarketDataProvider,
-    protective_levels,
+    protective_levels, AccountProvider, ExecutionProvider, InstrumentProvider, MarketDataProvider,
 };
 use executor::Executor;
 use notify::Notifier;
 use risk::{Position, RiskManager};
 use std::env;
 use strategy::Signal;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
 /// Positions worth less than this are leftover fractions, not real holdings.
@@ -78,8 +77,7 @@ async fn main() {
         "Risk per trade: {:.2}% of equity",
         config.risk_per_trade * 100.0
     );
-    let mut risk_manager =
-        RiskManager::with_risk_per_trade(equity.total, config.risk_per_trade);
+    let mut risk_manager = RiskManager::with_risk_per_trade(equity.total, config.risk_per_trade);
 
     // Detect positions held from a prior crash that lack OCO protection.
     reconcile_positions(&client, &config, &mut risk_manager, &notifier).await;
@@ -445,7 +443,9 @@ async fn reconcile_positions<C>(
         );
     }
     if failed > 0 {
-        error!("[RECONCILE] {failed} position(s) could not be protected — check exchange manually!");
+        error!(
+            "[RECONCILE] {failed} position(s) could not be protected — check exchange manually!"
+        );
     }
 
     notifier.notify_reconcile(restored, emergency, failed).await;

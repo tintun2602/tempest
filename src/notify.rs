@@ -76,7 +76,11 @@ impl Notifier {
                 debug!("Telegram message sent");
             }
             Ok(resp) => {
-                warn!("Telegram API returned {}: {:?}", resp.status(), resp.text().await.ok());
+                warn!(
+                    "Telegram API returned {}: {:?}",
+                    resp.status(),
+                    resp.text().await.ok()
+                );
             }
             Err(e) => {
                 warn!("Telegram send failed: {e}");
@@ -109,19 +113,13 @@ impl Notifier {
         self.send(&msg).await;
     }
 
-    pub async fn notify_sell(
-        &self,
-        symbol: &str,
-        price: f64,
-        pnl: f64,
-        pnl_pct: f64,
-    ) {
+    pub async fn notify_sell(&self, symbol: &str, price: f64, pnl: f64, pnl_pct: f64) {
         let emoji = if pnl >= 0.0 { "\u{1f7e2}" } else { "\u{1f534}" };
         let msg = format!(
             "{emoji} *SELL {symbol}*\n\
              Price: `{price:.2}`\n\
-             PnL: `{pnl:+.2}` {} (`{pnl_pct:+.2}%`)"
-            , self.quote_asset
+             PnL: `{pnl:+.2}` {} (`{pnl_pct:+.2}%`)",
+            self.quote_asset
         );
         self.send(&msg).await;
     }
@@ -131,8 +129,8 @@ impl Notifier {
             "\u{1f6d1} *HALT — Daily Drawdown Limit*\n\
              Drawdown: `{drawdown_pct:.2}%`\n\
              Equity: `{equity:.2}` {}\n\
-             _No new trades until next UTC midnight._"
-            , self.quote_asset
+             _No new trades until next UTC midnight._",
+            self.quote_asset
         );
         self.send(&msg).await;
     }
@@ -149,15 +147,15 @@ impl Notifier {
             msg.push_str(&format!("Emergency OCO: {emergency} order(s) placed\n"));
         }
         if failed > 0 {
-            msg.push_str(&format!("\u{26a0}\u{fe0f} *Failed: {failed}* — check exchange manually!"));
+            msg.push_str(&format!(
+                "\u{26a0}\u{fe0f} *Failed: {failed}* — check exchange manually!"
+            ));
         }
         self.send(&msg).await;
     }
 
     pub async fn notify_error(&self, context: &str, error: &str) {
-        let msg = format!(
-            "\u{26a0}\u{fe0f} *Error: {context}*\n`{error}`"
-        );
+        let msg = format!("\u{26a0}\u{fe0f} *Error: {context}*\n`{error}`");
         self.send(&msg).await;
     }
 
@@ -166,8 +164,8 @@ impl Notifier {
         let msg = format!(
             "\u{1f680} *Bot Started*\n\
              Equity: `{equity:.2}` {}\n\
-             Pairs: {pairs_str}"
-            , self.quote_asset
+             Pairs: {pairs_str}",
+            self.quote_asset
         );
         self.send(&msg).await;
     }

@@ -105,7 +105,14 @@ impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
         let stop_limit = filters.round_price(stop_loss * STOP_LIMIT_SLIP);
 
         let protected = match self
-            .oco_or_reason(&signal.asset, &filters, sellable, take_profit, stop_loss, stop_limit)
+            .oco_or_reason(
+                &signal.asset,
+                &filters,
+                sellable,
+                take_profit,
+                stop_loss,
+                stop_limit,
+            )
             .await
         {
             Ok(oco) => {
@@ -181,11 +188,7 @@ impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
             warn!("{symbol}: position may be unsellable — {rejection}");
         }
 
-        match self
-            .client
-            .market_order(symbol, Side::Sell, sell_qty)
-            .await
-        {
+        match self.client.market_order(symbol, Side::Sell, sell_qty).await {
             Ok(outcome) => {
                 let sell_price = outcome.average_price;
                 if sell_price <= 0.0 {
@@ -407,7 +410,10 @@ mod tests {
             Ok(())
         }
 
-        async fn open_orders(&self, _symbol: &str) -> Result<Vec<crate::exchange::OpenOrder>, String> {
+        async fn open_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<Vec<crate::exchange::OpenOrder>, String> {
             self.log("open_orders");
             Ok(Vec::new())
         }
@@ -453,7 +459,10 @@ mod tests {
             .unwrap();
 
         let pos = &rm.positions[0];
-        assert!(pos.protected, "confirmed OCO must mark the position protected");
+        assert!(
+            pos.protected,
+            "confirmed OCO must mark the position protected"
+        );
         assert_eq!(pos.quantity, 0.003);
         // Entry is the realised fill, not the pre-trade quote.
         assert_eq!(pos.entry_price, 50_100.0);
@@ -674,7 +683,10 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(rm.has_position("BTCUSDC"), "position must survive a failed sell");
+        assert!(
+            rm.has_position("BTCUSDC"),
+            "position must survive a failed sell"
+        );
         assert_eq!(rm.positions[0].quantity, 0.003);
     }
 
@@ -684,12 +696,10 @@ mod tests {
         let notifier = Notifier::disabled("USDC");
         let mut rm = RiskManager::new(10_000.0);
 
-        assert!(
-            Executor::new(&venue, &notifier)
-                .execute_sell("BTCUSDC", &mut rm)
-                .await
-                .is_err()
-        );
+        assert!(Executor::new(&venue, &notifier)
+            .execute_sell("BTCUSDC", &mut rm)
+            .await
+            .is_err());
         assert!(venue.calls().is_empty());
     }
 
@@ -702,7 +712,10 @@ mod tests {
     #[test]
     fn holding_period_never_reports_a_negative_span() {
         // Clock skew must not produce a wrapped, enormous duration.
-        assert_eq!(format_holding_period(1_700_000_000_000, 1_699_000_000_000), "unknown");
+        assert_eq!(
+            format_holding_period(1_700_000_000_000, 1_699_000_000_000),
+            "unknown"
+        );
     }
 
     #[test]

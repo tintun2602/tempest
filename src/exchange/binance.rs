@@ -5,9 +5,9 @@
 //! traits in the parent module.
 
 use super::{
-    AccountProvider, AccountSnapshot, Balance, Candle, ExecutionProvider, Fill,
-    InstrumentProvider, MarketDataProvider, OcoPlacement, OpenOrder, OrderKind, OrderOutcome,
-    Side, SymbolFilters, weighted_average_price,
+    weighted_average_price, AccountProvider, AccountSnapshot, Balance, Candle, ExecutionProvider,
+    Fill, InstrumentProvider, MarketDataProvider, OcoPlacement, OpenOrder, OrderKind, OrderOutcome,
+    Side, SymbolFilters,
 };
 use crate::config::Config;
 use hmac::{Hmac, Mac};
@@ -108,9 +108,8 @@ impl BinanceClient {
         limit: u32,
         end_time: Option<u64>,
     ) -> Result<Vec<Candle>, String> {
-        let mut url = format!(
-            "{base_url}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        );
+        let mut url =
+            format!("{base_url}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}");
         if let Some(end) = end_time {
             url.push_str(&format!("&endTime={end}"));
         }
@@ -442,7 +441,11 @@ fn parse_order_outcome(
     let average_price = weighted_average_price(&fills).unwrap_or_else(|| {
         let quote_qty = parse_str_f64_or_zero(&resp["cummulativeQuoteQty"]);
         let exec_qty = parse_str_f64_or_zero(&resp["executedQty"]);
-        if exec_qty > 0.0 { quote_qty / exec_qty } else { 0.0 }
+        if exec_qty > 0.0 {
+            quote_qty / exec_qty
+        } else {
+            0.0
+        }
     });
 
     OrderOutcome {
@@ -474,8 +477,8 @@ fn parse_symbol_filters(resp: &serde_json::Value, symbol: &str) -> Result<Symbol
         })
     };
 
-    let lot = find("LOT_SIZE")
-        .ok_or_else(|| format!("{symbol}: exchangeInfo has no LOT_SIZE filter"))?;
+    let lot =
+        find("LOT_SIZE").ok_or_else(|| format!("{symbol}: exchangeInfo has no LOT_SIZE filter"))?;
     let price = find("PRICE_FILTER")
         .ok_or_else(|| format!("{symbol}: exchangeInfo has no PRICE_FILTER"))?;
     // Older symbols expose MIN_NOTIONAL; newer ones expose NOTIONAL.
@@ -652,7 +655,10 @@ mod tests {
                 {"filterType": "MIN_NOTIONAL", "minNotional": "10.00000000"}
             ]
         }]});
-        assert_eq!(parse_symbol_filters(&resp, "BTCUSDT").unwrap().min_notional, 10.0);
+        assert_eq!(
+            parse_symbol_filters(&resp, "BTCUSDT").unwrap().min_notional,
+            10.0
+        );
     }
 
     #[test]
@@ -694,8 +700,18 @@ mod tests {
     #[test]
     fn candle_parses_positional_row() {
         let row = json!([
-            1_700_000_000_000u64, "42000.00", "42500.00", "41800.00", "42300.00",
-            "123.45", 1_700_086_399_999u64, "5215000.0", 900, "60.0", "2500000.0", "0"
+            1_700_000_000_000u64,
+            "42000.00",
+            "42500.00",
+            "41800.00",
+            "42300.00",
+            "123.45",
+            1_700_086_399_999u64,
+            "5215000.0",
+            900,
+            "60.0",
+            "2500000.0",
+            "0"
         ]);
         let c = parse_candle(&row).expect("row parses");
         assert_eq!(c.open_time, 1_700_000_000_000);
@@ -726,7 +742,10 @@ mod tests {
         // BTC counts free + locked; zero-balance ETH is dropped.
         assert_eq!(
             snap.assets,
-            vec![Balance { asset: "BTC".into(), quantity: 0.003 }]
+            vec![Balance {
+                asset: "BTC".into(),
+                quantity: 0.003
+            }]
         );
     }
 
@@ -742,7 +761,10 @@ mod tests {
         assert_eq!(snap.free_quote, 5.00);
         assert_eq!(
             snap.assets,
-            vec![Balance { asset: "USDC".into(), quantity: 19.42 }]
+            vec![Balance {
+                asset: "USDC".into(),
+                quantity: 19.42
+            }]
         );
     }
 

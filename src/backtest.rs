@@ -1,9 +1,9 @@
 use crate::costs::CostModel;
-use std::collections::HashMap;
 use crate::exchange::{Candle, MarketDataProvider};
 use crate::risk::RiskManager;
 use crate::strategy::{self, Signal};
 use rand::Rng;
+use std::collections::HashMap;
 use tracing::info;
 
 const STARTING_BALANCE: f64 = 10_000.0;
@@ -71,12 +71,7 @@ struct SimPosition {
 /// A take-profit is a resting limit order: it fills at its price and pays the
 /// maker fee. Everything else — a triggered stop, a signal exit, the final
 /// mark — crosses the book and pays taker plus slippage.
-fn settle(
-    pos: &SimPosition,
-    exit_quote: f64,
-    reason: ExitReason,
-    costs: &CostModel,
-) -> SimTrade {
+fn settle(pos: &SimPosition, exit_quote: f64, reason: ExitReason, costs: &CostModel) -> SimTrade {
     let resting = reason == ExitReason::TakeProfit;
     let exit_price = if resting {
         costs.limit_fill(exit_quote)
@@ -101,8 +96,16 @@ fn settle(
         exit_price,
         quantity: pos.quantity,
         pnl,
-        pnl_pct: if entry_notional > 0.0 { pnl / entry_notional * 100.0 } else { 0.0 },
-        equity_return: if pos.equity_at_entry > 0.0 { pnl / pos.equity_at_entry } else { 0.0 },
+        pnl_pct: if entry_notional > 0.0 {
+            pnl / entry_notional * 100.0
+        } else {
+            0.0
+        },
+        equity_return: if pos.equity_at_entry > 0.0 {
+            pnl / pos.equity_at_entry
+        } else {
+            0.0
+        },
         fees,
         exit_reason: reason,
     }
@@ -149,10 +152,16 @@ async fn backtest_symbol<M: MarketDataProvider>(
     let four_hour = client.klines_extended(symbol, "4h", 6000).await?;
 
     if daily.len() < 210 {
-        return Err(format!("Only {} daily candles available, need 210+", daily.len()));
+        return Err(format!(
+            "Only {} daily candles available, need 210+",
+            daily.len()
+        ));
     }
     if four_hour.len() < 50 {
-        return Err(format!("Only {} 4H candles available, need 50+", four_hour.len()));
+        return Err(format!(
+            "Only {} 4H candles available, need 50+",
+            four_hour.len()
+        ));
     }
 
     info!(
@@ -172,7 +181,13 @@ async fn backtest_symbol<M: MarketDataProvider>(
     // `four_hour[j].close_time` is ever read, so there is still no look-ahead.
     // Run the same history twice. The frictionless pass isolates what the
     // strategy found; the costed pass is what a real account would have kept.
-    let gross = simulate(symbol, &daily, &four_hour, &CostModel::frictionless(), risk_per_trade);
+    let gross = simulate(
+        symbol,
+        &daily,
+        &four_hour,
+        &CostModel::frictionless(),
+        risk_per_trade,
+    );
     let net = simulate(symbol, &daily, &four_hour, costs, risk_per_trade);
 
     print_diagnostics(&net.diagnostics);
@@ -182,7 +197,14 @@ async fn backtest_symbol<M: MarketDataProvider>(
     }
     print_report(symbol, &net.trades, net.final_balance, net.max_drawdown);
     print_monte_carlo_report(&net.trades);
-    print_period_split(symbol, &daily, &four_hour, costs, risk_per_trade, net.first_bar);
+    print_period_split(
+        symbol,
+        &daily,
+        &four_hour,
+        costs,
+        risk_per_trade,
+        net.first_bar,
+    );
     print_risk_sweep(&daily, &four_hour, costs, symbol);
 
     Ok(())
@@ -304,10 +326,18 @@ fn simulate(
         let macd_ok = snap.macd_crossed_bullish_recently;
         let stop_dist = snap.current_price - snap.swing_low;
         let rr_ok = stop_dist > 0.0; // RR is always 2.0 by construction
-        if trend_ok { diagnostics.trend += 1; }
-        if rsi_ok { diagnostics.rsi += 1; }
-        if macd_ok { diagnostics.macd += 1; }
-        if rr_ok { diagnostics.rr += 1; }
+        if trend_ok {
+            diagnostics.trend += 1;
+        }
+        if rsi_ok {
+            diagnostics.rsi += 1;
+        }
+        if macd_ok {
+            diagnostics.macd += 1;
+        }
+        if rr_ok {
+            diagnostics.rr += 1;
+        }
         if trend_ok && rsi_ok && macd_ok && rr_ok {
             diagnostics.all_aligned += 1;
             if position.is_some() {
@@ -390,7 +420,6 @@ fn simulate(
         trades.push(trade);
     }
 
-
     SimResult {
         trades,
         final_balance: balance,
@@ -433,7 +462,6 @@ fn buy_and_hold(bars: &[Candle], costs: &CostModel) -> (f64, f64) {
     (proceeds - costs.taker_cost(proceeds), max_drawdown)
 }
 
-
 /// Aggregate the trailing 4H bars belonging to the unfinished day starting at
 /// `day_open` into the partial daily candle a venue would report.
 ///
@@ -474,10 +502,26 @@ fn print_diagnostics(d: &Diagnostics) {
         d.evaluated,
         evaluated / BARS_PER_DAY
     );
-    println!("    Trend  (price > EMA50 > EMA200): {:>5} bars ({:.1}%)", d.trend, pct(d.trend));
-    println!("    RSI    (35-55):                  {:>5} bars ({:.1}%)", d.rsi, pct(d.rsi));
-    println!("    MACD   (bullish cross last 3):   {:>5} bars ({:.1}%)", d.macd, pct(d.macd));
-    println!("    R:R    (stop > 0):               {:>5} bars ({:.1}%)", d.rr, pct(d.rr));
+    println!(
+        "    Trend  (price > EMA50 > EMA200): {:>5} bars ({:.1}%)",
+        d.trend,
+        pct(d.trend)
+    );
+    println!(
+        "    RSI    (35-55):                  {:>5} bars ({:.1}%)",
+        d.rsi,
+        pct(d.rsi)
+    );
+    println!(
+        "    MACD   (bullish cross last 3):   {:>5} bars ({:.1}%)",
+        d.macd,
+        pct(d.macd)
+    );
+    println!(
+        "    R:R    (stop > 0):               {:>5} bars ({:.1}%)",
+        d.rr,
+        pct(d.rr)
+    );
     println!("    {}", "-".repeat(46));
     println!(
         "    ALL four aligned:                {:>5} bars ({:.2}%)",
@@ -689,7 +733,10 @@ fn print_monte_carlo_report(trades: &[SimTrade]) {
     max_drawdowns.sort_by(f64::total_cmp);
     worst_losing_streak.sort_by(f64::total_cmp);
 
-    println!("\n  Monte Carlo ({} runs, trade returns resampled):", MONTE_CARLO_RUNS);
+    println!(
+        "\n  Monte Carlo ({} runs, trade returns resampled):",
+        MONTE_CARLO_RUNS
+    );
     println!(
         "    Final balance p5 / p50 / p95: {:.2} / {:.2} / {:.2}",
         percentile(&final_balances, 0.05),
@@ -751,20 +798,56 @@ fn print_report(symbol: &str, trades: &[SimTrade], final_balance: f64, max_drawd
     println!("╔══════════════════════════════════════════════════╗");
     println!("║  BACKTEST REPORT: {:<31}║", symbol);
     println!("╠══════════════════════════════════════════════════╣");
-    println!("║  Starting Balance:  {:>10.2} USDT             ║", STARTING_BALANCE);
-    println!("║  Final Balance:     {:>10.2} USDT             ║", final_balance);
-    println!("║  Total Return:      {:>+10.2}%                 ║", total_return);
-    println!("║  Total PnL:         {:>+10.2} USDT             ║", total_pnl);
+    println!(
+        "║  Starting Balance:  {:>10.2} USDT             ║",
+        STARTING_BALANCE
+    );
+    println!(
+        "║  Final Balance:     {:>10.2} USDT             ║",
+        final_balance
+    );
+    println!(
+        "║  Total Return:      {:>+10.2}%                 ║",
+        total_return
+    );
+    println!(
+        "║  Total PnL:         {:>+10.2} USDT             ║",
+        total_pnl
+    );
     println!("╠══════════════════════════════════════════════════╣");
-    println!("║  Total Trades:      {:>10}                   ║", total_trades);
-    println!("║  Winners:           {:>10}                   ║", win_count);
-    println!("║  Losers:            {:>10}                   ║", loss_count);
-    println!("║  Win Rate:          {:>10.1}%                 ║", win_rate);
+    println!(
+        "║  Total Trades:      {:>10}                   ║",
+        total_trades
+    );
+    println!(
+        "║  Winners:           {:>10}                   ║",
+        win_count
+    );
+    println!(
+        "║  Losers:            {:>10}                   ║",
+        loss_count
+    );
+    println!(
+        "║  Win Rate:          {:>10.1}%                 ║",
+        win_rate
+    );
     println!("╠══════════════════════════════════════════════════╣");
-    println!("║  Avg Win:           {:>+10.2} USDT             ║", avg_win);
-    println!("║  Avg Loss:          {:>+10.2} USDT             ║", avg_loss);
-    println!("║  Profit Factor:     {:>10.2}                   ║", profit_factor);
-    println!("║  Max Drawdown:      {:>10.2}%                 ║", max_drawdown);
+    println!(
+        "║  Avg Win:           {:>+10.2} USDT             ║",
+        avg_win
+    );
+    println!(
+        "║  Avg Loss:          {:>+10.2} USDT             ║",
+        avg_loss
+    );
+    println!(
+        "║  Profit Factor:     {:>10.2}                   ║",
+        profit_factor
+    );
+    println!(
+        "║  Max Drawdown:      {:>10.2}%                 ║",
+        max_drawdown
+    );
     println!("╚══════════════════════════════════════════════════╝");
 
     if !trades.is_empty() {
@@ -792,7 +875,7 @@ fn print_report(symbol: &str, trades: &[SimTrade], final_balance: f64, max_drawd
 
 #[cfg(test)]
 mod tests {
-    use super::{Candle, partial_daily, percentile};
+    use super::{partial_daily, percentile, Candle};
 
     /// Four-hour bar starting at `open_time` (epoch ms).
     fn bar(open_time: u64, open: f64, high: f64, low: f64, close: f64) -> Candle {
@@ -950,7 +1033,9 @@ fn simulate_portfolio(
             })
             .collect();
         let mark = |symbol: &str, fallback: f64| {
-            bar_data.get(symbol).map_or(fallback, |(_, _, close)| *close)
+            bar_data
+                .get(symbol)
+                .map_or(fallback, |(_, _, close)| *close)
         };
 
         // ---- exits first, so freed cash can fund entries on the same bar ----
@@ -1010,10 +1095,18 @@ fn simulate_portfolio(
             let rsi_ok = snap.rsi_14 >= 35.0 && snap.rsi_14 <= 55.0;
             let macd_ok = snap.macd_crossed_bullish_recently;
             let rr_ok = snap.current_price - snap.swing_low > 0.0;
-            if trend_ok { diagnostics.trend += 1; }
-            if rsi_ok { diagnostics.rsi += 1; }
-            if macd_ok { diagnostics.macd += 1; }
-            if rr_ok { diagnostics.rr += 1; }
+            if trend_ok {
+                diagnostics.trend += 1;
+            }
+            if rsi_ok {
+                diagnostics.rsi += 1;
+            }
+            if macd_ok {
+                diagnostics.macd += 1;
+            }
+            if rr_ok {
+                diagnostics.rr += 1;
+            }
             if trend_ok && rsi_ok && macd_ok && rr_ok {
                 diagnostics.all_aligned += 1;
                 if positions.iter().any(|p| p.symbol == feed.symbol) {
@@ -1160,11 +1253,8 @@ async fn portfolio_backtest<M: MarketDataProvider>(
     // Align on the intersection of bar timestamps. Trimming to a common start
     // is not enough: a single missing bar on one symbol would shift every later
     // index and silently compare different moments in time.
-    let mut common: std::collections::HashSet<u64> = feeds[0]
-        .four_hour
-        .iter()
-        .map(|c| c.open_time)
-        .collect();
+    let mut common: std::collections::HashSet<u64> =
+        feeds[0].four_hour.iter().map(|c| c.open_time).collect();
     for feed in &feeds[1..] {
         let times: std::collections::HashSet<u64> =
             feed.four_hour.iter().map(|c| c.open_time).collect();
@@ -1214,7 +1304,12 @@ async fn portfolio_backtest<M: MarketDataProvider>(
     );
     println!("    Peak concurrent positions: {concurrent_peak}");
 
-    print_report("PORTFOLIO", &result.trades, result.final_balance, result.max_drawdown);
+    print_report(
+        "PORTFOLIO",
+        &result.trades,
+        result.final_balance,
+        result.max_drawdown,
+    );
     print_monte_carlo_report(&result.trades);
 
     Ok(())

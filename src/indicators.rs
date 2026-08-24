@@ -83,7 +83,13 @@ pub fn macd(closes: &[f64], fast: usize, slow: usize, signal_period: usize) -> M
     let macd_line: Vec<f64> = ema_fast
         .iter()
         .zip(ema_slow.iter())
-        .map(|(f, s)| if f.is_nan() || s.is_nan() { f64::NAN } else { f - s })
+        .map(|(f, s)| {
+            if f.is_nan() || s.is_nan() {
+                f64::NAN
+            } else {
+                f - s
+            }
+        })
         .collect();
 
     // Signal line = EMA of the valid (non-NAN) portion of the MACD line
@@ -98,7 +104,13 @@ pub fn macd(closes: &[f64], fast: usize, slow: usize, signal_period: usize) -> M
     let histogram: Vec<f64> = macd_line
         .iter()
         .zip(signal_line.iter())
-        .map(|(m, s)| if m.is_nan() || s.is_nan() { f64::NAN } else { m - s })
+        .map(|(m, s)| {
+            if m.is_nan() || s.is_nan() {
+                f64::NAN
+            } else {
+                m - s
+            }
+        })
         .collect();
 
     MacdResult {
@@ -124,20 +136,16 @@ pub fn find_nearest_swing_low(lows: &[f64], window: usize) -> Option<f64> {
 
     for i in window..(lows.len() - window) {
         let current = lows[i];
-        let is_swing =
-            (1..=window).all(|j| current <= lows[i - j] && current <= lows[i + j]);
+        let is_swing = (1..=window).all(|j| current <= lows[i - j] && current <= lows[i + j]);
         if is_swing {
             swing_lows.push((i, current));
         }
     }
 
-    swing_lows
-        .last()
-        .map(|(_, price)| *price)
-        .or_else(|| {
-            // Fallback: minimum of last 20 candles
-            lows.iter().rev().take(20).copied().reduce(f64::min)
-        })
+    swing_lows.last().map(|(_, price)| *price).or_else(|| {
+        // Fallback: minimum of last 20 candles
+        lows.iter().rev().take(20).copied().reduce(f64::min)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +192,10 @@ mod tests {
         let data: Vec<f64> = (0..30).map(|i| 100.0 + i as f64).collect();
         let result = rsi(&data, 14);
         let last = *result.last().unwrap();
-        assert!(last > 95.0, "Pure gains should yield RSI near 100, got {last}");
+        assert!(
+            last > 95.0,
+            "Pure gains should yield RSI near 100, got {last}"
+        );
     }
 
     #[test]
@@ -192,7 +203,10 @@ mod tests {
         let data: Vec<f64> = (0..30).map(|i| 100.0 - i as f64).collect();
         let result = rsi(&data, 14);
         let last = *result.last().unwrap();
-        assert!(last < 5.0, "Pure losses should yield RSI near 0, got {last}");
+        assert!(
+            last < 5.0,
+            "Pure losses should yield RSI near 0, got {last}"
+        );
     }
 
     #[test]
