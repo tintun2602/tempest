@@ -5,7 +5,8 @@ primary_region = "ams"
 
 [env]
   BINANCE_BASE_URL = "https://api.binance.com"
-  TRADING_PAIRS = "BTCUSDT"
+  QUOTE_ASSET = "USDC"
+  TRADING_PAIRS = "BTCUSDC"
   POLL_INTERVAL_SECONDS = "14400"
   LOG_LEVEL = "info"
 

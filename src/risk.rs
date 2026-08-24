@@ -1,7 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-const MAX_RISK_PER_TRADE: f64 = 0.015; // 1.5% of portfolio
+/// Default fraction of equity risked per trade. Overridable: this is the main
+/// lever on return *and* drawdown, and the right setting depends entirely on
+/// the operator's tolerance.
+pub const DEFAULT_RISK_PER_TRADE: f64 = 0.015; // 1.5% of portfolio
 const MAX_OPEN_POSITIONS: usize = 4;
 const DAILY_DRAWDOWN_LIMIT: f64 = 0.05; // 5%
 /// Largest share of free USDT a single entry may spend, leaving headroom for
@@ -16,10 +19,18 @@ pub struct Position {
     pub stop_loss: f64,
     pub take_profit: f64,
     pub entry_time: u64,
+    /// Whether the exchange has *confirmed* a protective OCO for this position.
+    ///
+    /// Only ever set from a venue acknowledgement. When false, the exchange is
+    /// holding nothing and `check_exits` is the only stop this position has —
+    /// which requires the bot to be alive and polling.
+    pub protected: bool,
 }
 
 pub struct RiskManager {
     pub positions: Vec<Position>,
+    /// Fraction of equity risked on each entry.
+    risk_per_trade: f64,
     /// Total portfolio equity at the start of the current UTC day — the baseline
     /// the daily drawdown limit is measured against.
     pub day_open_equity: f64,
@@ -28,9 +39,17 @@ pub struct RiskManager {
 }
 
 impl RiskManager {
+    /// Risk-per-trade at the default fraction. Production paths read the
+    /// configured value via [`Self::with_risk_per_trade`].
+    #[cfg(test)]
     pub fn new(starting_equity: f64) -> Self {
+        Self::with_risk_per_trade(starting_equity, DEFAULT_RISK_PER_TRADE)
+    }
+
+    pub fn with_risk_per_trade(starting_equity: f64, risk_per_trade: f64) -> Self {
         Self {
             positions: Vec::new(),
+            risk_per_trade,
             day_open_equity: starting_equity,
             current_utc_day: utc_day_number(),
             halted: false,
@@ -111,7 +130,7 @@ impl RiskManager {
             return (0.0, 0.0);
         }
 
-        let risk_amount = equity * MAX_RISK_PER_TRADE;
+        let risk_amount = equity * self.risk_per_trade;
         let mut quantity = risk_amount / stop_distance;
 
         let max_affordable = available_usdt * MAX_NOTIONAL_FRACTION / entry_price;
@@ -133,8 +152,13 @@ impl RiskManager {
     /// Record a newly opened position.
     pub fn open_position(&mut self, pos: Position) {
         info!(
-            "Opened {} | entry {:.2} | qty {:.6} | SL {:.2} | TP {:.2}",
-            pos.symbol, pos.entry_price, pos.quantity, pos.stop_loss, pos.take_profit
+            "Opened {} | entry {:.2} | qty {:.6} | SL {:.2} | TP {:.2} | {}",
+            pos.symbol,
+            pos.entry_price,
+            pos.quantity,
+            pos.stop_loss,
+            pos.take_profit,
+            if pos.protected { "OCO confirmed" } else { "UNPROTECTED" }
         );
         self.positions.push(pos);
     }
@@ -186,6 +210,25 @@ fn utc_day_number() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_risk_per_trade_scales_size_linearly() {
+        // Sizing is the operator's main lever: doubling the risk fraction must
+        // double the position, up to what the balance can fund.
+        let base = RiskManager::with_risk_per_trade(10_000.0, 0.015);
+        let doubled = RiskManager::with_risk_per_trade(10_000.0, 0.030);
+        let (q1, _) = base.calculate_position_size(10_000.0, 1_000_000.0, 50_000.0, 49_000.0);
+        let (q2, _) = doubled.calculate_position_size(10_000.0, 1_000_000.0, 50_000.0, 49_000.0);
+        assert!((q2 - 2.0 * q1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_risk_per_trade_still_capped_by_balance() {
+        // A large risk fraction must not size beyond what the account holds.
+        let rm = RiskManager::with_risk_per_trade(10_000.0, 0.50);
+        let (qty, _) = rm.calculate_position_size(10_000.0, 10_000.0, 50_000.0, 49_000.0);
+        assert!(qty * 50_000.0 <= 10_000.0);
+    }
 
     #[test]
     fn test_position_sizing() {
@@ -241,6 +284,7 @@ mod tests {
                 stop_loss: 90.0,
                 take_profit: 120.0,
                 entry_time: 0,
+                protected: false,
             });
         }
         assert!(!rm.can_open_position());
@@ -265,6 +309,7 @@ mod tests {
             stop_loss: 49_000.0,
             take_profit: 52_000.0,
             entry_time: 0,
+            protected: false,
         });
         assert!(rm.has_position("BTCUSDT"));
         let closed = rm.close_position("BTCUSDT");
@@ -282,6 +327,7 @@ mod tests {
             stop_loss: 2_800.0,
             take_profit: 3_400.0,
             entry_time: 0,
+            protected: false,
         });
         // Price between SL and TP → no exit
         assert!(rm.check_exits("ETHUSDT", 3_100.0).is_none());
@@ -303,6 +349,7 @@ mod tests {
             stop_loss: 0.0,
             take_profit: 0.0,
             entry_time: 0,
+            protected: false,
         });
         assert!(rm.check_exits("BTCUSDT", 50_000.0).is_none());
         assert!(rm.check_exits("BTCUSDT", 1.0).is_none());
@@ -318,6 +365,7 @@ mod tests {
             stop_loss: 48_000.0,
             take_profit: 0.0,
             entry_time: 0,
+            protected: false,
         });
         // Unset target never fires, however high the price goes.
         assert!(rm.check_exits("BTCUSDT", 90_000.0).is_none());

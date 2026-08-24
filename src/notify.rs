@@ -15,16 +15,30 @@ impl Notifier {
         let chat_id = std::env::var("TELEGRAM_CHAT_ID").ok();
         let quote_asset = std::env::var("QUOTE_ASSET").unwrap_or_else(|_| "USDT".to_string());
 
-        if token.is_some() && chat_id.is_some() {
+        let notifier = Self {
+            token,
+            chat_id,
+            quote_asset,
+            http: reqwest::Client::new(),
+        };
+
+        if notifier.is_enabled() {
             tracing::info!("Telegram notifications enabled");
         } else {
             debug!("Telegram not configured — notifications disabled");
         }
 
+        notifier
+    }
+
+    /// A notifier that never sends. Used by tests so no suite run can fire a
+    /// real Telegram message from an operator's ambient environment.
+    #[cfg(test)]
+    pub fn disabled(quote_asset: &str) -> Self {
         Self {
-            token,
-            chat_id,
-            quote_asset,
+            token: None,
+            chat_id: None,
+            quote_asset: quote_asset.to_string(),
             http: reqwest::Client::new(),
         }
     }
