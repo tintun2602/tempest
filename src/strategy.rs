@@ -131,6 +131,64 @@ pub fn compute_indicators(
     })
 }
 
+/// The four conditions a BUY requires, evaluated independently.
+///
+/// Single source of truth: `evaluate` decides from this, the backtest counts
+/// from it, and notifications render it. Restating the thresholds anywhere else
+/// lets a status message claim a setup the strategy would not actually take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryConditions {
+    /// Price above EMA50, and EMA50 above EMA200.
+    pub trend_bullish: bool,
+    /// Daily RSI(14) inside the 35-55 accumulation band.
+    pub rsi_ok: bool,
+    /// MACD crossed bullish within the last 3 four-hour candles.
+    pub macd_crossed: bool,
+    /// A swing low exists below price, so risk is measurable.
+    ///
+    /// Reward-to-risk is 2.0 by construction whenever this holds, since the
+    /// target is set at twice the stop distance.
+    pub stop_valid: bool,
+}
+
+impl EntryConditions {
+    pub fn evaluate(snap: &IndicatorSnapshot) -> Self {
+        Self {
+            trend_bullish: snap.current_price > snap.ema_50 && snap.ema_50 > snap.ema_200,
+            rsi_ok: snap.rsi_14 >= 35.0 && snap.rsi_14 <= 55.0,
+            macd_crossed: snap.macd_crossed_bullish_recently,
+            stop_valid: snap.current_price - snap.swing_low > 0.0,
+        }
+    }
+
+    /// Every condition holds, so a BUY is taken.
+    pub fn all_met(&self) -> bool {
+        self.trend_bullish && self.rsi_ok && self.macd_crossed && self.stop_valid
+    }
+
+    pub fn met_count(&self) -> usize {
+        [
+            self.trend_bullish,
+            self.rsi_ok,
+            self.macd_crossed,
+            self.stop_valid,
+        ]
+        .iter()
+        .filter(|met| **met)
+        .count()
+    }
+
+    /// `(label, met)` per condition, in evaluation order.
+    pub fn checklist(&self) -> [(&'static str, bool); 4] {
+        [
+            ("Trend  price > EMA50 > EMA200", self.trend_bullish),
+            ("RSI    within 35-55", self.rsi_ok),
+            ("MACD   bullish cross <=3 bars", self.macd_crossed),
+            ("Stop   swing low below price", self.stop_valid),
+        ]
+    }
+}
+
 /// Evaluate the indicator snapshot against entry/exit rules and return a signal.
 pub fn evaluate(symbol: &str, snap: &IndicatorSnapshot) -> TradeSignal {
     let mut warnings: Vec<String> = Vec::new();
@@ -140,16 +198,16 @@ pub fn evaluate(symbol: &str, snap: &IndicatorSnapshot) -> TradeSignal {
     // BUY conditions (ALL must be true)
     // -----------------------------------------------------------------------
 
-    // 1. Trend: price > EMA50 > EMA200
-    let trend_bullish = snap.current_price > snap.ema_50 && snap.ema_50 > snap.ema_200;
+    let conditions = EntryConditions::evaluate(snap);
+    let EntryConditions {
+        trend_bullish,
+        rsi_ok,
+        macd_crossed,
+        ..
+    } = conditions;
 
-    // 2. RSI(14) daily between 35 and 55
-    let rsi_ok = snap.rsi_14 >= 35.0 && snap.rsi_14 <= 55.0;
-
-    // 3. MACD crossed bullish within last 3 four-hour candles
-    let macd_crossed = snap.macd_crossed_bullish_recently;
-
-    // 4. Reward-to-risk >= 2.0
+    // Reward-to-risk is 2.0 by construction: the target sits at twice the stop
+    // distance, so `rr_ok` holds exactly when a stop distance exists.
     let stop_distance = snap.current_price - snap.swing_low;
     let take_profit = snap.current_price + 2.0 * stop_distance;
     let rr_ratio = if stop_distance > 0.0 {
@@ -157,7 +215,6 @@ pub fn evaluate(symbol: &str, snap: &IndicatorSnapshot) -> TradeSignal {
     } else {
         0.0
     };
-    let rr_ok = rr_ratio >= 2.0;
 
     // Warn on extreme stop distances
     let stop_pct = if snap.current_price > 0.0 {
@@ -200,7 +257,7 @@ pub fn evaluate(symbol: &str, snap: &IndicatorSnapshot) -> TradeSignal {
     });
 
     // ----- BUY -----
-    let all_buy = trend_bullish && rsi_ok && macd_crossed && rr_ok && stop_distance > 0.0;
+    let all_buy = conditions.all_met();
 
     if all_buy {
         let confidence = if snap.rsi_14 < 45.0 && stop_pct < 5.0 {
@@ -267,5 +324,85 @@ pub fn evaluate(symbol: &str, snap: &IndicatorSnapshot) -> TradeSignal {
         risk_reward_ratio: rr_ratio,
         reasoning: reasons.join(". "),
         warnings,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot that satisfies every entry condition.
+    fn qualifying() -> IndicatorSnapshot {
+        IndicatorSnapshot {
+            ema_50: 60_000.0,
+            ema_200: 55_000.0,
+            rsi_14: 45.0,
+            macd_line: 10.0,
+            macd_signal: 5.0,
+            macd_histogram: 5.0,
+            macd_crossed_bullish_recently: true,
+            current_price: 62_000.0,
+            swing_low: 59_000.0,
+        }
+    }
+
+    #[test]
+    fn a_qualifying_setup_meets_every_condition() {
+        let c = EntryConditions::evaluate(&qualifying());
+        assert!(c.all_met());
+        assert_eq!(c.met_count(), 4);
+    }
+
+    #[test]
+    fn buy_is_returned_exactly_when_all_conditions_hold() {
+        // The invariant the status message depends on: if the checklist shows
+        // 4/4, the strategy must actually take the trade. Otherwise a
+        // notification could promise a setup that never fires.
+        let snap = qualifying();
+        assert!(EntryConditions::evaluate(&snap).all_met());
+        assert_eq!(evaluate("BTCUSDC", &snap).signal, Signal::Buy);
+    }
+
+    #[test]
+    fn no_buy_while_any_condition_fails() {
+        let mut snap = qualifying();
+        snap.rsi_14 = 80.0; // outside the 35-55 band
+        let c = EntryConditions::evaluate(&snap);
+        assert!(!c.all_met());
+        assert_eq!(c.met_count(), 3);
+        assert_ne!(evaluate("BTCUSDC", &snap).signal, Signal::Buy);
+    }
+
+    #[test]
+    fn an_inverted_ema_stack_fails_the_trend_check() {
+        // The live case today: price is above EMA50, but EMA50 sits below
+        // EMA200, so the trend condition must still fail.
+        let mut snap = qualifying();
+        snap.ema_50 = 66_756.0;
+        snap.ema_200 = 71_203.0;
+        snap.current_price = 77_214.0;
+        let c = EntryConditions::evaluate(&snap);
+        assert!(!c.trend_bullish);
+    }
+
+    #[test]
+    fn a_swing_low_above_price_invalidates_the_stop() {
+        let mut snap = qualifying();
+        snap.swing_low = snap.current_price + 1.0;
+        assert!(!EntryConditions::evaluate(&snap).stop_valid);
+    }
+
+    #[test]
+    fn checklist_agrees_with_the_individual_flags() {
+        let mut snap = qualifying();
+        snap.macd_crossed_bullish_recently = false;
+        let c = EntryConditions::evaluate(&snap);
+        let checklist = c.checklist();
+        assert_eq!(checklist.len(), 4);
+        assert_eq!(
+            checklist.iter().filter(|(_, met)| *met).count(),
+            c.met_count()
+        );
+        assert!(!checklist[2].1, "MACD row must reflect the failed cross");
     }
 }

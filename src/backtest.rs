@@ -1,7 +1,7 @@
 use crate::costs::CostModel;
 use crate::exchange::{Candle, MarketDataProvider};
 use crate::risk::RiskManager;
-use crate::strategy::{self, Signal};
+use crate::strategy::{self, EntryConditions, Signal};
 use rand::Rng;
 use std::collections::HashMap;
 use tracing::info;
@@ -234,6 +234,20 @@ struct Diagnostics {
     blocked_in_position: u32,
 }
 
+impl Diagnostics {
+    fn record(&mut self, conditions: &EntryConditions, already_long: bool) {
+        self.evaluated += 1;
+        self.trend += u32::from(conditions.trend_bullish);
+        self.rsi += u32::from(conditions.rsi_ok);
+        self.macd += u32::from(conditions.macd_crossed);
+        self.rr += u32::from(conditions.stop_valid);
+        if conditions.all_met() {
+            self.all_aligned += 1;
+            self.blocked_in_position += u32::from(already_long);
+        }
+    }
+}
+
 /// Walk the history once under a given cost model. Pure: no I/O, so it can be
 /// run repeatedly over the same candles.
 fn simulate(
@@ -319,31 +333,10 @@ fn simulate(
 
         let Some(snap) = snap else { continue };
 
-        // Track condition hits for diagnostics
-        diagnostics.evaluated += 1;
-        let trend_ok = snap.current_price > snap.ema_50 && snap.ema_50 > snap.ema_200;
-        let rsi_ok = snap.rsi_14 >= 35.0 && snap.rsi_14 <= 55.0;
-        let macd_ok = snap.macd_crossed_bullish_recently;
-        let stop_dist = snap.current_price - snap.swing_low;
-        let rr_ok = stop_dist > 0.0; // RR is always 2.0 by construction
-        if trend_ok {
-            diagnostics.trend += 1;
-        }
-        if rsi_ok {
-            diagnostics.rsi += 1;
-        }
-        if macd_ok {
-            diagnostics.macd += 1;
-        }
-        if rr_ok {
-            diagnostics.rr += 1;
-        }
-        if trend_ok && rsi_ok && macd_ok && rr_ok {
-            diagnostics.all_aligned += 1;
-            if position.is_some() {
-                diagnostics.blocked_in_position += 1;
-            }
-        }
+        diagnostics.record(
+            &EntryConditions::evaluate(&snap),
+            position.is_some(),
+        );
 
         let signal = strategy::evaluate(symbol, &snap);
 
@@ -1090,29 +1083,10 @@ fn simulate_portfolio(
 
             let Some(snap) = snap else { continue };
 
-            diagnostics.evaluated += 1;
-            let trend_ok = snap.current_price > snap.ema_50 && snap.ema_50 > snap.ema_200;
-            let rsi_ok = snap.rsi_14 >= 35.0 && snap.rsi_14 <= 55.0;
-            let macd_ok = snap.macd_crossed_bullish_recently;
-            let rr_ok = snap.current_price - snap.swing_low > 0.0;
-            if trend_ok {
-                diagnostics.trend += 1;
-            }
-            if rsi_ok {
-                diagnostics.rsi += 1;
-            }
-            if macd_ok {
-                diagnostics.macd += 1;
-            }
-            if rr_ok {
-                diagnostics.rr += 1;
-            }
-            if trend_ok && rsi_ok && macd_ok && rr_ok {
-                diagnostics.all_aligned += 1;
-                if positions.iter().any(|p| p.symbol == feed.symbol) {
-                    diagnostics.blocked_in_position += 1;
-                }
-            }
+            diagnostics.record(
+                &EntryConditions::evaluate(&snap),
+                positions.iter().any(|p| p.symbol == feed.symbol),
+            );
 
             let signal = strategy::evaluate(&feed.symbol, &snap);
             let held = positions.iter().position(|p| p.symbol == feed.symbol);

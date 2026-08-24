@@ -21,6 +21,34 @@ use strategy::Signal;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
+/// How long to stay quiet when nothing about a symbol's setup has changed.
+const STATUS_QUIET_HOURS: u64 = 24;
+
+/// Decides when a per-symbol status message is worth sending.
+///
+/// Every cycle would be six messages a day about a bot that trades twice a
+/// month. Only a change in how many conditions are met is genuinely news; the
+/// daily floor exists so silence still distinguishes "waiting" from "dead".
+#[derive(Default)]
+struct StatusTracker {
+    last: std::collections::HashMap<String, (u64, usize)>,
+}
+
+impl StatusTracker {
+    fn should_send(&mut self, symbol: &str, met: usize, now_ms: u64, quiet_ms: u64) -> bool {
+        let send = match self.last.get(symbol) {
+            None => true,
+            Some((sent_at, previous)) => {
+                *previous != met || now_ms.saturating_sub(*sent_at) >= quiet_ms
+            }
+        };
+        if send {
+            self.last.insert(symbol.to_string(), (now_ms, met));
+        }
+        send
+    }
+}
+
 /// Positions worth less than this are leftover fractions, not real holdings.
 const DUST_NOTIONAL: f64 = 5.0;
 
@@ -71,7 +99,13 @@ async fn main() {
     };
 
     notifier
-        .notify_startup(equity.total, &config.trading_pairs)
+        .notify_startup(
+            equity.total,
+            equity.free_quote,
+            &config.trading_pairs,
+            config.risk_per_trade,
+            config.poll_interval_secs,
+        )
         .await;
 
     info!(
@@ -79,6 +113,7 @@ async fn main() {
         config.risk_per_trade * 100.0
     );
     let mut risk_manager = RiskManager::with_risk_per_trade(equity.total, config.risk_per_trade);
+    let mut status = StatusTracker::default();
 
     // Detect positions held from a prior crash that lack OCO protection.
     reconcile_positions(&client, &config, &mut risk_manager, &notifier).await;
@@ -86,7 +121,9 @@ async fn main() {
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
 
     loop {
-        if let Err(e) = run_cycle(&client, &config, &mut risk_manager, &notifier).await {
+        if let Err(e) =
+            run_cycle(&client, &config, &mut risk_manager, &notifier, &mut status).await
+        {
             error!("Cycle error: {e}");
             notifier.notify_error("Cycle", &e).await;
         }
@@ -100,6 +137,7 @@ async fn run_cycle<C>(
     config: &Config,
     risk_manager: &mut RiskManager,
     notifier: &Notifier,
+    status: &mut StatusTracker,
 ) -> Result<(), String>
 where
     C: MarketDataProvider + AccountProvider + ExecutionProvider + InstrumentProvider,
@@ -186,6 +224,19 @@ where
             warn!("{symbol}: {}", signal.warnings.join("; "));
         }
 
+        let conditions = strategy::EntryConditions::evaluate(&snap);
+        let quiet_ms = STATUS_QUIET_HOURS * 3_600_000;
+        if status.should_send(symbol, conditions.met_count(), now_ms(), quiet_ms) {
+            notifier
+                .notify_status(
+                    symbol,
+                    &snap,
+                    &conditions,
+                    risk_manager.positions.iter().find(|p| p.symbol == *symbol),
+                )
+                .await;
+        }
+
         match signal.signal {
             Signal::Buy => {
                 if risk_manager.has_position(symbol) {
@@ -245,6 +296,12 @@ where
         equity.free_quote
     );
     Ok(())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Portfolio value split into the cash that can fund new entries and the total
@@ -566,6 +623,56 @@ mod tests {
     use super::*;
 
     const BTC_PRICE: f64 = 77_000.0;
+
+    // ----- status throttling -----
+
+    const HOUR: u64 = 3_600_000;
+    const QUIET: u64 = 24 * HOUR;
+
+    #[test]
+    fn first_status_for_a_symbol_is_always_sent() {
+        let mut t = StatusTracker::default();
+        assert!(t.should_send("BTCUSDC", 1, 0, QUIET));
+    }
+
+    #[test]
+    fn an_unchanged_setup_stays_quiet() {
+        let mut t = StatusTracker::default();
+        assert!(t.should_send("BTCUSDC", 1, 0, QUIET));
+        // Six polls a day about a bot that trades twice a month is noise.
+        assert!(!t.should_send("BTCUSDC", 1, 4 * HOUR, QUIET));
+        assert!(!t.should_send("BTCUSDC", 1, 20 * HOUR, QUIET));
+    }
+
+    #[test]
+    fn a_change_in_conditions_reports_immediately() {
+        let mut t = StatusTracker::default();
+        assert!(t.should_send("BTCUSDC", 1, 0, QUIET));
+        // Moving from 1/4 to 3/4 is exactly what is worth knowing.
+        assert!(t.should_send("BTCUSDC", 3, 4 * HOUR, QUIET));
+        // ...and losing it again.
+        assert!(t.should_send("BTCUSDC", 2, 8 * HOUR, QUIET));
+    }
+
+    #[test]
+    fn a_daily_heartbeat_survives_a_static_setup() {
+        // Silence must still mean "alive and waiting", not "wedged".
+        let mut t = StatusTracker::default();
+        assert!(t.should_send("BTCUSDC", 1, 0, QUIET));
+        assert!(!t.should_send("BTCUSDC", 1, 23 * HOUR, QUIET));
+        assert!(t.should_send("BTCUSDC", 1, 25 * HOUR, QUIET));
+    }
+
+    #[test]
+    fn symbols_are_throttled_independently() {
+        let mut t = StatusTracker::default();
+        assert!(t.should_send("BTCUSDC", 1, 0, QUIET));
+        // A quiet BTC must not suppress a first report for ETH.
+        assert!(t.should_send("ETHUSDC", 1, 0, QUIET));
+        assert!(!t.should_send("BTCUSDC", 1, HOUR, QUIET));
+    }
+
+    // ----- position sync -----
 
     #[test]
     fn position_still_fully_held_is_unchanged() {

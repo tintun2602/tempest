@@ -1,3 +1,5 @@
+use crate::risk::Position;
+use crate::strategy::{EntryConditions, IndicatorSnapshot};
 use tracing::{debug, warn};
 
 /// Telegram notifier. If `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are not set,
@@ -159,14 +161,104 @@ impl Notifier {
         self.send(&msg).await;
     }
 
-    pub async fn notify_startup(&self, equity: f64, pairs: &[String]) {
-        let pairs_str = pairs.join(", ");
+    pub async fn notify_startup(
+        &self,
+        equity: f64,
+        free: f64,
+        pairs: &[String],
+        risk_per_trade: f64,
+        poll_interval_secs: u64,
+    ) {
         let msg = format!(
-            "\u{1f680} *Bot Started*\n\
-             Equity: `{equity:.2}` {}\n\
-             Pairs: {pairs_str}",
-            self.quote_asset
+            "\u{1f680} *Tempest Started*\n\
+             Equity: `{equity:.2}` {quote} (`{free:.2}` free)\n\
+             Pairs: {pairs}\n\
+             Risk/trade: `{risk:.2}%` \u{b7} Poll: every `{hours:.0}h`",
+            quote = self.quote_asset,
+            pairs = pairs.join(", "),
+            risk = risk_per_trade * 100.0,
+            hours = poll_interval_secs as f64 / 3600.0,
         );
         self.send(&msg).await;
+    }
+
+    /// Per-symbol state: either how close the setup is, or how an open
+    /// position is doing.
+    ///
+    /// Signals average a fortnight apart, so without this the bot is silent for
+    /// weeks and there is no way to tell "waiting correctly" from "wedged".
+    pub async fn notify_status(
+        &self,
+        symbol: &str,
+        snap: &IndicatorSnapshot,
+        conditions: &EntryConditions,
+        position: Option<&Position>,
+    ) {
+        let msg = match position {
+            Some(pos) => Self::position_status(symbol, snap, pos),
+            None => Self::entry_status(symbol, snap, conditions),
+        };
+        self.send(&msg).await;
+    }
+
+    fn entry_status(
+        symbol: &str,
+        snap: &IndicatorSnapshot,
+        conditions: &EntryConditions,
+    ) -> String {
+        let mut msg = format!(
+            "\u{1f440} *{symbol}* \u{2014} flat\n\
+             Price `{price:.2}` \u{b7} RSI `{rsi:.1}`\n\
+             EMA50 `{ema50:.2}` \u{b7} EMA200 `{ema200:.2}`\n\n",
+            price = snap.current_price,
+            rsi = snap.rsi_14,
+            ema50 = snap.ema_50,
+            ema200 = snap.ema_200,
+        );
+
+        for (label, met) in conditions.checklist() {
+            let mark = if met { "\u{2705}" } else { "\u{274c}" };
+            msg.push_str(&format!("{mark} {label}\n"));
+        }
+
+        msg.push_str(&format!(
+            "\n*{}/4* conditions met",
+            conditions.met_count()
+        ));
+        msg
+    }
+
+    fn position_status(symbol: &str, snap: &IndicatorSnapshot, pos: &Position) -> String {
+        let price = snap.current_price;
+        let pnl_pct = if pos.entry_price > 0.0 {
+            (price - pos.entry_price) / pos.entry_price * 100.0
+        } else {
+            0.0
+        };
+        let to = |level: f64| {
+            if level > 0.0 && price > 0.0 {
+                format!("`{level:.2}` ({:+.1}%)", (level - price) / price * 100.0)
+            } else {
+                "_unset_".to_string()
+            }
+        };
+
+        format!(
+            "\u{1f4c8} *{symbol}* \u{2014} long\n\
+             Entry `{entry:.2}` \u{b7} Now `{price:.2}` (`{pnl_pct:+.2}%`)\n\
+             Qty `{qty:.8}`\n\
+             SL {sl}\n\
+             TP {tp}\n\
+             Bracket: {bracket}",
+            entry = pos.entry_price,
+            qty = pos.quantity,
+            sl = to(pos.stop_loss),
+            tp = to(pos.take_profit),
+            bracket = if pos.protected {
+                "\u{2705} confirmed on exchange"
+            } else {
+                "\u{26a0}\u{fe0f} *UNPROTECTED*"
+            },
+        )
     }
 }
