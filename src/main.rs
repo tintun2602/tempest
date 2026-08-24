@@ -65,6 +65,7 @@ async fn main() {
             Equity {
                 free_quote: 0.0,
                 total: 0.0,
+                holdings: Vec::new(),
             }
         }
     };
@@ -118,6 +119,11 @@ where
     // every entry as a loss the size of the position notional, which trips the
     // 5% halt after a single trade.
     let equity = fetch_equity(client, config).await?;
+
+    // Before any exit logic runs: the exchange may have closed a position for
+    // us since the last poll.
+    sync_positions_with_exchange(risk_manager, &equity, notifier).await;
+
     risk_manager.check_day_reset(equity.total);
 
     if risk_manager.check_drawdown(equity.total) {
@@ -246,6 +252,103 @@ where
 struct Equity {
     free_quote: f64,
     total: f64,
+    /// Base assets actually held that map to a configured pair, already priced.
+    holdings: Vec<Holding>,
+}
+
+/// What the exchange says we hold, and what it is worth.
+struct Holding {
+    symbol: String,
+    quantity: f64,
+    price: f64,
+}
+
+impl Equity {
+    fn holding(&self, symbol: &str) -> Option<&Holding> {
+        self.holdings.iter().find(|h| h.symbol == symbol)
+    }
+}
+
+/// What the exchange's view of a position implies about our tracked copy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PositionSync {
+    Unchanged,
+    /// Partially filled or partially sold elsewhere.
+    Resized { to: f64 },
+    /// The exchange no longer backs this position at a tradable size.
+    ClosedExternally,
+}
+
+/// Tolerance before a shortfall counts as a real change, absorbing fee dust
+/// and float error.
+const QUANTITY_TOLERANCE: f64 = 0.999;
+
+/// Compare a tracked position against the balance the exchange reports.
+///
+/// The protective OCO fills on Binance, not here. When it does, the base asset
+/// is gone while the `RiskManager` still holds the position — and the next
+/// cycle tries to sell an asset we do not have, fails, and repeats that every
+/// poll until restart.
+///
+/// A remnant worth less than the minimum notional counts as closed: it cannot
+/// be sold, so tracking it as a position achieves nothing.
+fn classify_position(tracked_quantity: f64, held_quantity: f64, price: f64) -> PositionSync {
+    if held_quantity * price < DUST_NOTIONAL {
+        PositionSync::ClosedExternally
+    } else if held_quantity < tracked_quantity * QUANTITY_TOLERANCE {
+        PositionSync::Resized { to: held_quantity }
+    } else {
+        PositionSync::Unchanged
+    }
+}
+
+/// Bring tracked positions back in line with the exchange.
+async fn sync_positions_with_exchange(
+    risk_manager: &mut RiskManager,
+    equity: &Equity,
+    notifier: &Notifier,
+) {
+    let tracked: Vec<(String, f64)> = risk_manager
+        .positions
+        .iter()
+        .map(|p| (p.symbol.clone(), p.quantity))
+        .collect();
+
+    for (symbol, tracked_quantity) in tracked {
+        let (held, price) = equity
+            .holding(&symbol)
+            .map_or((0.0, 0.0), |h| (h.quantity, h.price));
+
+        match classify_position(tracked_quantity, held, price) {
+            PositionSync::Unchanged => {}
+            PositionSync::Resized { to } => {
+                warn!(
+                    "{symbol}: exchange holds {to:.8}, tracked {tracked_quantity:.8} — resizing"
+                );
+                if let Some(position) =
+                    risk_manager.positions.iter_mut().find(|p| p.symbol == symbol)
+                {
+                    position.quantity = to;
+                }
+            }
+            PositionSync::ClosedExternally => {
+                // Almost always the protective OCO doing its job.
+                let closed = risk_manager.close_position(&symbol);
+                let entry = closed.map_or(0.0, |p| p.entry_price);
+                info!(
+                    "{symbol}: position no longer held on the exchange — \
+                     closed externally (entry was {entry:.2})"
+                );
+                notifier
+                    .send(&format!(
+                        "*{symbol}* closed on the exchange\n\
+                         The protective OCO filled while the bot was idle. \
+                         Entry was `{entry:.2}`. Position released."
+                    ))
+                    .await;
+            }
+        }
+    }
 }
 
 /// Total equity: free quote asset plus the mark-to-market value of every held
@@ -259,6 +362,7 @@ where
 {
     let account = client.account(&config.quote_asset).await?;
     let mut total = account.free_quote;
+    let mut holdings = Vec::new();
 
     for balance in &account.assets {
         let symbol = format!("{}{}", balance.asset, config.quote_asset);
@@ -270,11 +374,17 @@ where
             .await
             .map_err(|e| format!("cannot price {symbol} for equity: {e}"))?;
         total += balance.quantity * price;
+        holdings.push(Holding {
+            symbol,
+            quantity: balance.quantity,
+            price,
+        });
     }
 
     Ok(Equity {
         free_quote: account.free_quote,
         total,
+        holdings,
     })
 }
 
@@ -449,4 +559,108 @@ async fn reconcile_positions<C>(
     }
 
     notifier.notify_reconcile(restored, emergency, failed).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BTC_PRICE: f64 = 77_000.0;
+
+    #[test]
+    fn position_still_fully_held_is_unchanged() {
+        assert_eq!(
+            classify_position(0.00012, 0.00012, BTC_PRICE),
+            PositionSync::Unchanged
+        );
+    }
+
+    #[test]
+    fn fee_dust_does_not_count_as_a_change() {
+        // The venue takes the spot BUY fee in the base asset, so the held
+        // amount is always a hair under what filled.
+        let tracked = 0.00012;
+        let held = tracked - 0.00000012;
+        assert_eq!(
+            classify_position(tracked, held, BTC_PRICE),
+            PositionSync::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_filled_oco_reads_as_closed_externally() {
+        // The exact bug: take-profit fills on Binance, the base asset is gone,
+        // and the bot must release the position instead of trying to sell it
+        // every four hours forever.
+        assert_eq!(
+            classify_position(0.00012, 0.0, BTC_PRICE),
+            PositionSync::ClosedExternally
+        );
+    }
+
+    #[test]
+    fn an_unsellable_remnant_counts_as_closed() {
+        // 0.00003 BTC is ~2.31 USDC, under the 5.00 minimum notional. It
+        // cannot be sold, so tracking it as a position achieves nothing.
+        assert_eq!(
+            classify_position(0.00012, 0.00003, BTC_PRICE),
+            PositionSync::ClosedExternally
+        );
+    }
+
+    #[test]
+    fn a_partial_fill_resizes_rather_than_closing() {
+        // Half of a larger position sold at target; the remainder is still
+        // worth 15.40 USDC, well over the minimum, so it is still a position.
+        let held = 0.0002;
+        assert_eq!(
+            classify_position(0.0004, held, BTC_PRICE),
+            PositionSync::Resized { to: held }
+        );
+    }
+
+    #[test]
+    fn a_partial_fill_below_minimum_notional_is_closed_not_resized() {
+        // At a 19 USDC account size, half a position is often unsellable:
+        // 0.00006 BTC is ~4.62 USDC against a 5.00 floor.
+        assert_eq!(
+            classify_position(0.00012, 0.00006, BTC_PRICE),
+            PositionSync::ClosedExternally
+        );
+    }
+
+    #[test]
+    fn holding_more_than_tracked_is_left_alone() {
+        // A manual buy on the side must not be silently absorbed or resized.
+        assert_eq!(
+            classify_position(0.00012, 0.00020, BTC_PRICE),
+            PositionSync::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_zero_price_never_resizes_a_position() {
+        // A pricing failure must not be read as the position having vanished
+        // into a resize; it falls to the closed branch and is released, not
+        // silently shrunk to a wrong size.
+        assert_eq!(
+            classify_position(0.00012, 0.00012, 0.0),
+            PositionSync::ClosedExternally
+        );
+    }
+
+    #[test]
+    fn equity_finds_the_holding_for_a_symbol() {
+        let equity = Equity {
+            free_quote: 10.0,
+            total: 19.28,
+            holdings: vec![Holding {
+                symbol: "BTCUSDC".into(),
+                quantity: 0.00012,
+                price: BTC_PRICE,
+            }],
+        };
+        assert_eq!(equity.holding("BTCUSDC").map(|h| h.quantity), Some(0.00012));
+        assert!(equity.holding("ETHUSDC").is_none());
+    }
 }
