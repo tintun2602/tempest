@@ -1,7 +1,7 @@
 use crate::costs::CostModel;
 use crate::exchange::{Candle, MarketDataProvider};
 use crate::risk::RiskManager;
-use crate::strategy::{self, EntryConditions, Signal};
+use crate::strategy::{self, EntryConditions, Signal, StrategyParams};
 use rand::Rng;
 use std::collections::HashMap;
 use tracing::info;
@@ -112,7 +112,13 @@ fn settle(pos: &SimPosition, exit_quote: f64, reason: ExitReason, costs: &CostMo
 }
 
 /// Run a backtest for a single symbol over its historical data.
-pub async fn run<M: MarketDataProvider>(client: &M, symbols: &[String], risk_per_trade: f64) {
+pub async fn run<M: MarketDataProvider>(
+    client: &M,
+    symbols: &[String],
+    risk_per_trade: f64,
+) {
+    let params = StrategyParams::from_env();
+    let params = &params;
     let costs = CostModel::from_env();
     info!(
         "Costs: taker {:.3}% | maker {:.3}% | slippage {:.3}%",
@@ -120,12 +126,16 @@ pub async fn run<M: MarketDataProvider>(client: &M, symbols: &[String], risk_per
         costs.maker_fee * 100.0,
         costs.slippage * 100.0
     );
+    info!(
+        "Signal buffers: entry {:.2} ATR | exit {:.2} ATR",
+        params.entry_buffer_atr, params.exit_buffer_atr
+    );
     info!("=== BACKTEST MODE ===");
     info!("Starting balance: {STARTING_BALANCE:.2} USDT");
 
     for symbol in symbols {
         info!("\n--- Backtesting {symbol} ---");
-        match backtest_symbol(client, symbol, &costs, risk_per_trade).await {
+        match backtest_symbol(client, symbol, &costs, risk_per_trade, params).await {
             Ok(()) => {}
             Err(e) => {
                 tracing::error!("{symbol}: backtest failed: {e}");
@@ -134,7 +144,7 @@ pub async fn run<M: MarketDataProvider>(client: &M, symbols: &[String], risk_per
     }
 
     if symbols.len() > 1 {
-        if let Err(e) = portfolio_backtest(client, symbols, &costs, risk_per_trade).await {
+        if let Err(e) = portfolio_backtest(client, symbols, &costs, risk_per_trade, params).await {
             tracing::error!("portfolio backtest failed: {e}");
         }
     }
@@ -145,6 +155,7 @@ async fn backtest_symbol<M: MarketDataProvider>(
     symbol: &str,
     costs: &CostModel,
     risk_per_trade: f64,
+    params: &StrategyParams,
 ) -> Result<(), String> {
     // Fetch maximum historical data from production API (testnet has limited history)
     // Daily: 1000 candles = ~2.7 years. 4H: paginate to cover the same period (~6000 candles).
@@ -187,8 +198,9 @@ async fn backtest_symbol<M: MarketDataProvider>(
         &four_hour,
         &CostModel::frictionless(),
         risk_per_trade,
+        params,
     );
-    let net = simulate(symbol, &daily, &four_hour, costs, risk_per_trade);
+    let net = simulate(symbol, &daily, &four_hour, costs, risk_per_trade, params);
 
     print_diagnostics(&net.diagnostics, 1);
     print_cost_impact(&gross, &net);
@@ -204,8 +216,9 @@ async fn backtest_symbol<M: MarketDataProvider>(
         costs,
         risk_per_trade,
         net.first_bar,
+        params,
     );
-    print_risk_sweep(&daily, &four_hour, costs, symbol);
+    print_risk_sweep(&daily, &four_hour, costs, symbol, params);
 
     Ok(())
 }
@@ -256,6 +269,7 @@ fn simulate(
     four_hour: &[Candle],
     costs: &CostModel,
     risk_per_trade: f64,
+    params: &StrategyParams,
 ) -> SimResult {
     let mut balance = STARTING_BALANCE;
     let mut risk_manager = RiskManager::with_risk_per_trade(balance, risk_per_trade);
@@ -334,11 +348,11 @@ fn simulate(
         let Some(snap) = snap else { continue };
 
         diagnostics.record(
-            &EntryConditions::evaluate(&snap),
+            &EntryConditions::evaluate(&snap, params),
             position.is_some(),
         );
 
-        let signal = strategy::evaluate(symbol, &snap);
+        let signal = strategy::evaluate(symbol, &snap, params);
 
         match signal.signal {
             Signal::Buy if position.is_none() => {
@@ -604,7 +618,13 @@ fn print_benchmark(net: &SimResult, (hold_balance, hold_drawdown): &(f64, f64)) 
 /// every row, only the stake changes. It shows the return/drawdown trade-off
 /// the operator is actually choosing between, and where the balance cap stops
 /// buying more exposure.
-fn print_risk_sweep(daily: &[Candle], four_hour: &[Candle], costs: &CostModel, symbol: &str) {
+fn print_risk_sweep(
+    daily: &[Candle],
+    four_hour: &[Candle],
+    costs: &CostModel,
+    symbol: &str,
+    params: &StrategyParams,
+) {
     println!();
     println!("  Position-size sweep (identical signals, different stake):");
     println!(
@@ -614,7 +634,7 @@ fn print_risk_sweep(daily: &[Candle], four_hour: &[Candle], costs: &CostModel, s
     println!("    {}", "-".repeat(52));
 
     for pct in [1.5, 3.0, 5.0, 10.0, 15.0, 20.0, 30.0] {
-        let r = simulate(symbol, daily, four_hour, costs, pct / 100.0);
+        let r = simulate(symbol, daily, four_hour, costs, pct / 100.0, params);
         let ret = (r.final_balance - STARTING_BALANCE) / STARTING_BALANCE * 100.0;
         let ratio = if r.max_drawdown > 0.0 {
             ret / r.max_drawdown
@@ -643,6 +663,7 @@ fn print_period_split(
     costs: &CostModel,
     risk_per_trade: f64,
     first_bar: Option<usize>,
+    params: &StrategyParams,
 ) {
     let Some(first) = first_bar else { return };
     let mid = first + (four_hour.len() - first) / 2;
@@ -650,8 +671,8 @@ fn print_period_split(
         return;
     }
 
-    let in_sample = simulate(symbol, daily, &four_hour[first..mid], costs, risk_per_trade);
-    let out_sample = simulate(symbol, daily, &four_hour[mid..], costs, risk_per_trade);
+    let in_sample = simulate(symbol, daily, &four_hour[first..mid], costs, risk_per_trade, params);
+    let out_sample = simulate(symbol, daily, &four_hour[mid..], costs, risk_per_trade, params);
     let ret = |b: f64| (b - STARTING_BALANCE) / STARTING_BALANCE * 100.0;
 
     println!();
@@ -986,6 +1007,7 @@ fn simulate_portfolio(
     feeds: &mut [SymbolFeed],
     costs: &CostModel,
     risk_per_trade: f64,
+    params: &StrategyParams,
 ) -> (SimResult, usize) {
     let mut balance = STARTING_BALANCE;
     let mut risk_manager = RiskManager::with_risk_per_trade(balance, risk_per_trade);
@@ -996,6 +1018,14 @@ fn simulate_portfolio(
     let mut diagnostics = Diagnostics::default();
     let mut first_bar: Option<usize> = None;
     let mut concurrent_peak = 0usize;
+
+    // Reset the rolling daily views so this can be called repeatedly over the
+    // same feeds — a sweep re-runs identical history under different settings,
+    // and one data fetch should serve all of them.
+    for feed in feeds.iter_mut() {
+        feed.daily_view.clear();
+        feed.next_daily = 0;
+    }
 
     let bars = feeds.iter().map(|f| f.four_hour.len()).min().unwrap_or(0);
 
@@ -1086,11 +1116,11 @@ fn simulate_portfolio(
             let Some(snap) = snap else { continue };
 
             diagnostics.record(
-                &EntryConditions::evaluate(&snap),
+                &EntryConditions::evaluate(&snap, params),
                 positions.iter().any(|p| p.symbol == feed.symbol),
             );
 
-            let signal = strategy::evaluate(&feed.symbol, &snap);
+            let signal = strategy::evaluate(&feed.symbol, &snap, params);
             let held = positions.iter().position(|p| p.symbol == feed.symbol);
 
             match signal.signal {
@@ -1204,6 +1234,7 @@ async fn portfolio_backtest<M: MarketDataProvider>(
     symbols: &[String],
     costs: &CostModel,
     risk_per_trade: f64,
+    params: &StrategyParams,
 ) -> Result<(), String> {
     let mut feeds: Vec<SymbolFeed> = Vec::new();
     for symbol in symbols {
@@ -1252,7 +1283,7 @@ async fn portfolio_backtest<M: MarketDataProvider>(
         aligned as f64 / BARS_PER_DAY
     );
 
-    let (result, concurrent_peak) = simulate_portfolio(&mut feeds, costs, risk_per_trade);
+    let (result, concurrent_peak) = simulate_portfolio(&mut feeds, costs, risk_per_trade, params);
 
     println!();
     println!("=============================================================");
@@ -1287,8 +1318,55 @@ async fn portfolio_backtest<M: MarketDataProvider>(
         result.max_drawdown,
     );
     print_monte_carlo_report(&result.trades);
+    print_buffer_sweep(&mut feeds, costs, risk_per_trade);
 
     Ok(())
+}
+
+/// Re-run the portfolio under a range of ATR signal buffers.
+///
+/// Entry and exit currently share the EMA50 line, so price hovering there
+/// produces a buy, a noise stop-out, and a buy again — each round trip paying
+/// fees and slippage. A buffer separates the two thresholds into a dead zone.
+/// Every row trades the same instruments over the same history; only the
+/// threshold moves.
+fn print_buffer_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_trade: f64) {
+    println!();
+    println!("  ATR signal-buffer sweep (same signals, different thresholds):");
+    println!(
+        "    {:>6} {:>6}  {:>10}  {:>9}  {:>7}  {:>7}  {:>8}",
+        "entry", "exit", "final", "return", "trades", "win%", "max DD"
+    );
+    println!("    {}", "-".repeat(62));
+
+    for (entry, exit) in [
+        (0.0, 0.0),
+        (0.0, 0.5),
+        (0.0, 1.0),
+        (0.5, 0.5),
+        (0.5, 1.0),
+        (1.0, 1.0),
+        (1.0, 2.0),
+    ] {
+        let params = StrategyParams {
+            entry_buffer_atr: entry,
+            exit_buffer_atr: exit,
+        };
+        let (r, _) = simulate_portfolio(feeds, costs, risk_per_trade, &params);
+        let wins = r.trades.iter().filter(|t| t.pnl > 0.0).count();
+        let win_rate = if r.trades.is_empty() {
+            0.0
+        } else {
+            wins as f64 / r.trades.len() as f64 * 100.0
+        };
+        println!(
+            "    {entry:>6.1} {exit:>6.1}  {:>10.2}  {:>+8.2}%  {:>7}  {win_rate:>6.1}%  {:>7.2}%",
+            r.final_balance,
+            (r.final_balance - STARTING_BALANCE) / STARTING_BALANCE * 100.0,
+            r.trades.len(),
+            r.max_drawdown
+        );
+    }
 }
 
 /// Equal-weight buy and hold across the same symbols and window.

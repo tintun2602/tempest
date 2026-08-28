@@ -17,7 +17,7 @@ use executor::Executor;
 use notify::Notifier;
 use risk::{Position, RiskManager};
 use std::env;
-use strategy::Signal;
+use strategy::{Signal, StrategyParams};
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
@@ -114,6 +114,11 @@ async fn main() {
     );
     let mut risk_manager = RiskManager::with_risk_per_trade(equity.total, config.risk_per_trade);
     let mut status = StatusTracker::default();
+    let params = StrategyParams::from_env();
+    info!(
+        "Signal buffers: entry {:.2} ATR | exit {:.2} ATR",
+        params.entry_buffer_atr, params.exit_buffer_atr
+    );
 
     // Detect positions held from a prior crash that lack OCO protection.
     reconcile_positions(&client, &config, &mut risk_manager, &notifier).await;
@@ -122,7 +127,7 @@ async fn main() {
 
     loop {
         if let Err(e) =
-            run_cycle(&client, &config, &mut risk_manager, &notifier, &mut status).await
+            run_cycle(&client, &config, &mut risk_manager, &notifier, &mut status, &params).await
         {
             error!("Cycle error: {e}");
             notifier.notify_error("Cycle", &e).await;
@@ -138,6 +143,7 @@ async fn run_cycle<C>(
     risk_manager: &mut RiskManager,
     notifier: &Notifier,
     status: &mut StatusTracker,
+    params: &StrategyParams,
 ) -> Result<(), String>
 where
     C: MarketDataProvider + AccountProvider + ExecutionProvider + InstrumentProvider,
@@ -214,7 +220,7 @@ where
             }
         };
 
-        let signal = strategy::evaluate(symbol, &snap);
+        let signal = strategy::evaluate(symbol, &snap, params);
 
         info!(
             "{symbol}: signal={:?} confidence={} RSI={:.1} EMA50={:.2} EMA200={:.2}",
@@ -224,7 +230,7 @@ where
             warn!("{symbol}: {}", signal.warnings.join("; "));
         }
 
-        let conditions = strategy::EntryConditions::evaluate(&snap);
+        let conditions = strategy::EntryConditions::evaluate(&snap, params);
         let quiet_ms = STATUS_QUIET_HOURS * 3_600_000;
         if status.should_send(symbol, conditions.met_count(), now_ms(), quiet_ms) {
             notifier

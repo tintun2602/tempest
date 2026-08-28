@@ -20,6 +20,44 @@ pub fn ema(values: &[f64], period: usize) -> Vec<f64> {
     result
 }
 
+/// Average True Range over `period`, using Wilder's smoothing.
+///
+/// True Range is the widest of: this bar's range, the gap up from the previous
+/// close, or the gap down from it — so it counts overnight gaps that a simple
+/// high-minus-low ignores.
+///
+/// ATR expresses "normal movement" in price units, which is what makes it the
+/// right yardstick for a signal buffer: a fixed percentage threshold is too
+/// tight for a volatile asset and too loose for a calm one.
+///
+/// Returns a Vec aligned with the input; the first `period` entries are `NAN`.
+pub fn atr(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) -> Vec<f64> {
+    let len = closes.len();
+    if period == 0 || len <= period || highs.len() != len || lows.len() != len {
+        return vec![f64::NAN; len];
+    }
+
+    let mut true_range = vec![f64::NAN; len];
+    for i in 1..len {
+        let previous_close = closes[i - 1];
+        true_range[i] = (highs[i] - lows[i])
+            .max((highs[i] - previous_close).abs())
+            .max((lows[i] - previous_close).abs());
+    }
+
+    let mut result = vec![f64::NAN; len];
+    // Seed with the simple mean of the first `period` true ranges, which start
+    // at index 1 because the first bar has no previous close.
+    let seed: f64 = true_range[1..=period].iter().sum::<f64>() / period as f64;
+    result[period] = seed;
+
+    for i in period + 1..len {
+        result[i] = (result[i - 1] * (period as f64 - 1.0) + true_range[i]) / period as f64;
+    }
+
+    result
+}
+
 /// Compute RSI (Relative Strength Index) from close prices with the given `period`.
 /// Uses the smoothed (Wilder) method. Returns NAN for indices with insufficient data.
 pub fn rsi(closes: &[f64], period: usize) -> Vec<f64> {
@@ -154,6 +192,54 @@ pub fn find_nearest_swing_low(lows: &[f64], window: usize) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_atr_basic_range() {
+        // Every bar spans exactly 2.0 with no gaps, so ATR must converge on 2.0.
+        let highs = vec![11.0, 12.0, 13.0, 14.0, 15.0, 16.0];
+        let lows = vec![9.0, 10.0, 11.0, 12.0, 13.0, 14.0];
+        let closes = vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
+        let out = atr(&highs, &lows, &closes, 3);
+        assert!(out[0].is_nan() && out[2].is_nan(), "warmup must be NAN");
+        assert!(out[3].is_finite());
+        assert!((out[5] - 2.0).abs() < 0.5, "got {}", out[5]);
+    }
+
+    #[test]
+    fn test_atr_counts_gaps() {
+        // A bar that gaps far above the previous close has a true range much
+        // larger than its own high-minus-low.
+        let highs = vec![11.0, 12.0, 13.0, 40.0];
+        let lows = vec![9.0, 10.0, 11.0, 38.0];
+        let closes = vec![10.0, 11.0, 12.0, 39.0];
+        let out = atr(&highs, &lows, &closes, 3);
+        // Final TR is 40 - 12 = 28, far beyond the 2.0 intrabar range.
+        assert!(out[3] > 5.0, "gap ignored: {}", out[3]);
+    }
+
+    #[test]
+    fn test_atr_insufficient_data() {
+        let out = atr(&[1.0, 2.0], &[0.5, 1.5], &[1.0, 2.0], 14);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn test_atr_is_never_negative() {
+        let highs = vec![11.0, 9.0, 13.0, 8.0, 15.0, 7.0];
+        let lows = vec![9.0, 7.0, 11.0, 6.0, 13.0, 5.0];
+        let closes = vec![10.0, 8.0, 12.0, 7.0, 14.0, 6.0];
+        for v in atr(&highs, &lows, &closes, 3).into_iter().filter(|v| v.is_finite()) {
+            assert!(v >= 0.0, "ATR went negative: {v}");
+        }
+    }
+
+    #[test]
+    fn test_atr_mismatched_series_is_rejected() {
+        assert!(atr(&[1.0, 2.0, 3.0], &[1.0], &[1.0, 2.0, 3.0], 2)
+            .iter()
+            .all(|v| v.is_nan()));
+    }
 
     #[test]
     fn test_ema_basic() {

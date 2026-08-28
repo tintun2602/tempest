@@ -41,6 +41,70 @@ pub struct IndicatorSnapshot {
     pub macd_crossed_bullish_recently: bool,
     pub current_price: f64,
     pub swing_low: f64,
+    /// Daily ATR(14) — "normal" movement in price units, used to size the
+    /// signal buffer so a threshold is neither too tight for a volatile asset
+    /// nor too loose for a calm one.
+    pub atr_14: f64,
+}
+
+/// Tunables that change how far price must travel past EMA50 before a signal
+/// counts, without changing which indicators are consulted.
+///
+/// Both default to zero, which reproduces the original behaviour exactly:
+/// entry and exit share the EMA50 line. That shared threshold is what makes
+/// price hovering near the line produce a buy, a noise stop-out, and a buy
+/// again — each round trip paying roughly 0.2-0.3% in fees and slippage.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrategyParams {
+    /// ATR multiples price must sit *above* EMA50 to enter.
+    pub entry_buffer_atr: f64,
+    /// ATR multiples price must fall *below* EMA50 to exit.
+    pub exit_buffer_atr: f64,
+}
+
+impl Default for StrategyParams {
+    fn default() -> Self {
+        Self {
+            entry_buffer_atr: 0.0,
+            exit_buffer_atr: 0.0,
+        }
+    }
+}
+
+impl StrategyParams {
+    pub fn from_env() -> Self {
+        let read = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(0.0)
+        };
+        Self {
+            entry_buffer_atr: read("ENTRY_BUFFER_ATR"),
+            exit_buffer_atr: read("EXIT_BUFFER_ATR"),
+        }
+    }
+
+    /// Price must clear this to enter.
+    fn entry_threshold(&self, snap: &IndicatorSnapshot) -> f64 {
+        snap.ema_50 + self.entry_buffer_atr * usable_atr(snap)
+    }
+
+    /// Price must fall under this to exit.
+    fn exit_threshold(&self, snap: &IndicatorSnapshot) -> f64 {
+        snap.ema_50 - self.exit_buffer_atr * usable_atr(snap)
+    }
+}
+
+/// ATR treated as zero when it is not computable, so a missing value collapses
+/// to the original un-buffered rule rather than disabling the strategy.
+fn usable_atr(snap: &IndicatorSnapshot) -> f64 {
+    if snap.atr_14.is_finite() && snap.atr_14 > 0.0 {
+        snap.atr_14
+    } else {
+        0.0
+    }
 }
 
 /// Compute all indicators from daily and 4-hour candles.
@@ -56,6 +120,7 @@ pub fn compute_indicators(
 
     let daily_closes: Vec<f64> = daily_candles.iter().map(|c| c.close).collect();
     let daily_lows: Vec<f64> = daily_candles.iter().map(|c| c.low).collect();
+    let daily_highs: Vec<f64> = daily_candles.iter().map(|c| c.high).collect();
     let four_hour_closes: Vec<f64> = four_hour_candles.iter().map(|c| c.close).collect();
 
     // --- Daily EMAs ---
@@ -118,7 +183,14 @@ pub fn compute_indicators(
         "indicators computed"
     );
 
+    // A missing ATR is not fatal: buffers simply fall back to the bare EMA50.
+    let atr_14 = indicators::atr(&daily_highs, &daily_lows, &daily_closes, 14)
+        .last()
+        .copied()
+        .unwrap_or(f64::NAN);
+
     Some(IndicatorSnapshot {
+        atr_14,
         ema_50,
         ema_200,
         rsi_14,
@@ -152,9 +224,10 @@ pub struct EntryConditions {
 }
 
 impl EntryConditions {
-    pub fn evaluate(snap: &IndicatorSnapshot) -> Self {
+    pub fn evaluate(snap: &IndicatorSnapshot, params: &StrategyParams) -> Self {
         Self {
-            trend_bullish: snap.current_price > snap.ema_50 && snap.ema_50 > snap.ema_200,
+            trend_bullish: snap.current_price > params.entry_threshold(snap)
+                && snap.ema_50 > snap.ema_200,
             rsi_ok: snap.rsi_14 >= 35.0 && snap.rsi_14 <= 55.0,
             macd_crossed: snap.macd_crossed_bullish_recently,
             stop_valid: snap.current_price - snap.swing_low > 0.0,
@@ -190,7 +263,11 @@ impl EntryConditions {
 }
 
 /// Evaluate the indicator snapshot against entry/exit rules and return a signal.
-pub fn evaluate(symbol: &str, snap: &IndicatorSnapshot) -> TradeSignal {
+pub fn evaluate(
+    symbol: &str,
+    snap: &IndicatorSnapshot,
+    params: &StrategyParams,
+) -> TradeSignal {
     let mut warnings: Vec<String> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
 
@@ -198,7 +275,7 @@ pub fn evaluate(symbol: &str, snap: &IndicatorSnapshot) -> TradeSignal {
     // BUY conditions (ALL must be true)
     // -----------------------------------------------------------------------
 
-    let conditions = EntryConditions::evaluate(snap);
+    let conditions = EntryConditions::evaluate(snap, params);
     let EntryConditions {
         trend_bullish,
         rsi_ok,
@@ -281,7 +358,7 @@ pub fn evaluate(symbol: &str, snap: &IndicatorSnapshot) -> TradeSignal {
     // -----------------------------------------------------------------------
     // SELL conditions (ANY is sufficient)
     // -----------------------------------------------------------------------
-    let sell_trend_break = snap.current_price < snap.ema_50;
+    let sell_trend_break = snap.current_price < params.exit_threshold(snap);
     let sell_overbought_reversal = snap.rsi_14 > 70.0 && snap.macd_histogram < 0.0;
 
     if sell_trend_break || sell_overbought_reversal {
@@ -343,12 +420,18 @@ mod tests {
             macd_crossed_bullish_recently: true,
             current_price: 62_000.0,
             swing_low: 59_000.0,
+            atr_14: 1_000.0,
         }
+    }
+
+    /// The original behaviour: entry and exit both sit exactly on EMA50.
+    fn bare() -> StrategyParams {
+        StrategyParams::default()
     }
 
     #[test]
     fn a_qualifying_setup_meets_every_condition() {
-        let c = EntryConditions::evaluate(&qualifying());
+        let c = EntryConditions::evaluate(&qualifying(), &bare());
         assert!(c.all_met());
         assert_eq!(c.met_count(), 4);
     }
@@ -359,18 +442,18 @@ mod tests {
         // 4/4, the strategy must actually take the trade. Otherwise a
         // notification could promise a setup that never fires.
         let snap = qualifying();
-        assert!(EntryConditions::evaluate(&snap).all_met());
-        assert_eq!(evaluate("BTCUSDC", &snap).signal, Signal::Buy);
+        assert!(EntryConditions::evaluate(&snap, &bare()).all_met());
+        assert_eq!(evaluate("BTCUSDC", &snap, &bare()).signal, Signal::Buy);
     }
 
     #[test]
     fn no_buy_while_any_condition_fails() {
         let mut snap = qualifying();
         snap.rsi_14 = 80.0; // outside the 35-55 band
-        let c = EntryConditions::evaluate(&snap);
+        let c = EntryConditions::evaluate(&snap, &bare());
         assert!(!c.all_met());
         assert_eq!(c.met_count(), 3);
-        assert_ne!(evaluate("BTCUSDC", &snap).signal, Signal::Buy);
+        assert_ne!(evaluate("BTCUSDC", &snap, &bare()).signal, Signal::Buy);
     }
 
     #[test]
@@ -381,7 +464,7 @@ mod tests {
         snap.ema_50 = 66_756.0;
         snap.ema_200 = 71_203.0;
         snap.current_price = 77_214.0;
-        let c = EntryConditions::evaluate(&snap);
+        let c = EntryConditions::evaluate(&snap, &bare());
         assert!(!c.trend_bullish);
     }
 
@@ -389,14 +472,14 @@ mod tests {
     fn a_swing_low_above_price_invalidates_the_stop() {
         let mut snap = qualifying();
         snap.swing_low = snap.current_price + 1.0;
-        assert!(!EntryConditions::evaluate(&snap).stop_valid);
+        assert!(!EntryConditions::evaluate(&snap, &bare()).stop_valid);
     }
 
     #[test]
     fn checklist_agrees_with_the_individual_flags() {
         let mut snap = qualifying();
         snap.macd_crossed_bullish_recently = false;
-        let c = EntryConditions::evaluate(&snap);
+        let c = EntryConditions::evaluate(&snap, &bare());
         let checklist = c.checklist();
         assert_eq!(checklist.len(), 4);
         assert_eq!(
@@ -404,5 +487,79 @@ mod tests {
             c.met_count()
         );
         assert!(!checklist[2].1, "MACD row must reflect the failed cross");
+    }
+
+    // ----- ATR signal buffers -----
+
+    #[test]
+    fn default_params_reproduce_the_bare_ema_rule() {
+        // Zero buffers must behave exactly as before, so enabling the feature
+        // is opt-in and the old backtests stay comparable.
+        let mut snap = qualifying();
+        snap.current_price = snap.ema_50 + 0.01;
+        assert!(EntryConditions::evaluate(&snap, &bare()).trend_bullish);
+    }
+
+    #[test]
+    fn an_entry_buffer_rejects_a_marginal_cross() {
+        // Price a hair above EMA50 is exactly the setup that buys, gets
+        // stopped out by noise, and buys again.
+        let mut snap = qualifying();
+        snap.current_price = snap.ema_50 + 0.01;
+        let buffered = StrategyParams {
+            entry_buffer_atr: 0.5,
+            exit_buffer_atr: 0.0,
+        };
+        assert!(!EntryConditions::evaluate(&snap, &buffered).trend_bullish);
+
+        // A decisive move still qualifies: 0.5 ATR is 500 here.
+        snap.current_price = snap.ema_50 + 600.0;
+        assert!(EntryConditions::evaluate(&snap, &buffered).trend_bullish);
+    }
+
+    #[test]
+    fn an_exit_buffer_holds_through_a_marginal_dip() {
+        let mut snap = qualifying();
+        snap.current_price = snap.ema_50 - 0.01;
+        // Without a buffer this dip is a SELL.
+        assert_eq!(evaluate("BTCUSDC", &snap, &bare()).signal, Signal::Sell);
+
+        // With one, it is noise and the position is held.
+        let buffered = StrategyParams {
+            entry_buffer_atr: 0.0,
+            exit_buffer_atr: 0.5,
+        };
+        assert_ne!(evaluate("BTCUSDC", &snap, &buffered).signal, Signal::Sell);
+
+        // A real breakdown still exits.
+        snap.current_price = snap.ema_50 - 600.0;
+        assert_eq!(evaluate("BTCUSDC", &snap, &buffered).signal, Signal::Sell);
+    }
+
+    #[test]
+    fn buffers_create_a_dead_zone_between_entry_and_exit() {
+        // The whole point: a price that neither buys nor sells, instead of one
+        // threshold doing both jobs.
+        let mut snap = qualifying();
+        snap.current_price = snap.ema_50 + 100.0;
+        let buffered = StrategyParams {
+            entry_buffer_atr: 0.5,
+            exit_buffer_atr: 0.5,
+        };
+        assert!(!EntryConditions::evaluate(&snap, &buffered).all_met());
+        assert_ne!(evaluate("BTCUSDC", &snap, &buffered).signal, Signal::Sell);
+    }
+
+    #[test]
+    fn a_missing_atr_falls_back_to_the_bare_threshold() {
+        // A NaN ATR must not disable trading or produce a NaN threshold.
+        let mut snap = qualifying();
+        snap.atr_14 = f64::NAN;
+        snap.current_price = snap.ema_50 + 0.01;
+        let buffered = StrategyParams {
+            entry_buffer_atr: 2.0,
+            exit_buffer_atr: 2.0,
+        };
+        assert!(EntryConditions::evaluate(&snap, &buffered).trend_bullish);
     }
 }
