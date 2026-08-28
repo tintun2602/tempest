@@ -37,6 +37,8 @@ enum ExitReason {
     TakeProfit,
     /// Strategy produced a SELL before either level was touched.
     Signal,
+    /// Chandelier trailing stop, which replaces the fixed target when enabled.
+    Trailing,
     /// Still open when history ran out; marked to the final close.
     EndOfData,
 }
@@ -47,6 +49,7 @@ impl ExitReason {
             ExitReason::StopLoss => "SL",
             ExitReason::TakeProfit => "TP",
             ExitReason::Signal => "signal",
+            ExitReason::Trailing => "trail",
             ExitReason::EndOfData => "end",
         }
     }
@@ -63,6 +66,25 @@ struct SimPosition {
     entry_fee: f64,
     /// Portfolio equity when this position was opened.
     equity_at_entry: f64,
+    /// Highest high seen since entry, for the chandelier stop.
+    highest_high: f64,
+    /// ATR at entry. Held fixed for the life of the trade so the stop ratchets
+    /// on price alone and cannot loosen when volatility expands.
+    atr_at_entry: f64,
+}
+
+/// Where the protective stop actually sits this bar.
+///
+/// The chandelier trails the highest high since entry but never falls back, so
+/// the effective stop is whichever of the two is higher. Deliberately computed
+/// from the *previous* bar's high: letting this bar's own high raise the stop
+/// before testing its low would peek inside the bar.
+fn effective_stop(pos: &SimPosition, params: &StrategyParams) -> f64 {
+    if params.trailing_stop_atr <= 0.0 || pos.atr_at_entry <= 0.0 {
+        return pos.stop_loss;
+    }
+    let trail = pos.highest_high - params.trailing_stop_atr * pos.atr_at_entry;
+    pos.stop_loss.max(trail)
 }
 
 /// Close `pos` at `exit_quote` and price the fill according to how the exit
@@ -311,13 +333,22 @@ fn simulate(
         // cadence the live bot actually polls at. A bar that touches both
         // levels resolves as the stop, which is the conservative reading.
         if let Some(pos) = &position {
-            let hit_sl = bar.low <= pos.stop_loss;
-            let hit_tp = bar.high >= pos.take_profit;
+            let stop = effective_stop(pos, params);
+            let trailing = params.trailing_stop_atr > 0.0;
+            let hit_sl = bar.low <= stop;
+            // A fixed target only applies when the trail is off; the whole
+            // point of trailing is to let winners run past 2R.
+            let hit_tp = !trailing && bar.high >= pos.take_profit;
 
             if hit_sl || hit_tp {
                 // One bar touching both levels resolves as the stop.
                 let (level, reason) = if hit_sl {
-                    (pos.stop_loss, ExitReason::StopLoss)
+                    let reason = if trailing && stop > pos.stop_loss {
+                        ExitReason::Trailing
+                    } else {
+                        ExitReason::StopLoss
+                    };
+                    (stop, reason)
                 } else {
                     (pos.take_profit, ExitReason::TakeProfit)
                 };
@@ -328,6 +359,11 @@ fn simulate(
                 risk_manager.close_position(&pos.symbol);
                 position = None;
             }
+        }
+
+        // Ratchet after the exit test, never before it.
+        if let Some(pos) = position.as_mut() {
+            pos.highest_high = pos.highest_high.max(bar.high);
         }
 
         // --- Evaluate strategy ---
@@ -381,6 +417,8 @@ fn simulate(
                     take_profit,
                     entry_fee: costs.taker_cost(entry_fill * qty),
                     equity_at_entry: balance,
+                    highest_high: entry_fill,
+                    atr_at_entry: snap.atr_14,
                 });
 
                 risk_manager.open_position(crate::risk::Position {
@@ -1072,11 +1110,18 @@ fn simulate_portfolio(
                 .copied()
                 .expect("position symbol always has a feed");
 
-            let hit_sl = low <= pos.stop_loss;
-            let hit_tp = high >= pos.take_profit;
+            let stop = effective_stop(pos, params);
+            let trailing = params.trailing_stop_atr > 0.0;
+            let hit_sl = low <= stop;
+            let hit_tp = !trailing && high >= pos.take_profit;
             if hit_sl || hit_tp {
                 let (level, reason) = if hit_sl {
-                    (pos.stop_loss, ExitReason::StopLoss)
+                    let reason = if trailing && stop > pos.stop_loss {
+                        ExitReason::Trailing
+                    } else {
+                        ExitReason::StopLoss
+                    };
+                    (stop, reason)
                 } else {
                     (pos.take_profit, ExitReason::TakeProfit)
                 };
@@ -1088,6 +1133,8 @@ fn simulate_portfolio(
                 positions.remove(i);
                 continue;
             }
+            // Ratchet after the exit test, never before it.
+            positions[i].highest_high = positions[i].highest_high.max(high);
             i += 1;
         }
 
@@ -1160,6 +1207,8 @@ fn simulate_portfolio(
                         take_profit,
                         entry_fee: fee,
                         equity_at_entry: equity,
+                        highest_high: entry_fill,
+                        atr_at_entry: snap.atr_14,
                     });
                     risk_manager.open_position(crate::risk::Position {
                         symbol: feed.symbol.clone(),
@@ -1319,6 +1368,7 @@ async fn portfolio_backtest<M: MarketDataProvider>(
     );
     print_monte_carlo_report(&result.trades);
     print_buffer_sweep(&mut feeds, costs, risk_per_trade);
+    print_trailing_sweep(&mut feeds, costs, risk_per_trade);
 
     Ok(())
 }
@@ -1341,16 +1391,12 @@ fn print_buffer_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_trad
 
     for (entry, exit) in [
         (0.0, 0.0),
-        (0.0, 0.5),
-        (0.0, 1.0),
         (0.5, 0.5),
-        (0.5, 1.0),
-        (1.0, 1.0),
-        (1.0, 2.0),
     ] {
         let params = StrategyParams {
             entry_buffer_atr: entry,
             exit_buffer_atr: exit,
+            trailing_stop_atr: 0.0,
         };
         let (r, _) = simulate_portfolio(feeds, costs, risk_per_trade, &params);
         let wins = r.trades.iter().filter(|t| t.pnl > 0.0).count();
@@ -1361,6 +1407,60 @@ fn print_buffer_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_trad
         };
         println!(
             "    {entry:>6.1} {exit:>6.1}  {:>10.2}  {:>+8.2}%  {:>7}  {win_rate:>6.1}%  {:>7.2}%",
+            r.final_balance,
+            (r.final_balance - STARTING_BALANCE) / STARTING_BALANCE * 100.0,
+            r.trades.len(),
+            r.max_drawdown
+        );
+    }
+}
+
+/// Re-run the portfolio with a chandelier trailing stop instead of the fixed
+/// 2R target.
+///
+/// The fixed target caps every winner at twice the stop distance. Trend
+/// following earns its living from a fat right tail, so the question is
+/// whether letting winners run more than pays for the give-back when a trade
+/// reverses before the trail catches it.
+fn print_trailing_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_trade: f64) {
+    println!();
+    println!("  Trailing-stop sweep (fixed 2R target vs chandelier):");
+    println!(
+        "    {:>10}  {:>10}  {:>9}  {:>7}  {:>7}  {:>8}  {:>9}",
+        "exit rule", "final", "return", "trades", "win%", "max DD", "avg win"
+    );
+    println!("    {}", "-".repeat(72));
+
+    for trail in [0.0, 2.0, 3.0, 4.0, 6.0] {
+        let params = StrategyParams {
+            entry_buffer_atr: 0.0,
+            exit_buffer_atr: 0.0,
+            trailing_stop_atr: trail,
+        };
+        let (r, _) = simulate_portfolio(feeds, costs, risk_per_trade, &params);
+        let wins: Vec<f64> = r
+            .trades
+            .iter()
+            .filter(|t| t.pnl > 0.0)
+            .map(|t| t.pnl)
+            .collect();
+        let win_rate = if r.trades.is_empty() {
+            0.0
+        } else {
+            wins.len() as f64 / r.trades.len() as f64 * 100.0
+        };
+        let avg_win = if wins.is_empty() {
+            0.0
+        } else {
+            wins.iter().sum::<f64>() / wins.len() as f64
+        };
+        let label = if trail == 0.0 {
+            "fixed 2R".to_string()
+        } else {
+            format!("trail {trail:.0}ATR")
+        };
+        println!(
+            "    {label:>10}  {:>10.2}  {:>+8.2}%  {:>7}  {win_rate:>6.1}%  {:>7.2}%  {avg_win:>+9.2}",
             r.final_balance,
             (r.final_balance - STARTING_BALANCE) / STARTING_BALANCE * 100.0,
             r.trades.len(),

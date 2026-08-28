@@ -60,6 +60,13 @@ pub struct StrategyParams {
     pub entry_buffer_atr: f64,
     /// ATR multiples price must fall *below* EMA50 to exit.
     pub exit_buffer_atr: f64,
+    /// Chandelier trailing stop, in ATR multiples below the highest high since
+    /// entry. Zero disables it and keeps the fixed 2R take-profit.
+    ///
+    /// The fixed target caps every winner at twice the stop distance, which
+    /// deletes the fat right tail trend-following depends on — measured here,
+    /// *every* winning trade exited at the target and none ran further.
+    pub trailing_stop_atr: f64,
 }
 
 impl Default for StrategyParams {
@@ -67,6 +74,7 @@ impl Default for StrategyParams {
         Self {
             entry_buffer_atr: 0.0,
             exit_buffer_atr: 0.0,
+            trailing_stop_atr: 0.0,
         }
     }
 }
@@ -83,6 +91,7 @@ impl StrategyParams {
         Self {
             entry_buffer_atr: read("ENTRY_BUFFER_ATR"),
             exit_buffer_atr: read("EXIT_BUFFER_ATR"),
+            trailing_stop_atr: read("TRAILING_STOP_ATR"),
         }
     }
 
@@ -509,6 +518,7 @@ mod tests {
         let buffered = StrategyParams {
             entry_buffer_atr: 0.5,
             exit_buffer_atr: 0.0,
+            ..Default::default()
         };
         assert!(!EntryConditions::evaluate(&snap, &buffered).trend_bullish);
 
@@ -528,6 +538,7 @@ mod tests {
         let buffered = StrategyParams {
             entry_buffer_atr: 0.0,
             exit_buffer_atr: 0.5,
+            ..Default::default()
         };
         assert_ne!(evaluate("BTCUSDC", &snap, &buffered).signal, Signal::Sell);
 
@@ -545,6 +556,7 @@ mod tests {
         let buffered = StrategyParams {
             entry_buffer_atr: 0.5,
             exit_buffer_atr: 0.5,
+            ..Default::default()
         };
         assert!(!EntryConditions::evaluate(&snap, &buffered).all_met());
         assert_ne!(evaluate("BTCUSDC", &snap, &buffered).signal, Signal::Sell);
@@ -559,6 +571,7 @@ mod tests {
         let buffered = StrategyParams {
             entry_buffer_atr: 2.0,
             exit_buffer_atr: 2.0,
+            ..Default::default()
         };
         assert!(EntryConditions::evaluate(&snap, &buffered).trend_bullish);
     }
