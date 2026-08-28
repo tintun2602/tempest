@@ -7,7 +7,7 @@
 use crate::exchange::{ExecutionProvider, InstrumentProvider, Side, SymbolFilters};
 use crate::notify::Notifier;
 use crate::risk::{Position, RiskManager};
-use crate::strategy::TradeSignal;
+use crate::strategy::{StrategyParams, TradeSignal};
 use tracing::{error, info, warn};
 
 /// Stop-limit price is placed just under the trigger so the resting limit still
@@ -16,6 +16,11 @@ const STOP_LIMIT_SLIP: f64 = 0.998;
 
 /// Reward-to-risk applied to the realised fill when setting the target.
 const REWARD_RISK_RATIO: f64 = 2.0;
+
+/// The trailing stop is only moved once it has advanced this many ATR, so a
+/// position is not cancel-and-replaced on every poll for a few ticks of gain.
+/// Each move opens a window where nothing protects the position.
+const RATCHET_MIN_ATR: f64 = 0.25;
 
 pub struct Executor<'a, E> {
     client: &'a E,
@@ -37,6 +42,7 @@ impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
         signal: &TradeSignal,
         quantity: f64,
         risk_manager: &mut RiskManager,
+        params: &StrategyParams,
     ) -> Result<(), String> {
         info!(
             "BUY {} | qty {:.6} | entry ~{:.2} | SL {:.2} | TP {:.2}",
@@ -100,12 +106,26 @@ impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
             );
         }
 
-        let take_profit = filters.round_price(take_profit);
         let stop_loss = filters.round_price(stop_loss);
         let stop_limit = filters.round_price(stop_loss * STOP_LIMIT_SLIP);
+        let trailing = params.trailing_stop_atr > 0.0 && signal.atr > 0.0;
 
-        let protected = match self
-            .oco_or_reason(
+        // A trailing stop has no target: capping the upside is exactly what it
+        // exists to avoid. `0.0` is the established "unset" sentinel that
+        // `check_exits` ignores.
+        let take_profit = if trailing {
+            0.0
+        } else {
+            filters.round_price(take_profit)
+        };
+
+        let placement = if trailing {
+            self.client
+                .place_stop_loss(&signal.asset, sellable, stop_loss, stop_limit)
+                .await
+                .map(|stop| format!("stop {}", stop.order_id))
+        } else {
+            self.oco_or_reason(
                 &signal.asset,
                 &filters,
                 sellable,
@@ -114,23 +134,26 @@ impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
                 stop_limit,
             )
             .await
-        {
-            Ok(oco) => {
+            .map(|oco| format!("OCO list {}", oco.order_list_id))
+        };
+
+        let protected = match placement {
+            Ok(reference) => {
                 info!(
-                    "OCO confirmed for {}: list {} (SL {:.2} / TP {:.2})",
-                    signal.asset, oco.order_list_id, oco.stop_price, oco.take_profit_price
+                    "{} protected: {reference} (SL {stop_loss:.2})",
+                    signal.asset
                 );
                 true
             }
             Err(e) => {
                 error!(
-                    "OCO FAILED for {} — position is UNPROTECTED: {}",
-                    signal.asset, e
+                    "{}: protective order FAILED — position is UNPROTECTED: {e}",
+                    signal.asset
                 );
                 self.notifier
                     .notify_error(
                         &format!("UNPROTECTED {}", signal.asset),
-                        &format!("OCO rejected: {e}"),
+                        &format!("Protective order rejected: {e}"),
                     )
                     .await;
                 false
@@ -145,6 +168,8 @@ impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
             take_profit,
             entry_time: now_ms(),
             protected,
+            highest_high: fill_price,
+            atr_at_entry: if trailing { signal.atr } else { 0.0 },
         });
 
         self.notifier
@@ -243,6 +268,103 @@ impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
             .await
     }
 
+    /// Keep exchange-side protection correct for one open position.
+    ///
+    /// Three jobs, in priority order:
+    /// 1. Re-protect a position that has none — which is how a failed replace
+    ///    from an earlier cycle gets repaired.
+    /// 2. Ratchet the trailing stop upward once it has moved far enough to be
+    ///    worth the replace.
+    /// 3. Otherwise leave the resting order alone.
+    ///
+    /// Binance reserves the base asset against a resting order, so a new stop
+    /// cannot be placed before the old one is cancelled. That ordering is
+    /// forced, and it means every ratchet has a brief window with nothing on
+    /// the exchange. `RATCHET_MIN_ATR` keeps those windows rare, and a failure
+    /// leaves `protected` false so the next cycle repairs it.
+    pub async fn maintain_protection(
+        &self,
+        symbol: &str,
+        current_price: f64,
+        params: &StrategyParams,
+        risk_manager: &mut RiskManager,
+    ) -> Result<(), String> {
+        let Some(position) = risk_manager.positions.iter_mut().find(|p| p.symbol == symbol)
+        else {
+            return Ok(());
+        };
+
+        // The high-water mark only ever rises.
+        position.highest_high = position.highest_high.max(current_price);
+
+        let trailing = params.trailing_stop_atr > 0.0 && position.atr_at_entry > 0.0;
+        let desired = if trailing {
+            let trail = position.highest_high - params.trailing_stop_atr * position.atr_at_entry;
+            // Never below the structural stop the entry was sized against.
+            position.stop_loss.max(trail)
+        } else {
+            position.stop_loss
+        };
+
+        let ratchet = trailing
+            && desired > position.stop_loss + RATCHET_MIN_ATR * position.atr_at_entry;
+
+        if position.protected && !ratchet {
+            return Ok(());
+        }
+
+        let (quantity, was_protected) = (position.quantity, position.protected);
+        let filters = self.client.filters(symbol).await?;
+        let stop_price = filters.round_price(desired);
+        let stop_limit = filters.round_price(desired * STOP_LIMIT_SLIP);
+        let sell_qty = filters.round_quantity(quantity);
+
+        if let Err(rejection) = filters.check_order(sell_qty, stop_price) {
+            warn!("{symbol}: cannot place protective stop — {rejection}");
+            return Ok(());
+        }
+
+        // Only cancel when something is actually resting.
+        if was_protected {
+            self.client.cancel_open_orders(symbol).await.map_err(|e| {
+                format!("{symbol}: could not cancel old stop, leaving it in place: {e}")
+            })?;
+        }
+
+        match self
+            .client
+            .place_stop_loss(symbol, sell_qty, stop_price, stop_limit)
+            .await
+        {
+            Ok(stop) => {
+                if let Some(p) = risk_manager.positions.iter_mut().find(|p| p.symbol == symbol) {
+                    p.stop_loss = stop.stop_price;
+                    p.protected = true;
+                }
+                info!(
+                    "{symbol}: protective stop at {:.2} (order {})",
+                    stop.stop_price, stop.order_id
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // The old order is already gone. Say so loudly and let the next
+                // cycle retry via job 1.
+                if let Some(p) = risk_manager.positions.iter_mut().find(|p| p.symbol == symbol) {
+                    p.protected = false;
+                }
+                error!("{symbol}: stop placement FAILED — position is UNPROTECTED: {e}");
+                self.notifier
+                    .notify_error(
+                        &format!("UNPROTECTED {symbol}"),
+                        &format!("Stop could not be placed: {e}. Retrying next cycle."),
+                    )
+                    .await;
+                Err(e)
+            }
+        }
+    }
+
     /// Force-close every open position (used by FORCE_CLOSE).
     pub async fn close_all_positions(&self, risk_manager: &mut RiskManager) {
         let symbols: Vec<String> = risk_manager
@@ -287,7 +409,7 @@ fn format_holding_period(entry_time: u64, now: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::{Fill, OcoPlacement, OrderOutcome};
+    use crate::exchange::{Fill, OcoPlacement, OpenOrder, OrderOutcome, StopPlacement};
     use crate::strategy::Signal;
     use std::sync::Mutex;
 
@@ -308,6 +430,9 @@ mod tests {
         base_fee: f64,
         oco_rejects: bool,
         market_order_rejects: bool,
+        stop_rejects: bool,
+        /// `(symbol, quantity, stop_price)` per standalone stop attempt.
+        stop_requests: Mutex<Vec<(String, f64, f64)>>,
     }
 
     /// The real BTCUSDC rules: 1e-5 lot step, 0.01 tick, 5.00 USDC minimum.
@@ -405,6 +530,27 @@ mod tests {
             })
         }
 
+        async fn place_stop_loss(
+            &self,
+            symbol: &str,
+            quantity: f64,
+            stop_price: f64,
+            _stop_limit_price: f64,
+        ) -> Result<StopPlacement, String> {
+            self.log("place_stop_loss");
+            self.stop_requests
+                .lock()
+                .unwrap()
+                .push((symbol.to_string(), quantity, stop_price));
+            if self.stop_rejects {
+                return Err("Binance API error -2010: insufficient balance".into());
+            }
+            Ok(StopPlacement {
+                order_id: 77,
+                stop_price,
+            })
+        }
+
         async fn cancel_open_orders(&self, _symbol: &str) -> Result<(), String> {
             self.log("cancel_open_orders");
             Ok(())
@@ -430,6 +576,7 @@ mod tests {
             risk_reward_ratio: 2.0,
             reasoning: "test".into(),
             warnings: Vec::new(),
+            atr: 1_000.0,
         }
     }
 
@@ -442,7 +589,17 @@ mod tests {
             take_profit: 52_000.0,
             entry_time: 0,
             protected: true,
+            highest_high: 50_000.0,
+            atr_at_entry: 1_000.0,
         });
+    }
+
+    /// A 3-ATR chandelier.
+    fn trailing() -> StrategyParams {
+        StrategyParams {
+            trailing_stop_atr: 3.0,
+            ..Default::default()
+        }
     }
 
     // ----- BUY -----
@@ -454,7 +611,7 @@ mod tests {
         let mut rm = RiskManager::new(10_000.0);
 
         Executor::new(&venue, &notifier)
-            .execute_buy(&buy_signal(), 0.003, &mut rm)
+            .execute_buy(&buy_signal(), 0.003, &mut rm, &StrategyParams::default())
             .await
             .unwrap();
 
@@ -481,7 +638,7 @@ mod tests {
         // The buy itself still succeeded — the caller must not treat this as a
         // failed entry, or it would re-buy on the next cycle.
         Executor::new(&venue, &notifier)
-            .execute_buy(&buy_signal(), 0.003, &mut rm)
+            .execute_buy(&buy_signal(), 0.003, &mut rm, &StrategyParams::default())
             .await
             .unwrap();
 
@@ -503,7 +660,7 @@ mod tests {
         let mut rm = RiskManager::new(10_000.0);
 
         Executor::new(&venue, &notifier)
-            .execute_buy(&buy_signal(), 0.003, &mut rm)
+            .execute_buy(&buy_signal(), 0.003, &mut rm, &StrategyParams::default())
             .await
             .unwrap();
 
@@ -522,7 +679,7 @@ mod tests {
         let mut rm = RiskManager::new(10_000.0);
 
         Executor::new(&venue, &notifier)
-            .execute_buy(&buy_signal(), 0.003, &mut rm)
+            .execute_buy(&buy_signal(), 0.003, &mut rm, &StrategyParams::default())
             .await
             .unwrap();
 
@@ -539,7 +696,7 @@ mod tests {
         let mut rm = RiskManager::new(10_000.0);
 
         let result = Executor::new(&venue, &notifier)
-            .execute_buy(&buy_signal(), 0.003, &mut rm)
+            .execute_buy(&buy_signal(), 0.003, &mut rm, &StrategyParams::default())
             .await;
 
         assert!(result.is_err());
@@ -557,7 +714,7 @@ mod tests {
         let mut rm = RiskManager::new(19.0);
 
         Executor::new(&venue, &notifier)
-            .execute_buy(&buy_signal(), 0.000123, &mut rm)
+            .execute_buy(&buy_signal(), 0.000123, &mut rm, &StrategyParams::default())
             .await
             .unwrap();
 
@@ -573,7 +730,7 @@ mod tests {
         let mut rm = RiskManager::new(19.0);
 
         let err = Executor::new(&venue, &notifier)
-            .execute_buy(&buy_signal(), 0.00003, &mut rm)
+            .execute_buy(&buy_signal(), 0.00003, &mut rm, &StrategyParams::default())
             .await
             .unwrap_err();
 
@@ -597,7 +754,7 @@ mod tests {
         let mut rm = RiskManager::new(19.0);
 
         Executor::new(&venue, &notifier)
-            .execute_buy(&buy_signal(), 0.00012, &mut rm)
+            .execute_buy(&buy_signal(), 0.00012, &mut rm, &StrategyParams::default())
             .await
             .unwrap();
 
@@ -614,7 +771,7 @@ mod tests {
         let mut rm = RiskManager::new(19.0);
 
         Executor::new(&venue, &notifier)
-            .execute_buy(&buy_signal(), 0.00012, &mut rm)
+            .execute_buy(&buy_signal(), 0.00012, &mut rm, &StrategyParams::default())
             .await
             .unwrap();
 
@@ -635,12 +792,169 @@ mod tests {
         let mut rm = RiskManager::new(19.0);
 
         Executor::new(&venue, &notifier)
-            .execute_buy(&buy_signal(), 0.00012, &mut rm)
+            .execute_buy(&buy_signal(), 0.00012, &mut rm, &StrategyParams::default())
             .await
             .unwrap();
 
         assert!(!rm.positions[0].protected);
         assert_eq!(venue.calls(), vec!["market_order"], "no doomed OCO sent");
+    }
+
+    // ----- trailing stop -----
+
+    #[tokio::test]
+    async fn a_trailing_entry_places_a_stop_and_no_target() {
+        // Capping the winner is the thing the trail exists to avoid, so the
+        // take-profit must be left unset rather than placed at 2R.
+        let venue = FakeExchange::filling_at(50_000.0, 0.00012);
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(19.0);
+
+        Executor::new(&venue, &notifier)
+            .execute_buy(&buy_signal(), 0.00012, &mut rm, &trailing())
+            .await
+            .unwrap();
+
+        assert_eq!(venue.calls(), vec!["market_order", "place_stop_loss"]);
+        let pos = &rm.positions[0];
+        assert!(pos.protected);
+        assert_eq!(pos.take_profit, 0.0, "no target under a trailing stop");
+        assert_eq!(pos.atr_at_entry, 1_000.0);
+    }
+
+    #[tokio::test]
+    async fn the_stop_ratchets_up_as_price_advances() {
+        let venue = FakeExchange::default();
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+        open_position(&mut rm, "BTCUSDC", 0.001);
+
+        // Price runs to 56,000: trail = 56,000 - 3*1,000 = 53,000.
+        Executor::new(&venue, &notifier)
+            .maintain_protection("BTCUSDC", 56_000.0, &trailing(), &mut rm)
+            .await
+            .unwrap();
+
+        assert_eq!(rm.positions[0].stop_loss, 53_000.0);
+        assert_eq!(rm.positions[0].highest_high, 56_000.0);
+        // The old order must go before the new one, since it reserves the asset.
+        assert_eq!(
+            venue.calls(),
+            vec!["cancel_open_orders", "place_stop_loss"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stop_never_moves_down() {
+        let venue = FakeExchange::default();
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+        open_position(&mut rm, "BTCUSDC", 0.001);
+        let executor = Executor::new(&venue, &notifier);
+
+        executor
+            .maintain_protection("BTCUSDC", 56_000.0, &trailing(), &mut rm)
+            .await
+            .unwrap();
+        // Price falls back; the ratchet must hold, not retreat.
+        executor
+            .maintain_protection("BTCUSDC", 51_000.0, &trailing(), &mut rm)
+            .await
+            .unwrap();
+
+        assert_eq!(rm.positions[0].stop_loss, 53_000.0);
+        assert_eq!(rm.positions[0].highest_high, 56_000.0);
+    }
+
+    #[tokio::test]
+    async fn a_small_advance_does_not_churn_the_order() {
+        // Every replace opens a window with nothing protecting the position,
+        // so a few ticks of gain must not trigger one.
+        let venue = FakeExchange::default();
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+        open_position(&mut rm, "BTCUSDC", 0.001);
+
+        // Trail would be 52,050 — only 50 above the existing 49,000... but the
+        // ratchet threshold is 0.25 ATR = 250, and 52,050 clears it, so use a
+        // move that does not: price 52,100 gives trail 49,100, under 49,250.
+        Executor::new(&venue, &notifier)
+            .maintain_protection("BTCUSDC", 52_100.0, &trailing(), &mut rm)
+            .await
+            .unwrap();
+
+        assert_eq!(rm.positions[0].stop_loss, 49_000.0, "stop should not move");
+        assert!(venue.calls().is_empty(), "no orders should be touched");
+    }
+
+    #[tokio::test]
+    async fn a_failed_replace_marks_the_position_unprotected() {
+        // The old order is already cancelled at this point, so the position is
+        // genuinely naked and must not be recorded as safe.
+        let venue = FakeExchange {
+            stop_rejects: true,
+            ..Default::default()
+        };
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+        open_position(&mut rm, "BTCUSDC", 0.001);
+
+        let result = Executor::new(&venue, &notifier)
+            .maintain_protection("BTCUSDC", 56_000.0, &trailing(), &mut rm)
+            .await;
+
+        assert!(result.is_err());
+        assert!(!rm.positions[0].protected);
+        assert!(rm.has_position("BTCUSDC"), "position must stay tracked");
+    }
+
+    #[tokio::test]
+    async fn an_unprotected_position_is_repaired_without_cancelling() {
+        // Repairing after a failed replace: nothing is resting, so issuing a
+        // cancel would be pointless and could mask a real error.
+        let venue = FakeExchange::default();
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+        open_position(&mut rm, "BTCUSDC", 0.001);
+        rm.positions[0].protected = false;
+
+        Executor::new(&venue, &notifier)
+            .maintain_protection("BTCUSDC", 50_100.0, &trailing(), &mut rm)
+            .await
+            .unwrap();
+
+        assert!(rm.positions[0].protected);
+        assert_eq!(venue.calls(), vec!["place_stop_loss"]);
+    }
+
+    #[tokio::test]
+    async fn maintenance_is_inert_without_a_position() {
+        let venue = FakeExchange::default();
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+
+        Executor::new(&venue, &notifier)
+            .maintain_protection("BTCUSDC", 56_000.0, &trailing(), &mut rm)
+            .await
+            .unwrap();
+
+        assert!(venue.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_protected_position_is_left_alone_when_trailing_is_off() {
+        let venue = FakeExchange::default();
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(10_000.0);
+        open_position(&mut rm, "BTCUSDC", 0.001);
+
+        Executor::new(&venue, &notifier)
+            .maintain_protection("BTCUSDC", 90_000.0, &StrategyParams::default(), &mut rm)
+            .await
+            .unwrap();
+
+        assert_eq!(rm.positions[0].stop_loss, 49_000.0);
+        assert!(venue.calls().is_empty());
     }
 
     // ----- SELL -----

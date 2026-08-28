@@ -28,6 +28,8 @@ pub struct TradeSignal {
     pub risk_reward_ratio: f64,
     pub reasoning: String,
     pub warnings: Vec<String>,
+    /// Daily ATR(14) at signal time, used to size the trailing stop.
+    pub atr: f64,
 }
 
 /// Snapshot of all indicator values at the latest candle.
@@ -361,6 +363,7 @@ pub fn evaluate(
             risk_reward_ratio: rr_ratio,
             reasoning: reasons.join(". "),
             warnings,
+            atr: snap.atr_14,
         };
     }
 
@@ -394,6 +397,7 @@ pub fn evaluate(
             risk_reward_ratio: 0.0,
             reasoning: sell_reasons.join(". "),
             warnings,
+            atr: snap.atr_14,
         };
     }
 
@@ -410,6 +414,7 @@ pub fn evaluate(
         risk_reward_ratio: rr_ratio,
         reasoning: reasons.join(". "),
         warnings,
+        atr: snap.atr_14,
     }
 }
 

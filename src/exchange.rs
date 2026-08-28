@@ -152,6 +152,17 @@ pub struct OcoPlacement {
     pub take_profit_price: f64,
 }
 
+/// Confirmation that a standalone protective stop is live on the venue.
+///
+/// A trailing stop has no target leg, so it cannot be an OCO — Binance's order
+/// list always pairs a stop with a take-profit. This is a lone
+/// `STOP_LOSS_LIMIT` that ratchets upward as price advances.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StopPlacement {
+    pub order_id: u64,
+    pub stop_price: f64,
+}
+
 /// A non-quote asset holding, `free + locked` so assets reserved by a resting
 /// OCO still count toward equity.
 #[derive(Debug, Clone, PartialEq)]
@@ -392,6 +403,18 @@ pub trait ExecutionProvider {
         stop_price: f64,
         stop_limit_price: f64,
     ) -> impl Future<Output = Result<OcoPlacement, String>> + Send;
+
+    /// Place a standalone protective stop, with no target leg.
+    ///
+    /// Used by the trailing stop, where capping the upside is exactly what we
+    /// are trying to avoid.
+    fn place_stop_loss(
+        &self,
+        symbol: &str,
+        quantity: f64,
+        stop_price: f64,
+        stop_limit_price: f64,
+    ) -> impl Future<Output = Result<StopPlacement, String>> + Send;
 
     fn cancel_open_orders(&self, symbol: &str) -> impl Future<Output = Result<(), String>> + Send;
 

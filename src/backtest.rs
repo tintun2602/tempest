@@ -431,6 +431,8 @@ fn simulate(
                     // The sim fills SL/TP off candle extremes, i.e. it assumes
                     // the bracket is resting on the exchange.
                     protected: true,
+                    highest_high: entry_fill,
+                    atr_at_entry: snap.atr_14,
                 });
             }
             Signal::Sell if position.is_some() => {
@@ -1218,6 +1220,8 @@ fn simulate_portfolio(
                         take_profit,
                         entry_time: bar.open_time,
                         protected: true,
+                        highest_high: entry_fill,
+                        atr_at_entry: snap.atr_14,
                     });
                     concurrent_peak = concurrent_peak.max(positions.len());
                 }

@@ -212,6 +212,15 @@ where
             }
         };
 
+        // Ratchet the trailing stop, and repair any position left unprotected
+        // by a failed replace on an earlier cycle.
+        if let Err(e) = executor
+            .maintain_protection(symbol, price, params, risk_manager)
+            .await
+        {
+            error!("{symbol}: protection maintenance failed: {e}");
+        }
+
         let snap = match strategy::compute_indicators(&daily, &four_hour, price) {
             Some(s) => s,
             None => {
@@ -263,7 +272,7 @@ where
                     warn!("{symbol}: calculated position size is zero, skipping");
                     continue;
                 }
-                if let Err(e) = executor.execute_buy(&signal, qty, risk_manager).await {
+                if let Err(e) = executor.execute_buy(&signal, qty, risk_manager, params).await {
                     error!("{symbol}: BUY failed: {e}");
                     notifier.notify_error(&format!("BUY {symbol}"), &e).await;
                 }
@@ -527,6 +536,8 @@ async fn reconcile_positions<C>(
                 take_profit,
                 entry_time: 0,
                 protected,
+                highest_high: price,
+                atr_at_entry: 0.0,
             });
             restored += 1;
             continue;
@@ -604,6 +615,8 @@ async fn reconcile_positions<C>(
             take_profit,
             entry_time: 0,
             protected,
+            highest_high: price,
+            atr_at_entry: 0.0,
         });
     }
 

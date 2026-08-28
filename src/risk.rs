@@ -25,6 +25,11 @@ pub struct Position {
     /// holding nothing and `check_exits` is the only stop this position has —
     /// which requires the bot to be alive and polling.
     pub protected: bool,
+    /// Highest price seen since entry, for the chandelier trailing stop.
+    pub highest_high: f64,
+    /// ATR at entry, held fixed so the stop ratchets on price alone and never
+    /// loosens when volatility expands.
+    pub atr_at_entry: f64,
 }
 
 pub struct RiskManager {
@@ -289,6 +294,8 @@ mod tests {
                 take_profit: 120.0,
                 entry_time: 0,
                 protected: false,
+            highest_high: 0.0,
+            atr_at_entry: 0.0,
             });
         }
         assert!(!rm.can_open_position());
@@ -314,6 +321,8 @@ mod tests {
             take_profit: 52_000.0,
             entry_time: 0,
             protected: false,
+            highest_high: 0.0,
+            atr_at_entry: 0.0,
         });
         assert!(rm.has_position("BTCUSDT"));
         let closed = rm.close_position("BTCUSDT");
@@ -332,6 +341,8 @@ mod tests {
             take_profit: 3_400.0,
             entry_time: 0,
             protected: false,
+            highest_high: 0.0,
+            atr_at_entry: 0.0,
         });
         // Price between SL and TP → no exit
         assert!(rm.check_exits("ETHUSDT", 3_100.0).is_none());
@@ -354,6 +365,8 @@ mod tests {
             take_profit: 0.0,
             entry_time: 0,
             protected: false,
+            highest_high: 0.0,
+            atr_at_entry: 0.0,
         });
         assert!(rm.check_exits("BTCUSDT", 50_000.0).is_none());
         assert!(rm.check_exits("BTCUSDT", 1.0).is_none());
@@ -370,6 +383,8 @@ mod tests {
             take_profit: 0.0,
             entry_time: 0,
             protected: false,
+            highest_high: 0.0,
+            atr_at_entry: 0.0,
         });
         // Unset target never fires, however high the price goes.
         assert!(rm.check_exits("BTCUSDT", 90_000.0).is_none());

@@ -7,7 +7,7 @@
 use super::{
     weighted_average_price, AccountProvider, AccountSnapshot, Balance, Candle, ExecutionProvider,
     Fill, InstrumentProvider, MarketDataProvider, OcoPlacement, OpenOrder, OrderKind, OrderOutcome,
-    Side, SymbolFilters,
+    Side, StopPlacement, SymbolFilters,
 };
 use crate::config::Config;
 use hmac::{Hmac, Mac};
@@ -300,6 +300,38 @@ impl ExecutionProvider for BinanceClient {
             order_list_id,
             stop_price,
             take_profit_price,
+        })
+    }
+
+    async fn place_stop_loss(
+        &self,
+        symbol: &str,
+        quantity: f64,
+        stop_price: f64,
+        stop_limit_price: f64,
+    ) -> Result<StopPlacement, String> {
+        let ts = self.timestamp_ms();
+        let query = format!(
+            "symbol={symbol}&side=SELL&type=STOP_LOSS_LIMIT\
+             &quantity={}&price={}&stopPrice={}&timeInForce=GTC&timestamp={ts}",
+            format_quantity(quantity),
+            format_price(stop_limit_price),
+            format_price(stop_price),
+        );
+
+        let resp = self
+            .signed_form(reqwest::Method::POST, "/api/v3/order", &query)
+            .await?;
+        check_api_error(&resp)?;
+
+        // As with the OCO, only a venue-issued id counts as protection.
+        let order_id = resp["orderId"]
+            .as_u64()
+            .ok_or_else(|| format!("stop not confirmed by exchange: {resp}"))?;
+
+        Ok(StopPlacement {
+            order_id,
+            stop_price,
         })
     }
 
