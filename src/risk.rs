@@ -5,8 +5,35 @@ use tracing::{info, warn};
 /// lever on return *and* drawdown, and the right setting depends entirely on
 /// the operator's tolerance.
 pub const DEFAULT_RISK_PER_TRADE: f64 = 0.015; // 1.5% of portfolio
-const MAX_OPEN_POSITIONS: usize = 4;
-const DAILY_DRAWDOWN_LIMIT: f64 = 0.05; // 5%
+pub const DEFAULT_MAX_OPEN_POSITIONS: usize = 4;
+pub const DEFAULT_DAILY_DRAWDOWN_LIMIT: f64 = 0.05; // 5%
+
+/// The three numbers that decide how much of the account is at stake.
+///
+/// Grouped so a caller cannot set one and silently inherit stale defaults for
+/// the others: they only make sense together. On spot the notional a position
+/// can take is bounded by free cash (see [`MAX_NOTIONAL_FRACTION`]), so raising
+/// `risk_per_trade` past roughly `stop_distance / max_open_positions` buys no
+/// additional exposure — the sizer simply clamps and logs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RiskLimits {
+    /// Fraction of equity risked on each entry.
+    pub risk_per_trade: f64,
+    /// How many positions may be open at once.
+    pub max_open_positions: usize,
+    /// Fraction below the day-open equity at which new trading stops.
+    pub daily_drawdown_limit: f64,
+}
+
+impl Default for RiskLimits {
+    fn default() -> Self {
+        Self {
+            risk_per_trade: DEFAULT_RISK_PER_TRADE,
+            max_open_positions: DEFAULT_MAX_OPEN_POSITIONS,
+            daily_drawdown_limit: DEFAULT_DAILY_DRAWDOWN_LIMIT,
+        }
+    }
+}
 /// Largest share of free USDT a single entry may spend, leaving headroom for
 /// fees and market-order slippage.
 const MAX_NOTIONAL_FRACTION: f64 = 0.95;
@@ -34,8 +61,7 @@ pub struct Position {
 
 pub struct RiskManager {
     pub positions: Vec<Position>,
-    /// Fraction of equity risked on each entry.
-    risk_per_trade: f64,
+    limits: RiskLimits,
     /// Total portfolio equity at the start of the current UTC day — the baseline
     /// the daily drawdown limit is measured against.
     pub day_open_equity: f64,
@@ -51,10 +77,21 @@ impl RiskManager {
         Self::with_risk_per_trade(starting_equity, DEFAULT_RISK_PER_TRADE)
     }
 
+    /// Default position and drawdown limits, with an explicit risk fraction.
     pub fn with_risk_per_trade(starting_equity: f64, risk_per_trade: f64) -> Self {
+        Self::with_limits(
+            starting_equity,
+            RiskLimits {
+                risk_per_trade,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn with_limits(starting_equity: f64, limits: RiskLimits) -> Self {
         Self {
             positions: Vec::new(),
-            risk_per_trade,
+            limits,
             day_open_equity: starting_equity,
             current_utc_day: utc_day_number(),
             halted: false,
@@ -85,11 +122,11 @@ impl RiskManager {
             return false;
         }
         let drawdown = (self.day_open_equity - current_equity) / self.day_open_equity;
-        if drawdown >= DAILY_DRAWDOWN_LIMIT {
+        if drawdown >= self.limits.daily_drawdown_limit {
             warn!(
                 "HALT: drawdown {:.2}% >= {:.1}% limit (day open: {:.2}, now: {:.2})",
                 drawdown * 100.0,
-                DAILY_DRAWDOWN_LIMIT * 100.0,
+                self.limits.daily_drawdown_limit * 100.0,
                 self.day_open_equity,
                 current_equity
             );
@@ -109,7 +146,7 @@ impl RiskManager {
 
     /// Whether a new position is allowed right now.
     pub fn can_open_position(&self) -> bool {
-        !self.halted && self.positions.len() < MAX_OPEN_POSITIONS
+        !self.halted && self.positions.len() < self.limits.max_open_positions
     }
 
     /// Whether the bot already holds a position in `symbol`.
@@ -135,7 +172,7 @@ impl RiskManager {
             return (0.0, 0.0);
         }
 
-        let risk_amount = equity * self.risk_per_trade;
+        let risk_amount = equity * self.limits.risk_per_trade;
         let mut quantity = risk_amount / stop_distance;
 
         let max_affordable = available_usdt * MAX_NOTIONAL_FRACTION / entry_price;
@@ -294,8 +331,8 @@ mod tests {
                 take_profit: 120.0,
                 entry_time: 0,
                 protected: false,
-            highest_high: 0.0,
-            atr_at_entry: 0.0,
+                highest_high: 0.0,
+                atr_at_entry: 0.0,
             });
         }
         assert!(!rm.can_open_position());

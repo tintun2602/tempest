@@ -1,10 +1,18 @@
 use crate::costs::CostModel;
-use crate::exchange::{Candle, MarketDataProvider};
+use crate::exchange::{closed_candles, Candle, MarketDataProvider};
 use crate::risk::RiskManager;
 use crate::strategy::{self, EntryConditions, Signal, StrategyParams};
 use rand::Rng;
 use std::collections::HashMap;
 use tracing::info;
+
+/// Current wall clock in Unix epoch milliseconds.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch")
+        .as_millis() as u64
+}
 
 const STARTING_BALANCE: f64 = 10_000.0;
 const MONTE_CARLO_RUNS: usize = 10_000;
@@ -134,11 +142,7 @@ fn settle(pos: &SimPosition, exit_quote: f64, reason: ExitReason, costs: &CostMo
 }
 
 /// Run a backtest for a single symbol over its historical data.
-pub async fn run<M: MarketDataProvider>(
-    client: &M,
-    symbols: &[String],
-    risk_per_trade: f64,
-) {
+pub async fn run<M: MarketDataProvider>(client: &M, symbols: &[String], risk_per_trade: f64) {
     let params = StrategyParams::from_env();
     let params = &params;
     let costs = CostModel::from_env();
@@ -181,8 +185,13 @@ async fn backtest_symbol<M: MarketDataProvider>(
 ) -> Result<(), String> {
     // Fetch maximum historical data from production API (testnet has limited history)
     // Daily: 1000 candles = ~2.7 years. 4H: paginate to cover the same period (~6000 candles).
-    let daily = client.klines_extended(symbol, "1d", 1000).await?;
-    let four_hour = client.klines_extended(symbol, "4h", 6000).await?;
+    // Same rule as the live bot: the venue's final bar is still being written,
+    // and a backtest that scores it as settled measures a strategy the live
+    // path will not run.
+    let now = now_ms();
+    let daily = closed_candles(&client.klines_extended(symbol, "1d", 1000).await?, now).to_vec();
+    let four_hour =
+        closed_candles(&client.klines_extended(symbol, "4h", 6000).await?, now).to_vec();
 
     if daily.len() < 210 {
         return Err(format!(
@@ -711,8 +720,22 @@ fn print_period_split(
         return;
     }
 
-    let in_sample = simulate(symbol, daily, &four_hour[first..mid], costs, risk_per_trade, params);
-    let out_sample = simulate(symbol, daily, &four_hour[mid..], costs, risk_per_trade, params);
+    let in_sample = simulate(
+        symbol,
+        daily,
+        &four_hour[first..mid],
+        costs,
+        risk_per_trade,
+        params,
+    );
+    let out_sample = simulate(
+        symbol,
+        daily,
+        &four_hour[mid..],
+        costs,
+        risk_per_trade,
+        params,
+    );
     let ret = |b: f64| (b - STARTING_BALANCE) / STARTING_BALANCE * 100.0;
 
     println!();
@@ -1291,8 +1314,11 @@ async fn portfolio_backtest<M: MarketDataProvider>(
 ) -> Result<(), String> {
     let mut feeds: Vec<SymbolFeed> = Vec::new();
     for symbol in symbols {
-        let daily = client.klines_extended(symbol, "1d", 1000).await?;
-        let four_hour = client.klines_extended(symbol, "4h", 6000).await?;
+        let now = now_ms();
+        let daily =
+            closed_candles(&client.klines_extended(symbol, "1d", 1000).await?, now).to_vec();
+        let four_hour =
+            closed_candles(&client.klines_extended(symbol, "4h", 6000).await?, now).to_vec();
         if daily.len() < 210 || four_hour.len() < 50 {
             tracing::warn!("{symbol}: insufficient history for the portfolio run, skipping");
             continue;
@@ -1373,6 +1399,7 @@ async fn portfolio_backtest<M: MarketDataProvider>(
     print_monte_carlo_report(&result.trades);
     print_buffer_sweep(&mut feeds, costs, risk_per_trade);
     print_trailing_sweep(&mut feeds, costs, risk_per_trade);
+    print_entry_gate_sweep(&mut feeds, costs, risk_per_trade);
 
     Ok(())
 }
@@ -1393,14 +1420,12 @@ fn print_buffer_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_trad
     );
     println!("    {}", "-".repeat(62));
 
-    for (entry, exit) in [
-        (0.0, 0.0),
-        (0.5, 0.5),
-    ] {
+    for (entry, exit) in [(0.0, 0.0), (0.5, 0.5)] {
         let params = StrategyParams {
             entry_buffer_atr: entry,
             exit_buffer_atr: exit,
             trailing_stop_atr: 0.0,
+            ..Default::default()
         };
         let (r, _) = simulate_portfolio(feeds, costs, risk_per_trade, &params);
         let wins = r.trades.iter().filter(|t| t.pnl > 0.0).count();
@@ -1416,6 +1441,58 @@ fn print_buffer_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_trad
             r.trades.len(),
             r.max_drawdown
         );
+    }
+}
+
+/// Re-run the portfolio across the entry gates that decide how *often* it trades.
+///
+/// The RSI ceiling and the MACD recency rule are the two binding constraints on
+/// frequency, and they interact: the default band (35-55) fights the trend
+/// filter, because an established uptrend keeps daily RSI nearer 55-70. Every
+/// row trades the same instruments over the same history; only the gate moves.
+///
+/// Read the `trades` column together with `return` — loosening always buys more
+/// trades, and the question is whether the edge survives them once fees and
+/// slippage are paid on each one.
+fn print_entry_gate_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_trade: f64) {
+    println!();
+    println!("  Entry-gate sweep (how often the strategy is allowed to trade):");
+    println!(
+        "    {:>9}  {:>22}  {:>10}  {:>9}  {:>7}  {:>7}  {:>8}",
+        "RSI band", "MACD rule", "final", "return", "trades", "win%", "max DD"
+    );
+    println!("    {}", "-".repeat(82));
+
+    let macd_modes = [
+        ("cross <=3 bars", true, 3usize),
+        ("cross <=6 bars", true, 6),
+        ("above signal", false, 3),
+    ];
+
+    for rsi_max in [55.0, 65.0, 70.0] {
+        for (label, require_cross, lookback) in macd_modes {
+            let params = StrategyParams {
+                rsi_max,
+                macd_require_cross: require_cross,
+                macd_lookback_bars: lookback,
+                ..Default::default()
+            };
+            let (r, _) = simulate_portfolio(feeds, costs, risk_per_trade, &params);
+            let wins = r.trades.iter().filter(|t| t.pnl > 0.0).count();
+            let win_rate = if r.trades.is_empty() {
+                0.0
+            } else {
+                wins as f64 / r.trades.len() as f64 * 100.0
+            };
+            println!(
+                "    {:>9}  {label:>22}  {:>10.2}  {:>+8.2}%  {:>7}  {win_rate:>6.1}%  {:>7.2}%",
+                format!("{:.0}-{:.0}", params.rsi_min, rsi_max),
+                r.final_balance,
+                (r.final_balance - STARTING_BALANCE) / STARTING_BALANCE * 100.0,
+                r.trades.len(),
+                r.max_drawdown
+            );
+        }
     }
 }
 
@@ -1440,6 +1517,7 @@ fn print_trailing_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_tr
             entry_buffer_atr: 0.0,
             exit_buffer_atr: 0.0,
             trailing_stop_atr: trail,
+            ..Default::default()
         };
         let (r, _) = simulate_portfolio(feeds, costs, risk_per_trade, &params);
         let wins: Vec<f64> = r
@@ -1479,11 +1557,7 @@ fn print_trailing_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_tr
 /// zero would credit the benchmark with the entire indicator warmup — a
 /// stretch the strategy sat out — and on this data that alone turned a losing
 /// benchmark into a +63% one.
-fn portfolio_buy_and_hold(
-    feeds: &[SymbolFeed],
-    costs: &CostModel,
-    first_bar: usize,
-) -> (f64, f64) {
+fn portfolio_buy_and_hold(feeds: &[SymbolFeed], costs: &CostModel, first_bar: usize) -> (f64, f64) {
     let per_symbol = STARTING_BALANCE / feeds.len() as f64;
     let bars = feeds.iter().map(|f| f.four_hour.len()).min().unwrap_or(0);
     if bars == 0 || first_bar >= bars {

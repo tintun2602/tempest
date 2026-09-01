@@ -3,6 +3,16 @@ use crate::indicators;
 use serde::Serialize;
 use tracing::debug;
 
+/// The RSI band the strategy has always used.
+const DEFAULT_RSI_MIN: f64 = 35.0;
+const DEFAULT_RSI_MAX: f64 = 55.0;
+/// How recent a bullish MACD cross must be, in four-hour bars.
+const DEFAULT_MACD_LOOKBACK_BARS: usize = 3;
+/// How far back `compute_indicators` looks for the last cross. The snapshot
+/// records the distance so the *policy* (how recent is recent enough) lives in
+/// `StrategyParams` rather than being baked into the measurement.
+const MAX_MACD_LOOKBACK_BARS: usize = 12;
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Signal {
     Buy,
@@ -37,10 +47,13 @@ pub struct IndicatorSnapshot {
     pub ema_50: f64,
     pub ema_200: f64,
     pub rsi_14: f64,
-    pub macd_line: f64,
-    pub macd_signal: f64,
     pub macd_histogram: f64,
-    pub macd_crossed_bullish_recently: bool,
+    /// MACD line currently above its signal line.
+    pub macd_above_signal: bool,
+    /// Bars since the MACD line was last at or below its signal line, capped at
+    /// [`MAX_MACD_LOOKBACK_BARS`]. `None` means it has been above for at least
+    /// that long — a mature move rather than a fresh cross.
+    pub macd_bars_since_cross: Option<usize>,
     pub current_price: f64,
     pub swing_low: f64,
     /// Daily ATR(14) — "normal" movement in price units, used to size the
@@ -69,6 +82,27 @@ pub struct StrategyParams {
     /// deletes the fat right tail trend-following depends on — measured here,
     /// *every* winning trade exited at the target and none ran further.
     pub trailing_stop_atr: f64,
+
+    /// Lower bound of the daily RSI(14) entry band.
+    pub rsi_min: f64,
+    /// Upper bound of the daily RSI(14) entry band.
+    ///
+    /// The default of 55 fights the trend filter: an established uptrend keeps
+    /// daily RSI in roughly 55-70, so demanding price > EMA50 > EMA200 *and*
+    /// RSI <= 55 asks for strength and weakness at the same time. Raising this
+    /// is the single largest lever on how often the strategy trades.
+    pub rsi_max: f64,
+
+    /// Whether MACD must have *crossed* bullish recently, rather than merely
+    /// sitting above its signal line.
+    ///
+    /// The cross is an event and holds for only a handful of bars; the state
+    /// holds for as long as the move does. Requiring the event is the sharpest
+    /// single constraint on entry frequency.
+    pub macd_require_cross: bool,
+    /// How many four-hour bars back the bullish cross may have happened.
+    /// Ignored when `macd_require_cross` is false.
+    pub macd_lookback_bars: usize,
 }
 
 impl Default for StrategyParams {
@@ -77,6 +111,10 @@ impl Default for StrategyParams {
             entry_buffer_atr: 0.0,
             exit_buffer_atr: 0.0,
             trailing_stop_atr: 0.0,
+            rsi_min: DEFAULT_RSI_MIN,
+            rsi_max: DEFAULT_RSI_MAX,
+            macd_require_cross: true,
+            macd_lookback_bars: DEFAULT_MACD_LOOKBACK_BARS,
         }
     }
 }
@@ -90,10 +128,46 @@ impl StrategyParams {
                 .filter(|v| v.is_finite() && *v >= 0.0)
                 .unwrap_or(0.0)
         };
+        // Buffers default to zero (feature off). The entry gates instead
+        // default to the values the strategy has always used, so an unset
+        // environment reproduces current behaviour exactly.
+        let or_default = |key: &str, fallback: f64| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite())
+                .unwrap_or(fallback)
+        };
+
+        let rsi_min = or_default("RSI_MIN", DEFAULT_RSI_MIN);
+        let rsi_max = or_default("RSI_MAX", DEFAULT_RSI_MAX);
+        // An inverted band silently blocks every trade. Fall back rather than
+        // run a bot that can never buy.
+        let (rsi_min, rsi_max) = if rsi_min <= rsi_max {
+            (rsi_min, rsi_max)
+        } else {
+            tracing::warn!(
+                "RSI_MIN {rsi_min} is above RSI_MAX {rsi_max} — ignoring both and using {}-{}",
+                DEFAULT_RSI_MIN,
+                DEFAULT_RSI_MAX
+            );
+            (DEFAULT_RSI_MIN, DEFAULT_RSI_MAX)
+        };
+
         Self {
             entry_buffer_atr: read("ENTRY_BUFFER_ATR"),
             exit_buffer_atr: read("EXIT_BUFFER_ATR"),
             trailing_stop_atr: read("TRAILING_STOP_ATR"),
+            rsi_min,
+            rsi_max,
+            macd_require_cross: std::env::var("MACD_REQUIRE_CROSS")
+                .map(|v| v != "false")
+                .unwrap_or(true),
+            macd_lookback_bars: std::env::var("MACD_LOOKBACK_BARS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v >= 1 && *v <= MAX_MACD_LOOKBACK_BARS)
+                .unwrap_or(DEFAULT_MACD_LOOKBACK_BARS),
         }
     }
 
@@ -105,6 +179,22 @@ impl StrategyParams {
     /// Price must fall under this to exit.
     fn exit_threshold(&self, snap: &IndicatorSnapshot) -> f64 {
         snap.ema_50 - self.exit_buffer_atr * usable_atr(snap)
+    }
+
+    /// Whether MACD momentum satisfies the entry gate.
+    ///
+    /// In cross mode the line must be above its signal *and* have been below it
+    /// within `macd_lookback_bars` — a fresh turn. In state mode being above is
+    /// enough, which fires far more often and drifts toward trend-following.
+    fn macd_bullish(&self, snap: &IndicatorSnapshot) -> bool {
+        if !snap.macd_above_signal {
+            return false;
+        }
+        if !self.macd_require_cross {
+            return true;
+        }
+        snap.macd_bars_since_cross
+            .is_some_and(|bars| bars <= self.macd_lookback_bars)
     }
 }
 
@@ -160,15 +250,14 @@ pub fn compute_indicators(
         return None;
     }
 
-    // Did MACD cross bullish within the last 3 four-hour candles?
-    let macd_crossed_bullish_recently = (1..=3.min(n - 1)).any(|offset| {
+    // How long has MACD been above its signal line? The first offset at which
+    // it was at or below is the age of the current bullish leg.
+    let macd_above_signal = macd_line > macd_signal;
+    let macd_bars_since_cross = (1..=MAX_MACD_LOOKBACK_BARS.min(n - 1)).find(|offset| {
         let i = n - 1 - offset;
         let prev_m = macd_result.macd_line[i];
         let prev_s = macd_result.signal_line[i];
-        if prev_m.is_nan() || prev_s.is_nan() {
-            return false;
-        }
-        prev_m <= prev_s && macd_line > macd_signal
+        !prev_m.is_nan() && !prev_s.is_nan() && prev_m <= prev_s
     });
 
     // --- Swing low for stop-loss ---
@@ -188,7 +277,8 @@ pub fn compute_indicators(
         macd_line,
         macd_signal,
         macd_histogram,
-        macd_crossed_bullish_recently,
+        macd_above_signal,
+        ?macd_bars_since_cross,
         swing_low,
         current_price,
         "indicators computed"
@@ -205,10 +295,9 @@ pub fn compute_indicators(
         ema_50,
         ema_200,
         rsi_14,
-        macd_line,
-        macd_signal,
         macd_histogram,
-        macd_crossed_bullish_recently,
+        macd_above_signal,
+        macd_bars_since_cross,
         current_price,
         swing_low,
     })
@@ -223,9 +312,10 @@ pub fn compute_indicators(
 pub struct EntryConditions {
     /// Price above EMA50, and EMA50 above EMA200.
     pub trend_bullish: bool,
-    /// Daily RSI(14) inside the 35-55 accumulation band.
+    /// Daily RSI(14) inside the configured accumulation band.
     pub rsi_ok: bool,
-    /// MACD crossed bullish within the last 3 four-hour candles.
+    /// MACD momentum is bullish, per [`StrategyParams::macd_require_cross`]:
+    /// either a recent bullish cross, or simply the line above its signal.
     pub macd_crossed: bool,
     /// A swing low exists below price, so risk is measurable.
     ///
@@ -239,8 +329,8 @@ impl EntryConditions {
         Self {
             trend_bullish: snap.current_price > params.entry_threshold(snap)
                 && snap.ema_50 > snap.ema_200,
-            rsi_ok: snap.rsi_14 >= 35.0 && snap.rsi_14 <= 55.0,
-            macd_crossed: snap.macd_crossed_bullish_recently,
+            rsi_ok: snap.rsi_14 >= params.rsi_min && snap.rsi_14 <= params.rsi_max,
+            macd_crossed: params.macd_bullish(snap),
             stop_valid: snap.current_price - snap.swing_low > 0.0,
         }
     }
@@ -266,19 +356,15 @@ impl EntryConditions {
     pub fn checklist(&self) -> [(&'static str, bool); 4] {
         [
             ("Trend  price > EMA50 > EMA200", self.trend_bullish),
-            ("RSI    within 35-55", self.rsi_ok),
-            ("MACD   bullish cross <=3 bars", self.macd_crossed),
+            ("RSI    within band", self.rsi_ok),
+            ("MACD   bullish momentum", self.macd_crossed),
             ("Stop   swing low below price", self.stop_valid),
         ]
     }
 }
 
 /// Evaluate the indicator snapshot against entry/exit rules and return a signal.
-pub fn evaluate(
-    symbol: &str,
-    snap: &IndicatorSnapshot,
-    params: &StrategyParams,
-) -> TradeSignal {
+pub fn evaluate(symbol: &str, snap: &IndicatorSnapshot, params: &StrategyParams) -> TradeSignal {
     let mut warnings: Vec<String> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
 
@@ -331,14 +417,23 @@ pub fn evaluate(
     });
 
     reasons.push(if rsi_ok {
-        format!("RSI(14) = {:.1} (in buy zone 35–55)", snap.rsi_14)
+        format!(
+            "RSI(14) = {:.1} (in buy zone {:.0}–{:.0})",
+            snap.rsi_14, params.rsi_min, params.rsi_max
+        )
     } else {
-        format!("RSI(14) = {:.1} (outside buy zone)", snap.rsi_14)
+        format!(
+            "RSI(14) = {:.1} (outside buy zone {:.0}–{:.0})",
+            snap.rsi_14, params.rsi_min, params.rsi_max
+        )
     });
 
     reasons.push(if macd_crossed {
-        "MACD crossed bullish within last 3 candles".into()
-    } else if snap.macd_line > snap.macd_signal {
+        match snap.macd_bars_since_cross {
+            Some(bars) => format!("MACD crossed bullish {bars} candle(s) ago"),
+            None => "MACD above signal (established leg)".into(),
+        }
+    } else if snap.macd_above_signal {
         "MACD above signal but no recent crossover".into()
     } else {
         "MACD bearish".into()
@@ -428,10 +523,9 @@ mod tests {
             ema_50: 60_000.0,
             ema_200: 55_000.0,
             rsi_14: 45.0,
-            macd_line: 10.0,
-            macd_signal: 5.0,
             macd_histogram: 5.0,
-            macd_crossed_bullish_recently: true,
+            macd_above_signal: true,
+            macd_bars_since_cross: Some(1),
             current_price: 62_000.0,
             swing_low: 59_000.0,
             atr_14: 1_000.0,
@@ -492,7 +586,7 @@ mod tests {
     #[test]
     fn checklist_agrees_with_the_individual_flags() {
         let mut snap = qualifying();
-        snap.macd_crossed_bullish_recently = false;
+        snap.macd_bars_since_cross = None;
         let c = EntryConditions::evaluate(&snap, &bare());
         let checklist = c.checklist();
         assert_eq!(checklist.len(), 4);
@@ -565,6 +659,85 @@ mod tests {
         };
         assert!(!EntryConditions::evaluate(&snap, &buffered).all_met());
         assert_ne!(evaluate("BTCUSDC", &snap, &buffered).signal, Signal::Sell);
+    }
+
+    // ----- tunable entry gates -----
+
+    #[test]
+    fn default_params_are_the_historical_rules() {
+        let p = StrategyParams::default();
+        assert_eq!(p.rsi_min, 35.0);
+        assert_eq!(p.rsi_max, 55.0);
+        assert!(p.macd_require_cross);
+        assert_eq!(p.macd_lookback_bars, 3);
+    }
+
+    #[test]
+    fn a_raised_rsi_ceiling_admits_a_strong_trend() {
+        // RSI 62 is typical of an established uptrend and is exactly what the
+        // default 55 ceiling excludes.
+        let mut snap = qualifying();
+        snap.rsi_14 = 62.0;
+        assert!(!EntryConditions::evaluate(&snap, &bare()).rsi_ok);
+
+        let wide = StrategyParams {
+            rsi_max: 70.0,
+            ..Default::default()
+        };
+        assert!(EntryConditions::evaluate(&snap, &wide).rsi_ok);
+        assert_eq!(evaluate("BTCUSDC", &snap, &wide).signal, Signal::Buy);
+    }
+
+    #[test]
+    fn the_rsi_floor_still_rejects_a_collapse() {
+        let mut snap = qualifying();
+        snap.rsi_14 = 20.0;
+        let wide = StrategyParams {
+            rsi_max: 70.0,
+            ..Default::default()
+        };
+        assert!(!EntryConditions::evaluate(&snap, &wide).rsi_ok);
+    }
+
+    #[test]
+    fn a_stale_cross_fails_in_cross_mode_but_passes_in_state_mode() {
+        // Above signal for 8 bars: a mature leg, not a fresh turn.
+        let mut snap = qualifying();
+        snap.macd_bars_since_cross = Some(8);
+        assert!(!EntryConditions::evaluate(&snap, &bare()).macd_crossed);
+
+        let state = StrategyParams {
+            macd_require_cross: false,
+            ..Default::default()
+        };
+        assert!(EntryConditions::evaluate(&snap, &state).macd_crossed);
+    }
+
+    #[test]
+    fn a_widened_lookback_admits_a_slightly_older_cross() {
+        let mut snap = qualifying();
+        snap.macd_bars_since_cross = Some(5);
+        assert!(!EntryConditions::evaluate(&snap, &bare()).macd_crossed);
+
+        let wider = StrategyParams {
+            macd_lookback_bars: 6,
+            ..Default::default()
+        };
+        assert!(EntryConditions::evaluate(&snap, &wider).macd_crossed);
+    }
+
+    #[test]
+    fn state_mode_still_requires_macd_above_its_signal() {
+        // Loosening the recency rule must not turn a bearish MACD into a buy.
+        let mut snap = qualifying();
+        snap.macd_above_signal = false;
+        snap.macd_bars_since_cross = None;
+        let state = StrategyParams {
+            macd_require_cross: false,
+            ..Default::default()
+        };
+        assert!(!EntryConditions::evaluate(&snap, &state).macd_crossed);
+        assert_ne!(evaluate("BTCUSDC", &snap, &state).signal, Signal::Buy);
     }
 
     #[test]

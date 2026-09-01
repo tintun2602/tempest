@@ -583,7 +583,7 @@ mod tests {
             trading_pairs: vec![],
             poll_interval_secs: 300,
             backtest_mode: false,
-            risk_per_trade: 0.015,
+            risk: Default::default(),
         })
     }
 

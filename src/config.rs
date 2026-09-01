@@ -1,3 +1,6 @@
+use crate::risk::{
+    RiskLimits, DEFAULT_DAILY_DRAWDOWN_LIMIT, DEFAULT_MAX_OPEN_POSITIONS, DEFAULT_RISK_PER_TRADE,
+};
 use std::env;
 
 pub struct Config {
@@ -8,8 +11,8 @@ pub struct Config {
     pub trading_pairs: Vec<String>,
     pub poll_interval_secs: u64,
     pub backtest_mode: bool,
-    /// Fraction of equity risked per trade.
-    pub risk_per_trade: f64,
+    /// How much of the account is at stake, per trade and in aggregate.
+    pub risk: RiskLimits,
 }
 
 /// Every configured symbol must be quoted in `quote_asset`.
@@ -84,8 +87,29 @@ impl Config {
         let risk_per_trade = env::var("RISK_PER_TRADE_PCT")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
+            .filter(|pct| *pct > 0.0 && *pct <= 100.0)
             .map(|pct| pct / 100.0)
-            .unwrap_or(crate::risk::DEFAULT_RISK_PER_TRADE);
+            .unwrap_or(DEFAULT_RISK_PER_TRADE);
+
+        let max_open_positions = env::var("MAX_OPEN_POSITIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(DEFAULT_MAX_OPEN_POSITIONS);
+
+        // A zero limit would halt the bot on the first tick of red.
+        let daily_drawdown_limit = env::var("DAILY_DRAWDOWN_PCT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|pct| *pct > 0.0 && *pct <= 100.0)
+            .map(|pct| pct / 100.0)
+            .unwrap_or(DEFAULT_DAILY_DRAWDOWN_LIMIT);
+
+        let risk = RiskLimits {
+            risk_per_trade,
+            max_open_positions,
+            daily_drawdown_limit,
+        };
 
         Self {
             base_url,
@@ -95,7 +119,7 @@ impl Config {
             trading_pairs,
             poll_interval_secs,
             backtest_mode,
-            risk_per_trade,
+            risk,
         }
     }
 }

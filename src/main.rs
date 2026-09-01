@@ -11,7 +11,8 @@ mod strategy;
 use config::Config;
 use exchange::binance::BinanceClient;
 use exchange::{
-    protective_levels, AccountProvider, ExecutionProvider, InstrumentProvider, MarketDataProvider,
+    closed_candles, protective_levels, AccountProvider, ExecutionProvider, InstrumentProvider,
+    MarketDataProvider,
 };
 use executor::Executor;
 use notify::Notifier;
@@ -49,6 +50,21 @@ impl StatusTracker {
     }
 }
 
+/// Daily candles requested per cycle.
+///
+/// EMA(200) is seeded with the simple average of the first 200 bars, so it
+/// needs a long tail behind it to converge. At the old request size of 250 the
+/// seed still carried ~61% of the weight of the final value, making "EMA200"
+/// largely an average of prices from eight months earlier. Measured against a
+/// fully warmed series that is a ~2% median error — and it flips the
+/// `EMA50 > EMA200` trend verdict, the gate that admits every trade, in ~3% of
+/// samples. 600 bars leaves the seed at under 14% weight.
+const DAILY_CANDLES: u32 = 600;
+
+/// Four-hour candles requested per cycle. MACD(12,26,9) settles well inside
+/// this; the surplus is warm-up margin.
+const FOUR_HOUR_CANDLES: u32 = 150;
+
 /// Positions worth less than this are leftover fractions, not real holdings.
 const DUST_NOTIONAL: f64 = 5.0;
 
@@ -69,7 +85,7 @@ async fn main() {
 
     // --- Backtest mode ---
     if config.backtest_mode {
-        backtest::run(&client, &config.trading_pairs, config.risk_per_trade).await;
+        backtest::run(&client, &config.trading_pairs, config.risk.risk_per_trade).await;
         return;
     }
 
@@ -103,22 +119,40 @@ async fn main() {
             equity.total,
             equity.free_quote,
             &config.trading_pairs,
-            config.risk_per_trade,
+            config.risk.risk_per_trade,
             config.poll_interval_secs,
         )
         .await;
 
-    info!(
-        "Risk per trade: {:.2}% of equity",
-        config.risk_per_trade * 100.0
-    );
-    let mut risk_manager = RiskManager::with_risk_per_trade(equity.total, config.risk_per_trade);
+    let mut risk_manager = RiskManager::with_limits(equity.total, config.risk);
     let mut status = StatusTracker::default();
     let params = StrategyParams::from_env();
+
+    // Every gate is tunable now, so the log states what is actually live —
+    // otherwise a misread env var is indistinguishable from a quiet market.
     info!(
-        "Signal buffers: entry {:.2} ATR | exit {:.2} ATR",
-        params.entry_buffer_atr, params.exit_buffer_atr
+        "Risk: {:.2}% per trade | max {} positions | halt at {:.1}% daily drawdown",
+        config.risk.risk_per_trade * 100.0,
+        config.risk.max_open_positions,
+        config.risk.daily_drawdown_limit * 100.0
     );
+    info!(
+        "Entry: RSI {:.0}-{:.0} | MACD {} | buffers entry {:.2} / exit {:.2} ATR | trail {:.2} ATR",
+        params.rsi_min,
+        params.rsi_max,
+        if params.macd_require_cross {
+            format!("cross within {} bars", params.macd_lookback_bars)
+        } else {
+            "above signal (state)".to_string()
+        },
+        params.entry_buffer_atr,
+        params.exit_buffer_atr,
+        params.trailing_stop_atr
+    );
+
+    // With a large pair list a typo or delisting is otherwise invisible: it
+    // fails one fetch per cycle, for ever, buried among healthy symbols.
+    report_unresolvable_symbols(&client, &config, &notifier).await;
 
     // Detect positions held from a prior crash that lack OCO protection.
     reconcile_positions(&client, &config, &mut risk_manager, &notifier).await;
@@ -126,8 +160,15 @@ async fn main() {
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
 
     loop {
-        if let Err(e) =
-            run_cycle(&client, &config, &mut risk_manager, &notifier, &mut status, &params).await
+        if let Err(e) = run_cycle(
+            &client,
+            &config,
+            &mut risk_manager,
+            &notifier,
+            &mut status,
+            &params,
+        )
+        .await
         {
             error!("Cycle error: {e}");
             notifier.notify_error("Cycle", &e).await;
@@ -188,7 +229,7 @@ where
     for symbol in &config.trading_pairs {
         info!("--- Evaluating {symbol} ---");
 
-        let daily = match client.klines(symbol, "1d", 250).await {
+        let daily = match client.klines(symbol, "1d", DAILY_CANDLES).await {
             Ok(c) => c,
             Err(e) => {
                 error!("{symbol}: daily klines failed: {e}");
@@ -196,13 +237,19 @@ where
             }
         };
 
-        let four_hour = match client.klines(symbol, "4h", 100).await {
+        let four_hour = match client.klines(symbol, "4h", FOUR_HOUR_CANDLES).await {
             Ok(c) => c,
             Err(e) => {
                 error!("{symbol}: 4h klines failed: {e}");
                 continue;
             }
         };
+
+        // Indicators are built only from bars the venue has finished writing —
+        // the last element of a klines response is the bar still in progress.
+        let now = now_ms();
+        let daily = closed_candles(&daily, now);
+        let four_hour = closed_candles(&four_hour, now);
 
         let price = match client.price(symbol).await {
             Ok(p) => p,
@@ -221,7 +268,7 @@ where
             error!("{symbol}: protection maintenance failed: {e}");
         }
 
-        let snap = match strategy::compute_indicators(&daily, &four_hour, price) {
+        let snap = match strategy::compute_indicators(daily, four_hour, price) {
             Some(s) => s,
             None => {
                 warn!("{symbol}: insufficient candle data for indicators");
@@ -272,7 +319,10 @@ where
                     warn!("{symbol}: calculated position size is zero, skipping");
                     continue;
                 }
-                if let Err(e) = executor.execute_buy(&signal, qty, risk_manager, params).await {
+                if let Err(e) = executor
+                    .execute_buy(&signal, qty, risk_manager, params)
+                    .await
+                {
                     error!("{symbol}: BUY failed: {e}");
                     notifier.notify_error(&format!("BUY {symbol}"), &e).await;
                 }
@@ -346,7 +396,9 @@ impl Equity {
 enum PositionSync {
     Unchanged,
     /// Partially filled or partially sold elsewhere.
-    Resized { to: f64 },
+    Resized {
+        to: f64,
+    },
     /// The exchange no longer backs this position at a tradable size.
     ClosedExternally,
 }
@@ -394,11 +446,11 @@ async fn sync_positions_with_exchange(
         match classify_position(tracked_quantity, held, price) {
             PositionSync::Unchanged => {}
             PositionSync::Resized { to } => {
-                warn!(
-                    "{symbol}: exchange holds {to:.8}, tracked {tracked_quantity:.8} — resizing"
-                );
-                if let Some(position) =
-                    risk_manager.positions.iter_mut().find(|p| p.symbol == symbol)
+                warn!("{symbol}: exchange holds {to:.8}, tracked {tracked_quantity:.8} — resizing");
+                if let Some(position) = risk_manager
+                    .positions
+                    .iter_mut()
+                    .find(|p| p.symbol == symbol)
                 {
                     position.quantity = to;
                 }
@@ -458,6 +510,44 @@ where
         total,
         holdings,
     })
+}
+
+/// Name any configured symbol the venue does not recognise.
+///
+/// `Config::validate_pairs` only checks the quote-asset suffix, so a mistyped
+/// or delisted pair passes startup and then fails a fetch every cycle. This is
+/// diagnostics only — nothing is removed from the trading list, because a
+/// transient error at startup must not silently disable a healthy symbol for
+/// the life of the process.
+async fn report_unresolvable_symbols<C>(client: &C, config: &Config, notifier: &Notifier)
+where
+    C: InstrumentProvider,
+{
+    let mut unresolved = Vec::new();
+    for symbol in &config.trading_pairs {
+        if let Err(e) = client.filters(symbol).await {
+            warn!("{symbol}: does not resolve on the venue: {e}");
+            unresolved.push(symbol.clone());
+        }
+    }
+
+    if unresolved.is_empty() {
+        info!(
+            "All {} configured symbols resolved.",
+            config.trading_pairs.len()
+        );
+        return;
+    }
+
+    let message = format!(
+        "{} of {} symbols did not resolve: {}. They will be skipped every cycle until \
+         TRADING_PAIRS is corrected.",
+        unresolved.len(),
+        config.trading_pairs.len(),
+        unresolved.join(", ")
+    );
+    warn!("{message}");
+    notifier.notify_error("Unresolved symbols", &message).await;
 }
 
 /// On startup, check the account for holdings that correspond to configured
