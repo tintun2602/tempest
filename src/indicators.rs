@@ -229,7 +229,10 @@ mod tests {
         let highs = vec![11.0, 9.0, 13.0, 8.0, 15.0, 7.0];
         let lows = vec![9.0, 7.0, 11.0, 6.0, 13.0, 5.0];
         let closes = vec![10.0, 8.0, 12.0, 7.0, 14.0, 6.0];
-        for v in atr(&highs, &lows, &closes, 3).into_iter().filter(|v| v.is_finite()) {
+        for v in atr(&highs, &lows, &closes, 3)
+            .into_iter()
+            .filter(|v| v.is_finite())
+        {
             assert!(v >= 0.0, "ATR went negative: {v}");
         }
     }

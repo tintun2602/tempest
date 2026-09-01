@@ -221,10 +221,7 @@ impl Notifier {
             msg.push_str(&format!("{mark} {label}\n"));
         }
 
-        msg.push_str(&format!(
-            "\n*{}/4* conditions met",
-            conditions.met_count()
-        ));
+        msg.push_str(&format!("\n*{}/4* conditions met", conditions.met_count()));
         msg
     }
 
