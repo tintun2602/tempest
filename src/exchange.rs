@@ -13,6 +13,26 @@ pub mod binance;
 
 use std::future::Future;
 
+/// The candles the venue has finished writing, given the current wall clock.
+///
+/// Binance returns the in-progress bar as the final element of a klines
+/// response. Computing indicators over it makes signals *repaint*: a MACD cross
+/// can appear halfway through a four-hour bar and be gone by the next poll, so
+/// the bot can act on a setup that never existed once the bar settled. Every
+/// indicator must be built from settled bars; the live price comes from the
+/// ticker instead.
+///
+/// Historical pages are entirely closed, so this is a no-op there.
+pub fn closed_candles(candles: &[Candle], now_ms: u64) -> &[Candle] {
+    // `close_time` is the last millisecond the bar covers, so a bar is settled
+    // only once the clock has passed it.
+    let settled = candles
+        .iter()
+        .position(|c| c.close_time >= now_ms)
+        .unwrap_or(candles.len());
+    &candles[..settled]
+}
+
 /// A single OHLCV bar. `open_time`/`close_time` are Unix epoch milliseconds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candle {
@@ -681,5 +701,55 @@ mod tests {
         assert!((outcome.commission_paid_in("BTC") - 0.00000012).abs() < 1e-12);
         // Fees paid in another asset do not reduce the base holding.
         assert_eq!(outcome.commission_paid_in("BNB"), 0.0);
+    }
+
+    fn candle_closing_at(close_time: u64) -> Candle {
+        Candle {
+            open_time: close_time.saturating_sub(1000),
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 1.0,
+            close_time,
+        }
+    }
+
+    #[test]
+    fn the_in_progress_bar_is_dropped() {
+        // The shape of a live klines response: settled history, then the bar
+        // the venue is still writing.
+        let candles = vec![
+            candle_closing_at(1_000),
+            candle_closing_at(2_000),
+            candle_closing_at(3_000),
+        ];
+        let settled = closed_candles(&candles, 2_500);
+        assert_eq!(settled.len(), 2);
+        assert_eq!(settled.last().unwrap().close_time, 2_000);
+    }
+
+    #[test]
+    fn a_bar_closing_this_exact_millisecond_is_not_yet_settled() {
+        let candles = vec![candle_closing_at(1_000), candle_closing_at(2_000)];
+        assert_eq!(closed_candles(&candles, 2_000).len(), 1);
+    }
+
+    #[test]
+    fn fully_historical_pages_are_untouched() {
+        let candles = vec![candle_closing_at(1_000), candle_closing_at(2_000)];
+        assert_eq!(closed_candles(&candles, 9_999).len(), 2);
+    }
+
+    #[test]
+    fn an_all_unsettled_response_yields_nothing_rather_than_repainting() {
+        // Better to skip a cycle than to compute indicators on a partial bar.
+        let candles = vec![candle_closing_at(5_000)];
+        assert!(closed_candles(&candles, 1_000).is_empty());
+    }
+
+    #[test]
+    fn an_empty_response_is_handled() {
+        assert!(closed_candles(&[], 1_000).is_empty());
     }
 }
