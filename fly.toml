@@ -6,9 +6,43 @@ primary_region = "ams"
 [env]
   BINANCE_BASE_URL = "https://api.binance.com"
   QUOTE_ASSET = "USDC"
-  TRADING_PAIRS = "BTCUSDC"
-  POLL_INTERVAL_SECONDS = "14400"
+
+  # A four-condition entry fires on roughly 1.4% of days per symbol. On one
+  # symbol that is ~5 signals a year, and the account sits ~98% in cash. Signal
+  # count scales with the universe without loosening any gate, so breadth is
+  # the cheapest source of trade frequency here. MAX_OPEN_POSITIONS still caps
+  # concurrent exposure.
+  #
+  # Startup logs "All N configured symbols resolved" — any pair without a USDC
+  # book is named there and in a Telegram alert, and can then be dropped.
+  TRADING_PAIRS = "BTCUSDC,ETHUSDC,SOLUSDC,XRPUSDC,BNBUSDC,DOGEUSDC,ADAUSDC,AVAXUSDC,LINKUSDC,DOTUSDC,LTCUSDC,TRXUSDC,NEARUSDC,ATOMUSDC,UNIUSDC,SUIUSDC"
+
+  # Signals are computed from closed candles only, so a shorter poll no longer
+  # risks acting on a half-formed bar. Hourly keeps a 4H MACD cross inside its
+  # lookback window instead of finding it three bars late.
+  POLL_INTERVAL_SECONDS = "3600"
+
   LOG_LEVEL = "info"
+
+  # ---------------------------------------------------------------------------
+  # Entry gates and risk limits are unset, which means the values the strategy
+  # has always used: RSI 35-55, MACD cross within 3 bars, 1.5% risk per trade,
+  # 4 positions, 5% daily drawdown halt.
+  #
+  # Loosening these is what raises trade frequency further, and each one is a
+  # row in `cargo run -- --backtest` (entry-gate and trailing-stop sweeps).
+  # Measure before enabling: the edge behind them has never been measured, and
+  # frequency amplifies the sign of an edge in both directions.
+  #
+  #   RSI_MAX = "70"                 # the default 55 fights the trend filter
+  #   MACD_REQUIRE_CROSS = "false"   # state instead of event: ~4x the signals
+  #   MACD_LOOKBACK_BARS = "6"
+  #   TRAILING_STOP_ATR = "3"        # uncap winners; 2R clips the right tail
+  #   ENTRY_BUFFER_ATR = "0.5"       # churn guard, matters more at frequency
+  #   RISK_PER_TRADE_PCT = "3"       # past ~3% the spot cash cap makes this a no-op
+  #   MAX_OPEN_POSITIONS = "6"
+  #   DAILY_DRAWDOWN_PCT = "12"      # 5% halts constantly at full deployment
+  # ---------------------------------------------------------------------------
 
 [[vm]]
   size = "shared-cpu-1x"

@@ -75,12 +75,36 @@ Fetches up to 1000 daily + 1000 4H candles per pair and prints a report with win
 
 ## Trading Logic
 
+All indicators are computed from **closed candles only** — the in-progress bar
+is dropped, so a signal cannot appear mid-bar and vanish before the next poll.
+The live price comes from the ticker.
+
 ### Entry (BUY) — all must be true:
 
 1. Price > EMA(50) > EMA(200) on daily
-2. RSI(14) daily between 35 and 55
-3. MACD crossed bullish within last 3 four-hour candles
+2. RSI(14) daily within the configured band (default 35–55)
+3. MACD bullish on 4H — by default a cross within the last 3 candles
 4. Reward-to-risk ratio >= 2.0
+
+### Tuning entry frequency
+
+The defaults are strict: all four conditions hold on roughly 1.4% of days per
+symbol, so a single-symbol deployment sees about five signals a year. Two gates
+dominate that number, and both are tunable from the environment:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `RSI_MIN` / `RSI_MAX` | `35` / `55` | The 55 ceiling fights the trend filter — an established uptrend keeps daily RSI nearer 55–70. Raising it is the largest single lever. |
+| `MACD_REQUIRE_CROSS` | `true` | `false` accepts MACD merely being above its signal (a state, not an event), which fires far more often. |
+| `MACD_LOOKBACK_BARS` | `3` | How recent the cross must be, in 4H bars. |
+
+Widening the universe raises frequency without touching any gate, and is the
+one lever that does not trade away selectivity.
+
+Run `cargo run -- --backtest` before enabling any of these: the entry-gate
+sweep reports return, trade count, win rate and drawdown for each combination.
+More trades is not more profit — each round trip pays roughly 0.3% in fees and
+slippage, so frequency amplifies whichever sign your edge actually has.
 
 ### Exit (SELL) — any of:
 
@@ -89,12 +113,19 @@ Fetches up to 1000 daily + 1000 4H candles per pair and prints a report with win
 3. RSI > 70 and MACD histogram negative
 4. `FORCE_CLOSE=true` environment variable
 
-### Risk Rules (hardcoded, non-negotiable):
+### Risk Rules:
 
-- Max risk per trade: 1.5% of USDT balance
-- Position size: `(balance * 0.015) / stop_distance`
-- Max simultaneous positions: 4
-- Daily drawdown halt: portfolio down >5% from day-open triggers HALT until next UTC midnight
+- Max risk per trade: 1.5% of equity (`RISK_PER_TRADE_PCT`)
+- Position size: `(equity * risk) / stop_distance`, capped at 95% of free cash
+- Max simultaneous positions: 4 (`MAX_OPEN_POSITIONS`)
+- Daily drawdown halt: portfolio down >5% from day-open halts new trades until
+  the next UTC midnight (`DAILY_DRAWDOWN_PCT`)
+
+On spot the sizer is bounded by free cash, so notional is
+`equity * risk / stop_distance` capped at 95% of what is uncommitted. With a
+typical 6% stop, four positions at 1.5% risk is already ~100% of equity
+deployed. Raising `RISK_PER_TRADE_PCT` much past 3% therefore buys no extra
+exposure — the sizer clamps and logs `Position size capped by balance`.
 
 ## Deployment
 

@@ -160,8 +160,11 @@ impl StrategyParams {
             trailing_stop_atr: read("TRAILING_STOP_ATR"),
             rsi_min,
             rsi_max,
+            // Only an explicit falsey value switches to state mode; anything
+            // unrecognised keeps the stricter rule rather than silently
+            // loosening entry.
             macd_require_cross: std::env::var("MACD_REQUIRE_CROSS")
-                .map(|v| v != "false")
+                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
                 .unwrap_or(true),
             macd_lookback_bars: std::env::var("MACD_LOOKBACK_BARS")
                 .ok()
