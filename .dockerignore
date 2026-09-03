@@ -1,0 +1,15 @@
+# Build artifacts — the image builds from source in its own target dir
+target/
+
+# Local toolchain and VCS metadata
+.rustup/
+.git/
+.gitignore
+
+# Secrets — never ship these to the builder
+.env
+
+# Not needed to build the binary
+docs/
+README.md
+fly.toml
