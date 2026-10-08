@@ -94,6 +94,25 @@ MODE=backtest cargo run
 
 Fetches up to 1000 daily + 1000 4H candles per pair and prints a report with win rate, profit factor, max drawdown, a full trade log, and a Monte Carlo stress analysis. The Monte Carlo section resamples historical trade returns to estimate final-balance ranges, drawdown, and losing streaks; it does not predict future performance.
 
+## Strategy lab
+
+```bash
+MODE=lab cargo run
+```
+
+Replays every strategy in `src/strategies.rs` (`trend_pullback`, `breakout`,
+`mean_reversion`) over the last `LAB_DAYS` (default 120) on `TRADING_PAIRS`,
+`TREND_INTERVAL` and `SIGNAL_INTERVAL`, with fees and slippage. Each bar sees
+exactly what the live loop fetches. The first 70% of the history is in-sample,
+the last 30% out-of-sample; only out-of-sample results count. It prints a table
+and one `LAB_REPORT {json}` line with a `recommendation` of `keep` or
+`switch:<strategy>`, made only when a strategy beats live out of sample with at
+least 30 trades and a profit factor of 1.1 or more.
+
+The live loop trades `STRATEGY` if set, otherwise `LIVE_STRATEGY` in
+`src/strategies.rs`. Switching strategies is a reviewed pull request that
+changes that constant.
+
 ## Trading Logic
 
 ### Entry (BUY) — all must be true:

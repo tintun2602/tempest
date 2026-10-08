@@ -514,7 +514,7 @@ fn buy_and_hold(bars: &[Candle], costs: &CostModel) -> (f64, f64) {
 ///
 /// Returns `None` when the last bar predates `day_open` — i.e. the day has no
 /// bars yet, so there is nothing in progress. Walks back at most six bars.
-fn partial_daily(bars: &[Candle], day_open: u64) -> Option<Candle> {
+pub(crate) fn partial_daily(bars: &[Candle], day_open: u64) -> Option<Candle> {
     let end = bars.len().checked_sub(1)?;
     if bars[end].open_time < day_open {
         return None;
