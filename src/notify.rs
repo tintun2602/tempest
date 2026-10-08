@@ -329,8 +329,10 @@ fn format_summary(
 
 /// `900` -> `15m`, `14400` -> `4h`: whole hours when they divide evenly,
 /// otherwise minutes, so a sub-hour poll no longer renders as `0h`.
+// `u64::is_multiple_of` needs Rust 1.87; the Dockerfile builds on 1.85.
+#[allow(clippy::manual_is_multiple_of)]
 fn format_interval(secs: u64) -> String {
-    if secs >= 3600 && secs.is_multiple_of(3600) {
+    if secs >= 3600 && secs % 3600 == 0 {
         format!("{}h", secs / 3600)
     } else {
         format!("{}m", (secs / 60).max(1))
