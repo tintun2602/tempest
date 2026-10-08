@@ -17,16 +17,34 @@ use std::sync::Mutex;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Public Binance endpoint used for historical klines. The configured
-/// `base_url` may be a testnet, which carries far too little history to warm up
-/// an EMA200 or run a backtest.
-const HISTORY_BASE_URL: &str = "https://api.binance.com";
+/// Binance's market-data-only host. Public candles, prices and trading rules
+/// come from here so the trading IP spends its request weight only on signed
+/// account and order calls, which keeps it clear of weight bans.
+const MARKET_DATA_URL: &str = "https://data-api.binance.vision";
+
+/// Public endpoint for historical klines. The configured `base_url` may be a
+/// testnet, which carries far too little history to warm up an EMA200 or run a
+/// backtest.
+const HISTORY_BASE_URL: &str = MARKET_DATA_URL;
+
+/// Where public market data is read for a given trading endpoint: production
+/// reads the data-only host, anything else (a testnet) reads itself so prices
+/// match the venue being traded.
+fn market_data_url(base_url: &str) -> String {
+    if base_url.trim_end_matches('/') == "https://api.binance.com" {
+        MARKET_DATA_URL.to_string()
+    } else {
+        base_url.to_string()
+    }
+}
 
 /// Largest page the klines endpoint will return.
 const MAX_KLINES_PER_REQUEST: usize = 1000;
 
 pub struct BinanceClient {
     base_url: String,
+    /// Host for unsigned market data; see [`market_data_url`].
+    market_url: String,
     api_key: String,
     api_secret: String,
     http: reqwest::Client,
@@ -39,6 +57,7 @@ impl BinanceClient {
     pub fn new(config: &Config) -> Self {
         Self {
             base_url: config.base_url.clone(),
+            market_url: market_data_url(&config.base_url),
             api_key: config.api_key.clone(),
             api_secret: config.api_secret.clone(),
             http: reqwest::Client::builder()
@@ -145,7 +164,7 @@ impl InstrumentProvider for BinanceClient {
             return Ok(cached.clone());
         }
 
-        let url = format!("{}/api/v3/exchangeInfo?symbol={symbol}", self.base_url);
+        let url = format!("{}/api/v3/exchangeInfo?symbol={symbol}", self.market_url);
         let resp: serde_json::Value = self
             .http
             .get(&url)
@@ -173,7 +192,7 @@ impl MarketDataProvider for BinanceClient {
         interval: &str,
         limit: u32,
     ) -> Result<Vec<Candle>, String> {
-        self.fetch_klines(&self.base_url, symbol, interval, limit, None)
+        self.fetch_klines(&self.market_url, symbol, interval, limit, None)
             .await
     }
 
@@ -210,7 +229,7 @@ impl MarketDataProvider for BinanceClient {
     }
 
     async fn price(&self, symbol: &str) -> Result<f64, String> {
-        let url = format!("{}/api/v3/ticker/price?symbol={symbol}", self.base_url);
+        let url = format!("{}/api/v3/ticker/price?symbol={symbol}", self.market_url);
         let resp: serde_json::Value = self
             .http
             .get(&url)
@@ -590,6 +609,20 @@ mod tests {
             daily_drawdown_limit: 0.05,
             strategy: crate::strategies::LIVE_STRATEGY,
         })
+    }
+
+    // ----- endpoints -----
+
+    #[test]
+    fn production_reads_market_data_from_the_data_only_host() {
+        assert_eq!(market_data_url("https://api.binance.com"), MARKET_DATA_URL);
+        assert_eq!(market_data_url("https://api.binance.com/"), MARKET_DATA_URL);
+    }
+
+    #[test]
+    fn a_testnet_reads_its_own_market_data() {
+        let testnet = "https://testnet.binance.vision";
+        assert_eq!(market_data_url(testnet), testnet);
     }
 
     // ----- signing -----

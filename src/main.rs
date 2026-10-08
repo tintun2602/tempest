@@ -70,6 +70,20 @@ fn rank_candidates(candidates: &mut [BuyCandidate]) {
     });
 }
 
+/// Never pause longer than this on a ban, so a misread timestamp cannot stall
+/// the bot for good. Binance's longest automatic ban is three days.
+const MAX_BAN_WAIT_MS: u64 = 3 * 24 * 3_600_000;
+/// Resume a little after the ban lifts rather than exactly on it.
+const BAN_MARGIN_MS: u64 = 5_000;
+
+/// The end of a Binance IP ban (`-1003 ... IP banned until <ms>`), if `error`
+/// reports one.
+fn banned_until_ms(error: &str) -> Option<u64> {
+    let rest = &error[error.find("banned until ")? + "banned until ".len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// Positions worth less than this are leftover fractions, not real holdings.
 const DUST_NOTIONAL: f64 = 5.0;
 
@@ -165,6 +179,21 @@ async fn main() {
         if let Err(e) =
             run_cycle(&client, &config, &mut risk_manager, &notifier, &mut status, &params).await
         {
+            if let Some(until) = banned_until_ms(&e) {
+                // Every request during a ban extends it, and an alert per poll
+                // is noise: pause until it lifts and say so once.
+                let wait_ms = until.saturating_sub(now_ms()).min(MAX_BAN_WAIT_MS) + BAN_MARGIN_MS;
+                warn!("Binance IP ban; pausing {}s", wait_ms / 1000);
+                notifier
+                    .send(&format!(
+                        "\u{26d4} *Binance IP ban*\nPausing for {} min, until the ban lifts. \
+                         Open positions keep their stop orders on the exchange.",
+                        wait_ms.div_ceil(60_000)
+                    ))
+                    .await;
+                sleep(Duration::from_millis(wait_ms)).await;
+                continue;
+            }
             error!("Cycle error: {e}");
             notifier.notify_error("Cycle", &e).await;
         }
@@ -769,6 +798,19 @@ mod tests {
     use super::*;
 
     const BTC_PRICE: f64 = 77_000.0;
+
+    #[test]
+    fn a_weight_ban_is_recognised_with_its_end_time() {
+        let err = r#"No balances array in response: {"code":-1003,"msg":"Way too much request weight used; IP banned until 1791436066508. Please use WebSocket Streams for live updates to avoid bans."}"#;
+        assert_eq!(banned_until_ms(err), Some(1_791_436_066_508));
+    }
+
+    #[test]
+    fn other_errors_are_not_bans() {
+        let err = r#"{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}"#;
+        assert_eq!(banned_until_ms(err), None);
+        assert_eq!(banned_until_ms("banned until soon"), None);
+    }
 
     // ----- entry ranking -----
 
