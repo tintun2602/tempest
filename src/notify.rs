@@ -94,6 +94,8 @@ impl Notifier {
     // Convenience methods
     // -----------------------------------------------------------------------
 
+    // Every field is part of the BUY message; a struct would only rename them.
+    #[allow(clippy::too_many_arguments)]
     pub async fn notify_buy(
         &self,
         symbol: &str,

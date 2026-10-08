@@ -409,7 +409,7 @@ fn format_holding_period(entry_time: u64, now: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::{Fill, OcoPlacement, OpenOrder, OrderOutcome, StopPlacement};
+    use crate::exchange::{Fill, OcoPlacement, OrderOutcome, StopPlacement};
     use crate::strategy::Signal;
     use std::sync::Mutex;
 

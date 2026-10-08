@@ -929,98 +929,6 @@ fn print_report(symbol: &str, trades: &[SimTrade], final_balance: f64, max_drawd
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{partial_daily, percentile, Candle};
-
-    /// Four-hour bar starting at `open_time` (epoch ms).
-    fn bar(open_time: u64, open: f64, high: f64, low: f64, close: f64) -> Candle {
-        Candle {
-            open_time,
-            open,
-            high,
-            low,
-            close,
-            volume: 1.0,
-            close_time: open_time + 4 * 3_600_000 - 1,
-        }
-    }
-
-    const DAY: u64 = 86_400_000;
-    const H4: u64 = 4 * 3_600_000;
-
-    #[test]
-    fn partial_daily_aggregates_the_current_day_only() {
-        // Yesterday's final bar, then three bars of today.
-        let bars = [
-            bar(DAY - H4, 10.0, 11.0, 9.0, 10.5),
-            bar(DAY, 100.0, 105.0, 99.0, 104.0),
-            bar(DAY + H4, 104.0, 112.0, 103.0, 108.0),
-            bar(DAY + 2 * H4, 108.0, 110.0, 101.0, 102.0),
-        ];
-
-        let partial = partial_daily(&bars, DAY).expect("today has bars");
-        // Open from the day's first bar, close from its last.
-        assert_eq!(partial.open, 100.0);
-        assert_eq!(partial.close, 102.0);
-        // Extremes across today only — yesterday's 9.0 low must not leak in.
-        assert_eq!(partial.high, 112.0);
-        assert_eq!(partial.low, 99.0);
-        assert_eq!(partial.volume, 3.0);
-        assert_eq!(partial.open_time, DAY);
-    }
-
-    #[test]
-    fn partial_daily_handles_the_first_bar_of_a_day() {
-        let bars = [
-            bar(DAY - H4, 10.0, 11.0, 9.0, 10.5),
-            bar(DAY, 100.0, 105.0, 99.0, 104.0),
-        ];
-        let partial = partial_daily(&bars, DAY).unwrap();
-        assert_eq!(partial.open, 100.0);
-        assert_eq!(partial.close, 104.0);
-        assert_eq!(partial.high, 105.0);
-        assert_eq!(partial.low, 99.0);
-    }
-
-    #[test]
-    fn partial_daily_is_none_when_the_day_has_not_started() {
-        // The latest bar still belongs to the previous day, so no candle is in
-        // progress and the daily view must not gain a phantom entry.
-        let bars = [bar(DAY - H4, 10.0, 11.0, 9.0, 10.5)];
-        assert!(partial_daily(&bars, DAY).is_none());
-    }
-
-    #[test]
-    fn partial_daily_is_none_for_an_empty_series() {
-        assert!(partial_daily(&[], DAY).is_none());
-    }
-
-    #[test]
-    fn partial_daily_never_reads_beyond_the_slice() {
-        // The caller passes `&four_hour[..=j]`; the aggregate must reflect only
-        // bars up to j, never a later one.
-        let bars = [
-            bar(DAY, 100.0, 105.0, 99.0, 104.0),
-            bar(DAY + H4, 104.0, 112.0, 103.0, 108.0),
-            bar(DAY + 2 * H4, 108.0, 999.0, 1.0, 102.0),
-        ];
-        let partial = partial_daily(&bars[..=1], DAY).unwrap();
-        assert_eq!(partial.high, 112.0);
-        assert_eq!(partial.low, 99.0);
-        assert_eq!(partial.close, 108.0);
-    }
-
-    #[test]
-    fn percentile_returns_nearest_sorted_value() {
-        let values = [10.0, 20.0, 30.0, 40.0, 50.0];
-
-        assert_eq!(percentile(&values, 0.0), 10.0);
-        assert_eq!(percentile(&values, 0.5), 30.0);
-        assert_eq!(percentile(&values, 1.0), 50.0);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Portfolio simulation
 // ---------------------------------------------------------------------------
@@ -1527,4 +1435,96 @@ fn portfolio_buy_and_hold(
         .map(|(f, q)| costs.sell_fill(f.four_hour[bars - 1].close) * q)
         .sum();
     (final_value - costs.taker_cost(final_value), max_drawdown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{partial_daily, percentile, Candle};
+
+    /// Four-hour bar starting at `open_time` (epoch ms).
+    fn bar(open_time: u64, open: f64, high: f64, low: f64, close: f64) -> Candle {
+        Candle {
+            open_time,
+            open,
+            high,
+            low,
+            close,
+            volume: 1.0,
+            close_time: open_time + 4 * 3_600_000 - 1,
+        }
+    }
+
+    const DAY: u64 = 86_400_000;
+    const H4: u64 = 4 * 3_600_000;
+
+    #[test]
+    fn partial_daily_aggregates_the_current_day_only() {
+        // Yesterday's final bar, then three bars of today.
+        let bars = [
+            bar(DAY - H4, 10.0, 11.0, 9.0, 10.5),
+            bar(DAY, 100.0, 105.0, 99.0, 104.0),
+            bar(DAY + H4, 104.0, 112.0, 103.0, 108.0),
+            bar(DAY + 2 * H4, 108.0, 110.0, 101.0, 102.0),
+        ];
+
+        let partial = partial_daily(&bars, DAY).expect("today has bars");
+        // Open from the day's first bar, close from its last.
+        assert_eq!(partial.open, 100.0);
+        assert_eq!(partial.close, 102.0);
+        // Extremes across today only — yesterday's 9.0 low must not leak in.
+        assert_eq!(partial.high, 112.0);
+        assert_eq!(partial.low, 99.0);
+        assert_eq!(partial.volume, 3.0);
+        assert_eq!(partial.open_time, DAY);
+    }
+
+    #[test]
+    fn partial_daily_handles_the_first_bar_of_a_day() {
+        let bars = [
+            bar(DAY - H4, 10.0, 11.0, 9.0, 10.5),
+            bar(DAY, 100.0, 105.0, 99.0, 104.0),
+        ];
+        let partial = partial_daily(&bars, DAY).unwrap();
+        assert_eq!(partial.open, 100.0);
+        assert_eq!(partial.close, 104.0);
+        assert_eq!(partial.high, 105.0);
+        assert_eq!(partial.low, 99.0);
+    }
+
+    #[test]
+    fn partial_daily_is_none_when_the_day_has_not_started() {
+        // The latest bar still belongs to the previous day, so no candle is in
+        // progress and the daily view must not gain a phantom entry.
+        let bars = [bar(DAY - H4, 10.0, 11.0, 9.0, 10.5)];
+        assert!(partial_daily(&bars, DAY).is_none());
+    }
+
+    #[test]
+    fn partial_daily_is_none_for_an_empty_series() {
+        assert!(partial_daily(&[], DAY).is_none());
+    }
+
+    #[test]
+    fn partial_daily_never_reads_beyond_the_slice() {
+        // The caller passes `&four_hour[..=j]`; the aggregate must reflect only
+        // bars up to j, never a later one.
+        let bars = [
+            bar(DAY, 100.0, 105.0, 99.0, 104.0),
+            bar(DAY + H4, 104.0, 112.0, 103.0, 108.0),
+            bar(DAY + 2 * H4, 108.0, 999.0, 1.0, 102.0),
+        ];
+        let partial = partial_daily(&bars[..=1], DAY).unwrap();
+        assert_eq!(partial.high, 112.0);
+        assert_eq!(partial.low, 99.0);
+        assert_eq!(partial.close, 108.0);
+    }
+
+    #[test]
+    fn percentile_returns_nearest_sorted_value() {
+        let values = [10.0, 20.0, 30.0, 40.0, 50.0];
+
+        assert_eq!(percentile(&values, 0.0), 10.0);
+        assert_eq!(percentile(&values, 0.5), 30.0);
+        assert_eq!(percentile(&values, 1.0), 50.0);
+    }
 }
