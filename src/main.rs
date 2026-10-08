@@ -49,6 +49,25 @@ impl StatusTracker {
     }
 }
 
+/// An entry smaller than this is leftover cash, not a position: Binance's
+/// minimum order is about 5, and a fee-adjusted OCO needs headroom above it.
+const MIN_ENTRY_NOTIONAL: f64 = 10.0;
+
+/// A pair whose conditions all held this cycle, waiting for its turn at the cash.
+struct BuyCandidate {
+    signal: strategy::TradeSignal,
+    rsi: f64,
+}
+
+/// Best setup first: HIGH confidence before MEDIUM, then the lower RSI, which
+/// has more room to run before the 70 overbought exit.
+fn rank_candidates(candidates: &mut [BuyCandidate]) {
+    candidates.sort_by(|a, b| {
+        let high = |c: &BuyCandidate| c.signal.confidence == "HIGH";
+        high(b).cmp(&high(a)).then(a.rsi.total_cmp(&b.rsi))
+    });
+}
+
 /// Positions worth less than this are leftover fractions, not real holdings.
 const DUST_NOTIONAL: f64 = 5.0;
 
@@ -196,6 +215,11 @@ where
 
     let executor = Executor::new(client, notifier);
 
+    // Entries are collected and taken after every pair has been evaluated, so
+    // the best setup this cycle gets the cash rather than whichever pair comes
+    // first in TRADING_PAIRS. Exits still run immediately: they free cash.
+    let mut candidates: Vec<BuyCandidate> = Vec::new();
+
     // ---- Evaluate each trading pair ----
     for symbol in &config.trading_pairs {
         info!("--- Evaluating {symbol} ---");
@@ -272,30 +296,10 @@ where
                     info!("{symbol}: already in position, skipping BUY");
                     continue;
                 }
-                if !risk_manager.can_open_position() {
-                    info!("{symbol}: max positions reached or halted, skipping BUY");
-                    continue;
-                }
-                let (qty, _) = risk_manager.calculate_position_size(
-                    equity.total,
-                    equity.free_quote,
-                    signal.entry_price,
-                    signal.stop_loss,
-                );
-                if qty <= 0.0 {
-                    warn!("{symbol}: calculated position size is zero, skipping");
-                    continue;
-                }
-                match executor
-                    .execute_buy(&signal, qty, risk_manager, params)
-                    .await
-                {
-                    Ok(_) => traded = true,
-                    Err(e) => {
-                        error!("{symbol}: BUY failed: {e}");
-                        notifier.notify_error(&format!("BUY {symbol}"), &e).await;
-                    }
-                }
+                candidates.push(BuyCandidate {
+                    signal,
+                    rsi: snap.rsi_14,
+                });
             }
             Signal::Sell => {
                 if !risk_manager.has_position(symbol) {
@@ -325,6 +329,56 @@ where
             }
             Signal::Halt => {
                 warn!("{symbol}: HALT signal");
+            }
+        }
+    }
+
+    // ---- Entries, best setup first ----
+    rank_candidates(&mut candidates);
+    let mut cash = (equity.total, equity.free_quote);
+    let mut bought_this_cycle = false;
+    for candidate in &candidates {
+        let symbol = &candidate.signal.asset;
+        if !risk_manager.can_open_position() {
+            info!("{symbol}: max positions reached or halted, skipping BUY");
+            continue;
+        }
+        // Size from what is actually left: the cycle-start balance no longer
+        // exists once an earlier entry has spent it.
+        if bought_this_cycle {
+            match fetch_equity(client, config).await {
+                Ok(eq) => cash = (eq.total, eq.free_quote),
+                Err(e) => {
+                    warn!("{symbol}: skipping BUY, balance refresh failed: {e}");
+                    continue;
+                }
+            }
+        }
+        let (total, free) = cash;
+        let (qty, _) = risk_manager.calculate_position_size(
+            total,
+            free,
+            candidate.signal.entry_price,
+            candidate.signal.stop_loss,
+        );
+        if qty * candidate.signal.entry_price < MIN_ENTRY_NOTIONAL {
+            info!(
+                "{symbol}: BUY signal, but only {free:.2} {} free; waiting for a position to close",
+                config.quote_asset
+            );
+            continue;
+        }
+        match executor
+            .execute_buy(&candidate.signal, qty, risk_manager, params)
+            .await
+        {
+            Ok(_) => {
+                traded = true;
+                bought_this_cycle = true;
+            }
+            Err(e) => {
+                error!("{symbol}: BUY failed: {e}");
+                notifier.notify_error(&format!("BUY {symbol}"), &e).await;
             }
         }
     }
@@ -708,6 +762,39 @@ mod tests {
     use super::*;
 
     const BTC_PRICE: f64 = 77_000.0;
+
+    // ----- entry ranking -----
+
+    fn candidate(asset: &str, confidence: &str, rsi: f64) -> BuyCandidate {
+        BuyCandidate {
+            signal: strategy::TradeSignal {
+                asset: asset.into(),
+                signal: Signal::Buy,
+                confidence: confidence.into(),
+                entry_price: 100.0,
+                stop_loss: 95.0,
+                take_profit: 110.0,
+                risk_reward_ratio: 2.0,
+                reasoning: String::new(),
+                warnings: Vec::new(),
+                atr: 1.0,
+            },
+            rsi,
+        }
+    }
+
+    #[test]
+    fn the_best_setup_is_bought_first_regardless_of_pair_order() {
+        // Config order is ETH, XRP, BNB; ranking must ignore it.
+        let mut c = vec![
+            candidate("ETHUSDC", "MEDIUM", 40.0),
+            candidate("XRPUSDC", "HIGH", 44.0),
+            candidate("BNBUSDC", "HIGH", 38.0),
+        ];
+        rank_candidates(&mut c);
+        let order: Vec<&str> = c.iter().map(|c| c.signal.asset.as_str()).collect();
+        assert_eq!(order, ["BNBUSDC", "XRPUSDC", "ETHUSDC"]);
+    }
 
     // ----- status throttling -----
 
