@@ -588,6 +588,7 @@ mod tests {
             signal_interval: "4h".to_string(),
             max_open_positions: 4,
             daily_drawdown_limit: 0.05,
+            strategy: crate::strategies::LIVE_STRATEGY,
         })
     }
 

@@ -18,6 +18,8 @@ pub struct Config {
     pub max_open_positions: usize,
     /// Fraction of day-open equity that halts new trades until the next UTC day.
     pub daily_drawdown_limit: f64,
+    /// What the live loop trades: `STRATEGY`, else `strategies::LIVE_STRATEGY`.
+    pub strategy: crate::strategies::StrategyKind,
 }
 
 /// Kline intervals Binance spot accepts.
@@ -138,6 +140,7 @@ impl Config {
             signal_interval,
             max_open_positions,
             daily_drawdown_limit,
+            strategy: crate::strategies::StrategyKind::live_from_env(),
         }
     }
 }

@@ -4,8 +4,10 @@ mod costs;
 mod exchange;
 mod executor;
 mod indicators;
+mod lab;
 mod notify;
 mod risk;
+mod strategies;
 mod strategy;
 
 use config::Config;
@@ -91,11 +93,16 @@ async fn main() {
         backtest::run(&client, &config.trading_pairs, config.risk_per_trade).await;
         return;
     }
+    if env::var("MODE").unwrap_or_default() == "lab" {
+        lab::run(&client, &config).await;
+        return;
+    }
 
     // --- Live mode ---
     info!("Tempest swing trading bot starting");
     info!("Trading pairs: {:?}", config.trading_pairs);
     info!("Poll interval: {}s", config.poll_interval_secs);
+    info!("Strategy: {}", config.strategy.name());
     info!(
         "Candles: trend {} | signal {}",
         config.trend_interval, config.signal_interval
@@ -265,7 +272,7 @@ where
             }
         };
 
-        let signal = strategy::evaluate(symbol, &snap, params);
+        let signal = config.strategy.evaluate(symbol, &snap, &signal_candles, params);
 
         info!(
             "{symbol}: signal={:?} confidence={} RSI={:.1} EMA50={:.2} EMA200={:.2}",
