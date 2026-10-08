@@ -5,8 +5,8 @@ use tracing::{info, warn};
 /// lever on return *and* drawdown, and the right setting depends entirely on
 /// the operator's tolerance.
 pub const DEFAULT_RISK_PER_TRADE: f64 = 0.015; // 1.5% of portfolio
-const MAX_OPEN_POSITIONS: usize = 4;
-const DAILY_DRAWDOWN_LIMIT: f64 = 0.05; // 5%
+pub const DEFAULT_MAX_OPEN_POSITIONS: usize = 4;
+pub const DEFAULT_DAILY_DRAWDOWN_LIMIT: f64 = 0.05; // 5%
 /// Largest share of free USDT a single entry may spend, leaving headroom for
 /// fees and market-order slippage.
 const MAX_NOTIONAL_FRACTION: f64 = 0.95;
@@ -36,6 +36,9 @@ pub struct RiskManager {
     pub positions: Vec<Position>,
     /// Fraction of equity risked on each entry.
     risk_per_trade: f64,
+    max_open_positions: usize,
+    /// Fraction of day-open equity that halts trading for the rest of the day.
+    daily_drawdown_limit: f64,
     /// Total portfolio equity at the start of the current UTC day — the baseline
     /// the daily drawdown limit is measured against.
     pub day_open_equity: f64,
@@ -55,10 +58,19 @@ impl RiskManager {
         Self {
             positions: Vec::new(),
             risk_per_trade,
+            max_open_positions: DEFAULT_MAX_OPEN_POSITIONS,
+            daily_drawdown_limit: DEFAULT_DAILY_DRAWDOWN_LIMIT,
             day_open_equity: starting_equity,
             current_utc_day: utc_day_number(),
             halted: false,
         }
+    }
+
+    /// Override the position cap and daily drawdown halt.
+    pub fn with_limits(mut self, max_open_positions: usize, daily_drawdown_limit: f64) -> Self {
+        self.max_open_positions = max_open_positions;
+        self.daily_drawdown_limit = daily_drawdown_limit;
+        self
     }
 
     /// Reset daily state when a new UTC day begins.
@@ -85,11 +97,11 @@ impl RiskManager {
             return false;
         }
         let drawdown = (self.day_open_equity - current_equity) / self.day_open_equity;
-        if drawdown >= DAILY_DRAWDOWN_LIMIT {
+        if drawdown >= self.daily_drawdown_limit {
             warn!(
                 "HALT: drawdown {:.2}% >= {:.1}% limit (day open: {:.2}, now: {:.2})",
                 drawdown * 100.0,
-                DAILY_DRAWDOWN_LIMIT * 100.0,
+                self.daily_drawdown_limit * 100.0,
                 self.day_open_equity,
                 current_equity
             );
@@ -109,7 +121,7 @@ impl RiskManager {
 
     /// Whether a new position is allowed right now.
     pub fn can_open_position(&self) -> bool {
-        !self.halted && self.positions.len() < MAX_OPEN_POSITIONS
+        !self.halted && self.positions.len() < self.max_open_positions
     }
 
     /// Whether the bot already holds a position in `symbol`.
