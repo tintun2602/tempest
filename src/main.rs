@@ -14,7 +14,7 @@ use exchange::{
     protective_levels, AccountProvider, ExecutionProvider, InstrumentProvider, MarketDataProvider,
 };
 use executor::Executor;
-use notify::Notifier;
+use notify::{Notifier, OpenPositionSummary};
 use risk::{Position, RiskManager};
 use std::env;
 use strategy::{Signal, StrategyParams};
@@ -176,19 +176,21 @@ where
 
     // Before any exit logic runs: the exchange may have closed a position for
     // us since the last poll.
-    sync_positions_with_exchange(risk_manager, &equity, notifier).await;
+    let mut traded = sync_positions_with_exchange(risk_manager, &equity, notifier).await;
 
     risk_manager.check_day_reset(equity.total);
 
+    // Checked before the drawdown so the HALT alert goes out once, when the
+    // limit is first breached, not on every poll for the rest of the day.
+    if risk_manager.halted {
+        info!("Still halted from earlier drawdown breach. Skipping cycle.");
+        return Ok(());
+    }
     if risk_manager.check_drawdown(equity.total) {
         warn!("HALTED — daily drawdown limit exceeded. No new trades until next UTC day.");
         notifier
             .notify_halt(risk_manager.drawdown_pct(equity.total), equity.total)
             .await;
-        return Ok(());
-    }
-    if risk_manager.halted {
-        info!("Still halted from earlier drawdown breach. Skipping cycle.");
         return Ok(());
     }
 
@@ -251,7 +253,9 @@ where
 
         let conditions = strategy::EntryConditions::evaluate(&snap, params);
         let quiet_ms = STATUS_QUIET_HOURS * 3_600_000;
-        if status.should_send(symbol, conditions.met_count(), now_ms(), quiet_ms) {
+        if status_alerts_enabled()
+            && status.should_send(symbol, conditions.met_count(), now_ms(), quiet_ms)
+        {
             notifier
                 .notify_status(
                     symbol,
@@ -282,9 +286,15 @@ where
                     warn!("{symbol}: calculated position size is zero, skipping");
                     continue;
                 }
-                if let Err(e) = executor.execute_buy(&signal, qty, risk_manager, params).await {
-                    error!("{symbol}: BUY failed: {e}");
-                    notifier.notify_error(&format!("BUY {symbol}"), &e).await;
+                match executor
+                    .execute_buy(&signal, qty, risk_manager, params)
+                    .await
+                {
+                    Ok(_) => traded = true,
+                    Err(e) => {
+                        error!("{symbol}: BUY failed: {e}");
+                        notifier.notify_error(&format!("BUY {symbol}"), &e).await;
+                    }
                 }
             }
             Signal::Sell => {
@@ -292,24 +302,58 @@ where
                     info!("{symbol}: SELL signal but no open position");
                     continue;
                 }
-                if let Err(e) = executor.execute_sell(symbol, risk_manager).await {
-                    error!("{symbol}: SELL failed: {e}");
-                    notifier.notify_error(&format!("SELL {symbol}"), &e).await;
+                match executor.execute_sell(symbol, risk_manager).await {
+                    Ok(_) => traded = true,
+                    Err(e) => {
+                        error!("{symbol}: SELL failed: {e}");
+                        notifier.notify_error(&format!("SELL {symbol}"), &e).await;
+                    }
                 }
             }
             Signal::Hold => {
                 // An existing position may still have breached a level.
                 if risk_manager.check_exits(symbol, price).is_some() {
                     info!("{symbol}: price hit SL/TP level, closing position");
-                    if let Err(e) = executor.execute_sell(symbol, risk_manager).await {
-                        error!("{symbol}: exit failed: {e}");
-                        notifier.notify_error(&format!("Exit {symbol}"), &e).await;
+                    match executor.execute_sell(symbol, risk_manager).await {
+                        Ok(_) => traded = true,
+                        Err(e) => {
+                            error!("{symbol}: exit failed: {e}");
+                            notifier.notify_error(&format!("Exit {symbol}"), &e).await;
+                        }
                     }
                 }
             }
             Signal::Halt => {
                 warn!("{symbol}: HALT signal");
             }
+        }
+    }
+
+    // One summary per cycle that traded, priced after the fills.
+    if traded {
+        match fetch_equity(client, config).await {
+            Ok(after) => {
+                let open: Vec<OpenPositionSummary> = risk_manager
+                    .positions
+                    .iter()
+                    .map(|p| OpenPositionSummary {
+                        symbol: p.symbol.clone(),
+                        entry_price: p.entry_price,
+                        price: after.holding(&p.symbol).map_or(p.entry_price, |h| h.price),
+                        stop_loss: p.stop_loss,
+                        take_profit: p.take_profit,
+                    })
+                    .collect();
+                notifier
+                    .notify_summary(
+                        after.total,
+                        after.free_quote,
+                        risk_manager.day_open_equity,
+                        &open,
+                    )
+                    .await;
+            }
+            Err(e) => warn!("Trade summary skipped: {e}"),
         }
     }
 
@@ -384,12 +428,22 @@ fn classify_position(tracked_quantity: f64, held_quantity: f64, price: f64) -> P
     }
 }
 
+/// Per-symbol "how close is the setup" alerts. Off unless `STATUS_ALERTS=true`:
+/// at 15-minute polls they drown out the BUY/SELL messages that matter.
+fn status_alerts_enabled() -> bool {
+    env::var("STATUS_ALERTS").unwrap_or_default() == "true"
+}
+
 /// Bring tracked positions back in line with the exchange.
+///
+/// Returns whether any position was closed on the exchange, which counts as a
+/// trade for the cycle summary.
 async fn sync_positions_with_exchange(
     risk_manager: &mut RiskManager,
     equity: &Equity,
     notifier: &Notifier,
-) {
+) -> bool {
+    let mut closed_any = false;
     let tracked: Vec<(String, f64)> = risk_manager
         .positions
         .iter()
@@ -428,9 +482,11 @@ async fn sync_positions_with_exchange(
                          Entry was `{entry:.2}`. Position released."
                     ))
                     .await;
+                closed_any = true;
             }
         }
     }
+    closed_any
 }
 
 /// Total equity: free quote asset plus the mark-to-market value of every held

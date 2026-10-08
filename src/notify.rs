@@ -126,6 +126,24 @@ impl Notifier {
         self.send(&msg).await;
     }
 
+    /// Account snapshot sent after a cycle that bought or sold.
+    pub async fn notify_summary(
+        &self,
+        equity: f64,
+        free: f64,
+        day_open_equity: f64,
+        open: &[OpenPositionSummary],
+    ) {
+        self.send(&format_summary(
+            &self.quote_asset,
+            equity,
+            free,
+            day_open_equity,
+            open,
+        ))
+        .await;
+    }
+
     pub async fn notify_halt(&self, drawdown_pct: f64, equity: f64) {
         let msg = format!(
             "\u{1f6d1} *HALT — Daily Drawdown Limit*\n\
@@ -263,6 +281,52 @@ impl Notifier {
     }
 }
 
+/// One open position as the trade summary shows it.
+pub struct OpenPositionSummary {
+    pub symbol: String,
+    pub entry_price: f64,
+    pub price: f64,
+    pub stop_loss: f64,
+    pub take_profit: f64,
+}
+
+fn format_summary(
+    quote: &str,
+    equity: f64,
+    free: f64,
+    day_open_equity: f64,
+    open: &[OpenPositionSummary],
+) -> String {
+    let day_pnl = equity - day_open_equity;
+    let day_pct = if day_open_equity > 0.0 {
+        day_pnl / day_open_equity * 100.0
+    } else {
+        0.0
+    };
+    let mut msg = format!(
+        "\u{1f4ca} *Summary*\n\
+         Equity: `{equity:.2}` {quote} (`{free:.2}` free)\n\
+         Today: `{day_pnl:+.2}` {quote} (`{day_pct:+.2}%`)\n"
+    );
+    if open.is_empty() {
+        msg.push_str("Open positions: none");
+    } else {
+        msg.push_str(&format!("Open positions: {}", open.len()));
+        for p in open {
+            let move_pct = if p.entry_price > 0.0 {
+                (p.price - p.entry_price) / p.entry_price * 100.0
+            } else {
+                0.0
+            };
+            msg.push_str(&format!(
+                "\n\u{2022} *{}* `{:.2}` -> `{:.2}` (`{move_pct:+.2}%`) \u{b7} SL `{:.2}` \u{b7} TP `{:.2}`",
+                p.symbol, p.entry_price, p.price, p.stop_loss, p.take_profit
+            ));
+        }
+    }
+    msg
+}
+
 /// `900` -> `15m`, `14400` -> `4h`: whole hours when they divide evenly,
 /// otherwise minutes, so a sub-hour poll no longer renders as `0h`.
 fn format_interval(secs: u64) -> String {
@@ -275,7 +339,29 @@ fn format_interval(secs: u64) -> String {
 
 #[cfg(test)]
 mod interval_tests {
-    use super::format_interval;
+    use super::{format_interval, format_summary, OpenPositionSummary};
+
+    #[test]
+    fn summary_reports_day_pnl_and_open_positions() {
+        let open = [OpenPositionSummary {
+            symbol: "ETHUSDC".into(),
+            entry_price: 2_500.0,
+            price: 2_550.0,
+            stop_loss: 2_400.0,
+            take_profit: 2_700.0,
+        }];
+        let msg = format_summary("USDC", 1_050.0, 40.0, 1_000.0, &open);
+        assert!(msg.contains("`+50.00` USDC (`+5.00%`)"), "got: {msg}");
+        assert!(msg.contains("Open positions: 1"), "got: {msg}");
+        assert!(
+            msg.contains("*ETHUSDC* `2500.00` -> `2550.00` (`+2.00%`)"),
+            "got: {msg}"
+        );
+
+        let flat = format_summary("USDC", 990.0, 990.0, 1_000.0, &[]);
+        assert!(flat.contains("`-10.00` USDC (`-1.00%`)"), "got: {flat}");
+        assert!(flat.contains("Open positions: none"), "got: {flat}");
+    }
 
     #[test]
     fn whole_hours_and_minutes_render_readably() {

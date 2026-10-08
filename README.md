@@ -53,6 +53,12 @@ fly.toml
    TELEGRAM_CHAT_ID=your_chat_id
    ```
 
+   Alerts go out on BUY and SELL (including stops and targets filled on the
+   exchange), each cycle that trades ends with an account summary (equity,
+   today's P&L, open positions), and HALT, errors and startup are always sent.
+   The per-pair "conditions met" status messages are off unless
+   `STATUS_ALERTS=true`.
+
    To trade a USDC pair instead, set `QUOTE_ASSET=USDC` and use a supported pair,
    for example `TRADING_PAIRS=BTCUSDC`.
 
