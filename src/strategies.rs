@@ -28,7 +28,12 @@ pub enum StrategyKind {
     MeanReversion,
 }
 
-const BREAKOUT_LOOKBACK: usize = 20;
+/// One day of bars on the live 15m signal interval. A five-hour channel fired
+/// so often that trading costs, not the signal, decided the result.
+const BREAKOUT_LOOKBACK: usize = 96;
+// The channel plus the bar being evaluated must fit in the lab's signal
+// window (the 100 bars `main.rs` also requests), or the strategy never trades.
+const _: () = assert!(BREAKOUT_LOOKBACK < crate::lab::SIGNAL_WINDOW);
 /// Breakout exit: a close below the lowest low of this many signal bars.
 const BREAKOUT_EXIT_LOOKBACK: usize = 10;
 const OVERSOLD: f64 = 30.0;
@@ -242,8 +247,9 @@ mod tests {
 
     /// Flat bars at 100 (range 99-101), then one final bar closing at `last`.
     fn flat_then(last: f64) -> Vec<Candle> {
-        let mut bars: Vec<Candle> = (0..30).map(|i| bar(i, 99.0, 101.0, 100.0)).collect();
-        bars.push(bar(30, last - 0.5, last + 0.5, last));
+        let n = BREAKOUT_LOOKBACK as u64;
+        let mut bars: Vec<Candle> = (0..n).map(|i| bar(i, 99.0, 101.0, 100.0)).collect();
+        bars.push(bar(n, last - 0.5, last + 0.5, last));
         bars
     }
 
@@ -279,6 +285,24 @@ mod tests {
         // 1.5 trend ATRs below entry, target at 2R.
         assert!((s.stop_loss - 100.0).abs() < 1e-9);
         assert!((s.take_profit - 109.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn breakout_holds_without_a_full_channel() {
+        let mut bars = flat_then(103.0);
+        bars.remove(0);
+        let s = StrategyKind::Breakout.evaluate("X", &snap(103.0), &bars, &Default::default());
+        assert_eq!(s.signal, Signal::Hold);
+        assert_eq!(s.reasoning, "not enough signal bars");
+    }
+
+    #[test]
+    fn breakout_channel_reaches_back_the_full_lookback() {
+        // A high in the oldest channel bar still caps the breakout.
+        let mut bars = flat_then(103.0);
+        bars[0] = bar(0, 99.0, 105.0, 100.0);
+        let s = StrategyKind::Breakout.evaluate("X", &snap(103.0), &bars, &Default::default());
+        assert_ne!(s.signal, Signal::Buy);
     }
 
     #[test]

@@ -40,7 +40,7 @@ const MONTE_CARLO_RUNS: usize = 2_000;
 const MONTE_CARLO_TRADES: usize = 100;
 /// Same windows the live loop requests.
 const TREND_WINDOW: usize = 250;
-const SIGNAL_WINDOW: usize = 100;
+pub(crate) const SIGNAL_WINDOW: usize = 100;
 /// Largest share of equity one entry may use, as in `risk.rs`.
 const MAX_NOTIONAL_FRACTION: f64 = 0.95;
 
