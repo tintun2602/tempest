@@ -1,26 +1,36 @@
 //! Strategy lab: replay every strategy on the live timeframes and pairs, with
 //! costs, and say whether anything beats what is live.
 //!
-//! Runs as `MODE=lab`. Each bar is evaluated with exactly the inputs the live
-//! loop fetches (the last 250 trend candles, the last 100 signal candles), so a
-//! result here describes the code that would run in production. Unlike the
-//! live loop it only uses *closed* trend candles, which is slightly
-//! conservative.
+//! Runs as `MODE=lab`. Each signal bar is evaluated with the inputs the live
+//! loop fetches: the last 250 trend candles including the one still forming
+//! (rebuilt from signal bars, so nothing later is read) and the last 100
+//! signal candles. Stops, targets, the trailing stop and costs follow the live
+//! executor.
 //!
-//! History is split by time: the first `IN_SAMPLE_SHARE` is where strategies
-//! were designed and tuned, the rest is the out-of-sample check. Only the
-//! out-of-sample numbers decide a recommendation.
+//! One difference remains: the lab decides at each signal bar's close, while
+//! live polls mid-bar on the ticker price. Before a strategy other than
+//! `trend_pullback` goes live, live must evaluate it on closed bars too.
+//!
+//! History is split by time into an earlier `IN_SAMPLE_SHARE` and a later
+//! out-of-sample period. A recommendation needs both, and is ranked on the
+//! later one.
 
+use crate::backtest;
 use crate::config::Config;
 use crate::costs::CostModel;
 use crate::exchange::{Candle, MarketDataProvider};
-use crate::strategies::StrategyKind;
+use crate::strategies::{StrategyKind, REWARD_RISK};
 use crate::strategy::{self, Signal, StrategyParams};
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde_json::json;
 use tracing::{error, info};
 
 const DEFAULT_LAB_DAYS: u64 = 120;
+/// Binance pagination makes very long windows slow; two years is plenty.
+const MAX_LAB_DAYS: u64 = 730;
+/// Fixed so the same candles always give the same report.
+const MONTE_CARLO_SEED: u64 = 0x7e3_9e57;
 const IN_SAMPLE_SHARE: f64 = 0.7;
 /// Fewer out-of-sample trades than this is noise, not evidence.
 const MIN_OOS_TRADES: usize = 30;
@@ -51,17 +61,21 @@ struct OpenTrade {
     target: f64,
     /// Share of equity committed.
     notional: f64,
+    /// Highest high since entry, for the trailing stop.
+    highest_high: f64,
+    /// Trend ATR at entry, held fixed as the live executor does.
+    atr_at_entry: f64,
 }
 
 pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
     let days = std::env::var("LAB_DAYS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .filter(|d| *d > 0)
+        .filter(|d| (1..=MAX_LAB_DAYS).contains(d))
         .unwrap_or(DEFAULT_LAB_DAYS);
     let costs = CostModel::from_env();
     let params = StrategyParams::from_env();
-    let live = StrategyKind::live_from_env();
+    let live = config.strategy;
     let (Some(trend_ms), Some(signal_ms)) = (
         interval_ms(&config.trend_interval),
         interval_ms(&config.signal_interval),
@@ -103,6 +117,11 @@ pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
                 continue;
             }
         };
+        // The newest candle of each series may still be forming; the lab only
+        // trades bars that have closed.
+        let now = now_ms();
+        let trend: Vec<Candle> = trend.into_iter().filter(|c| c.close_time <= now).collect();
+        let signal: Vec<Candle> = signal.into_iter().filter(|c| c.close_time <= now).collect();
         let found = simulate(&trend, &signal, config.risk_per_trade, &costs, &params);
         info!("lab {symbol}: {} trades across strategies", found.len());
         trades.extend(found);
@@ -131,6 +150,7 @@ fn simulate(
 
     let mut open: Vec<Option<OpenTrade>> = vec![None; StrategyKind::ALL.len()];
     let mut closed_trend = 0usize;
+    let mut trend_view: Vec<Candle> = Vec::with_capacity(TREND_WINDOW);
 
     for j in 0..signal.len() {
         let bar = &signal[j];
@@ -141,34 +161,34 @@ fn simulate(
             continue;
         }
 
-        // Exits on resting levels first, against this bar's range. A bar that
-        // touches both resolves as the stop, the conservative reading.
+        // Exits on resting levels first, against this bar's range, for
+        // positions opened on an earlier bar. A bar that touches both resolves
+        // as the stop; a bar that opens through the stop fills at its open.
         for (k, slot) in open.iter_mut().enumerate() {
-            let Some(pos) = *slot else { continue };
-            let exit = if bar.low <= pos.stop {
-                Some((costs.sell_fill(pos.stop), false))
-            } else if bar.high >= pos.target {
-                Some((costs.limit_fill(pos.target), true))
-            } else {
-                None
-            };
-            if let Some((price, resting)) = exit {
-                trades.push(close(
-                    StrategyKind::ALL[k],
-                    &pos,
-                    price,
-                    resting,
-                    bar,
-                    split_time,
-                    costs,
-                ));
+            let Some(pos) = slot.as_mut() else { continue };
+            if let Some((price, resting)) = exit_on_bar(pos, bar, params, costs) {
+                let kind = StrategyKind::ALL[k];
+                trades.push(close(kind, pos, price, resting, bar, split_time, costs));
                 *slot = None;
+            } else {
+                // Ratchet after the exit test, never before it.
+                pos.highest_high = pos.highest_high.max(bar.high);
             }
         }
 
-        let trend_view = &trend[closed_trend.saturating_sub(TREND_WINDOW)..closed_trend];
+        // What the venue reports at this bar: the closed trend candles plus
+        // the one still forming, rebuilt from signal bars so nothing later
+        // than this bar is read.
+        trend_view.clear();
+        let forming = trend
+            .get(closed_trend)
+            .and_then(|next| backtest::partial_daily(&signal[..=j], next.open_time));
+        let keep = TREND_WINDOW - usize::from(forming.is_some());
+        trend_view.extend_from_slice(&trend[closed_trend.saturating_sub(keep)..closed_trend]);
+        trend_view.extend(forming);
+
         let signal_view = &signal[(j + 1).saturating_sub(SIGNAL_WINDOW)..=j];
-        let Some(snap) = strategy::compute_indicators(trend_view, signal_view, bar.close) else {
+        let Some(snap) = strategy::compute_indicators(&trend_view, signal_view, bar.close) else {
             continue;
         };
 
@@ -183,7 +203,7 @@ fn simulate(
                 (Signal::Buy, None) => {
                     let entry_price = costs.buy_fill(decision.entry_price);
                     let stop_pct = (entry_price - decision.stop_loss) / entry_price;
-                    if stop_pct <= 0.0 {
+                    if !(stop_pct > 0.0 && stop_pct.is_finite()) {
                         continue;
                     }
                     open[k] = Some(OpenTrade {
@@ -191,8 +211,10 @@ fn simulate(
                         entry_price,
                         stop: decision.stop_loss,
                         // Re-derived from the fill, as the live executor does.
-                        target: entry_price + 2.0 * (entry_price - decision.stop_loss),
+                        target: entry_price + REWARD_RISK * (entry_price - decision.stop_loss),
                         notional: (risk_per_trade / stop_pct).min(MAX_NOTIONAL_FRACTION),
+                        highest_high: entry_price,
+                        atr_at_entry: decision.atr,
                     });
                 }
                 _ => {}
@@ -205,19 +227,44 @@ fn simulate(
         for (k, slot) in open.iter().enumerate() {
             if let Some(pos) = slot {
                 let price = costs.sell_fill(bar.close);
-                trades.push(close(
-                    StrategyKind::ALL[k],
-                    pos,
-                    price,
-                    false,
-                    bar,
-                    split_time,
-                    costs,
-                ));
+                let kind = StrategyKind::ALL[k];
+                trades.push(close(kind, pos, price, false, bar, split_time, costs));
             }
         }
     }
     trades
+}
+
+/// Whether a resting stop or target fills inside `bar`, and at what price.
+///
+/// A bar that touches both resolves as the stop, the conservative reading. A
+/// bar that opens through a level fills at the open: a stop then sells lower
+/// than its trigger, a target higher than its limit.
+fn exit_on_bar(
+    pos: &OpenTrade,
+    bar: &Candle,
+    params: &StrategyParams,
+    costs: &CostModel,
+) -> Option<(f64, bool)> {
+    let stop = effective_stop(pos, params);
+    let trailing = params.trailing_stop_atr > 0.0;
+    if bar.low <= stop {
+        Some((costs.sell_fill(stop.min(bar.open)), false))
+    } else if !trailing && bar.high >= pos.target {
+        Some((costs.limit_fill(pos.target.max(bar.open)), true))
+    } else {
+        None
+    }
+}
+
+/// The stop as the live executor holds it: the chandelier trail when
+/// `TRAILING_STOP_ATR` is set, never below the initial stop.
+fn effective_stop(pos: &OpenTrade, params: &StrategyParams) -> f64 {
+    if params.trailing_stop_atr <= 0.0 || !pos.atr_at_entry.is_finite() || pos.atr_at_entry <= 0.0 {
+        return pos.stop;
+    }
+    pos.stop
+        .max(pos.highest_high - params.trailing_stop_atr * pos.atr_at_entry)
 }
 
 fn close(
@@ -298,7 +345,7 @@ fn monte_carlo_p5(returns: &[f64]) -> Option<f64> {
     if returns.len() < MIN_OOS_TRADES {
         return None;
     }
-    let mut rng = rand::thread_rng();
+    let mut rng = StdRng::seed_from_u64(MONTE_CARLO_SEED);
     let mut outcomes: Vec<f64> = (0..MONTE_CARLO_RUNS)
         .map(|_| {
             (0..MONTE_CARLO_TRADES)
@@ -325,6 +372,7 @@ fn recommend(rows: &[(StrategyKind, Stats, Stats)], live: StrategyKind) -> Optio
                 && oos.trades >= MIN_OOS_TRADES
                 && oos.profit_factor >= MIN_OOS_PROFIT_FACTOR
                 && oos.expectancy > 0.0
+                && is.trades >= MIN_OOS_TRADES
                 && is.expectancy > 0.0
                 && oos.expectancy > live_oos.expectancy
         })
@@ -419,6 +467,12 @@ fn print_table(report: &serde_json::Value) {
 
 fn round(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(u64::MAX, |d| d.as_millis() as u64)
 }
 
 /// Binance interval notation to milliseconds.
@@ -553,19 +607,23 @@ mod tests {
     }
 
     #[test]
-    fn simulate_books_only_closed_trades_and_respects_warmup() {
-        // 260 flat trend candles, then a steady signal-interval uptrend.
+    fn simulate_trades_after_warmup_and_books_finite_returns() {
+        // A rising trend series, then signal bars that keep making new highs
+        // and pulling back: breakouts enter, pullbacks exit.
         let trend: Vec<Candle> = (0..260)
-            .map(|i| candle(i * 14_400_000, 14_400_000, 100.0 + i as f64 * 0.01))
+            .map(|i| candle(i * 14_400_000, 14_400_000, 100.0 + i as f64 * 0.1))
             .collect();
         let start = 210 * 14_400_000;
         let signal: Vec<Candle> = (0..2_000)
             .map(|i| {
-                candle(
-                    start + i * 900_000,
-                    900_000,
-                    100.0 + (i as f64 * 0.05).sin(),
-                )
+                let x = i as f64;
+                let close = 140.0 + 5.0 * (x * 0.03).sin() + x * 0.002;
+                // Tight bars, so a rising close clears the prior highs.
+                Candle {
+                    high: close + 0.01,
+                    low: close - 0.01,
+                    ..candle(start + i * 900_000, 900_000, close)
+                }
             })
             .collect();
         let trades = simulate(
@@ -575,12 +633,121 @@ mod tests {
             &CostModel::default(),
             &StrategyParams::default(),
         );
+        assert!(
+            trades.iter().any(|t| t.strategy == StrategyKind::Breakout),
+            "fixture must exercise the simulator"
+        );
         for t in &trades {
             assert!(t.exit_time > signal[34].close_time, "traded during warmup");
             assert!(t.ret.is_finite());
-            // Net of costs, no single trade can gain or lose more than the
-            // committed notional allows.
             assert!(t.ret.abs() < MAX_NOTIONAL_FRACTION);
         }
+    }
+
+    fn open_trade() -> OpenTrade {
+        OpenTrade {
+            entry_time: 0,
+            entry_price: 100.0,
+            stop: 95.0,
+            target: 110.0,
+            notional: 0.5,
+            highest_high: 100.0,
+            atr_at_entry: 2.0,
+        }
+    }
+
+    fn range(open: f64, low: f64, high: f64) -> Candle {
+        Candle {
+            open_time: 0,
+            open,
+            high,
+            low,
+            close: open,
+            volume: 1.0,
+            close_time: 1,
+        }
+    }
+
+    #[test]
+    fn a_bar_touching_both_levels_is_a_stop() {
+        let free = CostModel::frictionless();
+        let hit = exit_on_bar(
+            &open_trade(),
+            &range(100.0, 94.0, 111.0),
+            &Default::default(),
+            &free,
+        );
+        assert_eq!(hit, Some((95.0, false)));
+    }
+
+    #[test]
+    fn a_gap_through_the_stop_fills_at_the_open() {
+        let free = CostModel::frictionless();
+        let hit = exit_on_bar(
+            &open_trade(),
+            &range(90.0, 89.0, 91.0),
+            &Default::default(),
+            &free,
+        );
+        assert_eq!(hit, Some((90.0, false)));
+    }
+
+    #[test]
+    fn a_trailing_stop_replaces_the_target() {
+        let free = CostModel::frictionless();
+        let params = StrategyParams {
+            trailing_stop_atr: 2.0,
+            ..Default::default()
+        };
+        let mut pos = open_trade();
+        // Past the 2R target, but trailing: no exit.
+        assert_eq!(
+            exit_on_bar(&pos, &range(105.0, 104.0, 112.0), &params, &free),
+            None
+        );
+        // After the high reaches 112 the stop trails to 108.
+        pos.highest_high = 112.0;
+        let hit = exit_on_bar(&pos, &range(109.0, 107.0, 109.5), &params, &free);
+        assert_eq!(hit, Some((108.0, false)));
+    }
+
+    #[test]
+    fn fees_and_slippage_reduce_the_booked_return() {
+        let pos = open_trade();
+        let bar = range(110.0, 109.0, 111.0);
+        let free = close(
+            StrategyKind::Breakout,
+            &pos,
+            110.0,
+            true,
+            &bar,
+            0,
+            &CostModel::frictionless(),
+        );
+        // 50% of equity, +10%: +5% before costs.
+        assert!((free.ret - 0.05).abs() < 1e-12);
+        let costed = close(
+            StrategyKind::Breakout,
+            &pos,
+            110.0,
+            true,
+            &bar,
+            0,
+            &CostModel::default(),
+        );
+        assert!(costed.ret < free.ret);
+        assert!(
+            costed.out_of_sample,
+            "entry at the split boundary counts as out of sample"
+        );
+    }
+
+    #[test]
+    fn monte_carlo_is_reproducible_and_needs_enough_trades() {
+        assert_eq!(monte_carlo_p5(&[0.01; MIN_OOS_TRADES - 1]), None);
+        let returns: Vec<f64> = (0..60)
+            .map(|i| if i % 3 == 0 { -0.02 } else { 0.015 })
+            .collect();
+        assert_eq!(monte_carlo_p5(&returns), monte_carlo_p5(&returns));
     }
 }

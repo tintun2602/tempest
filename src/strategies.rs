@@ -14,7 +14,7 @@ use crate::strategy::{self, IndicatorSnapshot, Signal, StrategyParams, TradeSign
 pub const LIVE_STRATEGY: StrategyKind = StrategyKind::TrendPullback;
 
 /// Target distance as a multiple of the stop distance, for every strategy.
-const REWARD_RISK: f64 = 2.0;
+pub const REWARD_RISK: f64 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrategyKind {
@@ -245,6 +245,22 @@ mod tests {
         let mut bars: Vec<Candle> = (0..30).map(|i| bar(i, 99.0, 101.0, 100.0)).collect();
         bars.push(bar(30, last - 0.5, last + 0.5, last));
         bars
+    }
+
+    #[test]
+    fn trend_pullback_is_exactly_the_original_rules() {
+        // Live behaviour must not depend on the signal candles passed in.
+        let mut s = snap(103.0);
+        s.macd_crossed_bullish_recently = true;
+        s.rsi_14 = 45.0;
+        let params = StrategyParams::default();
+        let original = strategy::evaluate("X", &s, &params);
+        for bars in [Vec::new(), flat_then(103.0)] {
+            let via = StrategyKind::TrendPullback.evaluate("X", &s, &bars, &params);
+            assert_eq!(via.signal, original.signal);
+            assert_eq!(via.stop_loss, original.stop_loss);
+            assert_eq!(via.take_profit, original.take_profit);
+        }
     }
 
     #[test]
