@@ -526,9 +526,10 @@ enum PositionSync {
     ClosedExternally,
 }
 
-/// Tolerance before a shortfall counts as a real change, absorbing fee dust
-/// and float error.
-const QUANTITY_TOLERANCE: f64 = 0.999;
+/// Tolerance before a shortfall counts as a real change. Float error only:
+/// fee dust is a real shortfall, because a sell for the tracked amount is
+/// rejected (-2010) if the account holds even a hair less.
+const QUANTITY_TOLERANCE: f64 = 1.0 - 1e-9;
 
 /// Compare a tracked position against the balance the exchange reports.
 ///
@@ -954,13 +955,23 @@ mod tests {
     }
 
     #[test]
-    fn fee_dust_does_not_count_as_a_change() {
+    fn fee_dust_shrinks_the_tracked_position() {
         // The venue takes the spot BUY fee in the base asset, so the held
-        // amount is always a hair under what filled.
+        // amount is a hair under what filled. Tracking the gross amount made
+        // every exit fail with -2010 (the NEARUSDC 3.6 vs 3.5964 incident).
         let tracked = 0.00012;
         let held = tracked - 0.00000012;
         assert_eq!(
             classify_position(tracked, held, BTC_PRICE),
+            PositionSync::Resized { to: held }
+        );
+    }
+
+    #[test]
+    fn float_noise_is_not_a_change() {
+        let tracked = 0.1 + 0.2;
+        assert_eq!(
+            classify_position(tracked, 0.3, BTC_PRICE * 1000.0),
             PositionSync::Unchanged
         );
     }
