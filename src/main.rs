@@ -76,12 +76,28 @@ const MAX_BAN_WAIT_MS: u64 = 3 * 24 * 3_600_000;
 /// Resume a little after the ban lifts rather than exactly on it.
 const BAN_MARGIN_MS: u64 = 5_000;
 
-/// The end of a Binance IP ban (`-1003 ... IP banned until <ms>`), if `error`
-/// reports one.
+/// The end of a Binance IP ban (`-1003 ... IP banned until <ms>`) if `error`
+/// reports one, or `0` for a `-1003` rate limit without an end time: back off
+/// either way, since the next request is what turns a limit into a ban.
 fn banned_until_ms(error: &str) -> Option<u64> {
-    let rest = &error[error.find("banned until ")? + "banned until ".len()..];
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+    if let Some(at) = error.find("banned until ") {
+        let rest = &error[at + "banned until ".len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(until) = digits.parse() {
+            return Some(until);
+        }
+    }
+    error.contains("\"code\":-1003").then_some(0)
+}
+
+/// How long to pause for a ban ending at `until`: never less than one poll, so
+/// a ban already past (clock skew, an extension at the edge) cannot turn into
+/// a tight retry loop, and never more than `MAX_BAN_WAIT_MS`.
+fn ban_wait_ms(until: u64, now: u64, poll_ms: u64) -> u64 {
+    until
+        .saturating_sub(now)
+        .clamp(poll_ms.min(MAX_BAN_WAIT_MS), MAX_BAN_WAIT_MS)
+        + BAN_MARGIN_MS
 }
 
 /// Positions worth less than this are leftover fractions, not real holdings.
@@ -182,12 +198,12 @@ async fn main() {
             if let Some(until) = banned_until_ms(&e) {
                 // Every request during a ban extends it, and an alert per poll
                 // is noise: pause until it lifts and say so once.
-                let wait_ms = until.saturating_sub(now_ms()).min(MAX_BAN_WAIT_MS) + BAN_MARGIN_MS;
-                warn!("Binance IP ban; pausing {}s", wait_ms / 1000);
+                let wait_ms = ban_wait_ms(until, now_ms(), poll_interval.as_millis() as u64);
+                warn!("Binance rate limit or IP ban; pausing {}s", wait_ms / 1000);
                 notifier
                     .send(&format!(
-                        "\u{26d4} *Binance IP ban*\nPausing for {} min, until the ban lifts. \
-                         Open positions keep their stop orders on the exchange.",
+                        "\u{26d4} *Binance rate limit*\nPausing for {} min. Stop orders \
+                         already on the exchange stay in place.",
                         wait_ms.div_ceil(60_000)
                     ))
                     .await;
@@ -264,6 +280,11 @@ where
             Ok(c) => c,
             Err(e) => {
                 error!("{symbol}: {} klines failed: {e}", config.trend_interval);
+                // A rate limit applies to every pair: stop the cycle so the
+                // loop backs off, rather than spend more weight on the rest.
+                if banned_until_ms(&e).is_some() {
+                    return Err(e);
+                }
                 continue;
             }
         };
@@ -272,6 +293,11 @@ where
             Ok(c) => c,
             Err(e) => {
                 error!("{symbol}: {} klines failed: {e}", config.signal_interval);
+                // A rate limit applies to every pair: stop the cycle so the
+                // loop backs off, rather than spend more weight on the rest.
+                if banned_until_ms(&e).is_some() {
+                    return Err(e);
+                }
                 continue;
             }
         };
@@ -280,6 +306,11 @@ where
             Ok(p) => p,
             Err(e) => {
                 error!("{symbol}: price fetch failed: {e}");
+                // A rate limit applies to every pair: stop the cycle so the
+                // loop backs off, rather than spend more weight on the rest.
+                if banned_until_ms(&e).is_some() {
+                    return Err(e);
+                }
                 continue;
             }
         };
@@ -810,6 +841,25 @@ mod tests {
         let err = r#"{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}"#;
         assert_eq!(banned_until_ms(err), None);
         assert_eq!(banned_until_ms("banned until soon"), None);
+    }
+
+    #[test]
+    fn a_rate_limit_without_an_end_time_still_backs_off() {
+        let err = r#"{"code":-1003,"msg":"Too much request weight used; current limit is 6000"}"#;
+        assert_eq!(banned_until_ms(err), Some(0));
+    }
+
+    #[test]
+    fn ban_waits_are_bounded() {
+        let poll = 900_000;
+        let now = 1_000_000_000;
+        // Already lifted, or no end time: wait one poll, not a tight loop.
+        assert_eq!(ban_wait_ms(now - 1, now, poll), poll + BAN_MARGIN_MS);
+        assert_eq!(ban_wait_ms(0, now, poll), poll + BAN_MARGIN_MS);
+        // Inside the cap: until the ban lifts.
+        assert_eq!(ban_wait_ms(now + 2 * poll, now, poll), 2 * poll + BAN_MARGIN_MS);
+        // A wild timestamp is capped.
+        assert_eq!(ban_wait_ms(u64::MAX, now, poll), MAX_BAN_WAIT_MS + BAN_MARGIN_MS);
     }
 
     // ----- entry ranking -----
