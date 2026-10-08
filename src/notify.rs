@@ -173,11 +173,11 @@ impl Notifier {
             "\u{1f680} *Tempest Started*\n\
              Equity: `{equity:.2}` {quote} (`{free:.2}` free)\n\
              Pairs: {pairs}\n\
-             Risk/trade: `{risk:.2}%` \u{b7} Poll: every `{hours:.0}h`",
+             Risk/trade: `{risk:.2}%` \u{b7} Poll: every `{poll}`",
             quote = self.quote_asset,
             pairs = pairs.join(", "),
             risk = risk_per_trade * 100.0,
-            hours = poll_interval_secs as f64 / 3600.0,
+            poll = format_interval(poll_interval_secs),
         );
         self.send(&msg).await;
     }
@@ -260,5 +260,28 @@ impl Notifier {
                 "\u{26a0}\u{fe0f} *UNPROTECTED*"
             },
         )
+    }
+}
+
+/// `900` -> `15m`, `14400` -> `4h`: whole hours when they divide evenly,
+/// otherwise minutes, so a sub-hour poll no longer renders as `0h`.
+fn format_interval(secs: u64) -> String {
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}m", (secs / 60).max(1))
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::format_interval;
+
+    #[test]
+    fn whole_hours_and_minutes_render_readably() {
+        assert_eq!(format_interval(14_400), "4h");
+        assert_eq!(format_interval(900), "15m");
+        assert_eq!(format_interval(300), "5m");
+        assert_eq!(format_interval(5_400), "90m");
     }
 }

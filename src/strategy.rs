@@ -172,14 +172,15 @@ pub fn compute_indicators(
     });
 
     // --- Swing low for stop-loss ---
-    let swing_low = indicators::find_nearest_swing_low(&daily_lows, 3).unwrap_or_else(|| {
-        daily_lows
-            .iter()
-            .rev()
-            .take(20)
-            .copied()
-            .fold(f64::MAX, f64::min)
-    });
+    let swing_low = indicators::find_nearest_swing_low(&daily_lows, 3, current_price)
+        .unwrap_or_else(|| {
+            daily_lows
+                .iter()
+                .rev()
+                .take(20)
+                .copied()
+                .fold(f64::MAX, f64::min)
+        });
 
     debug!(
         ema_50,

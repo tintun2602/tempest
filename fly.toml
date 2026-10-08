@@ -7,7 +7,11 @@ primary_region = "ams"
   BINANCE_BASE_URL = "https://api.binance.com"
   QUOTE_ASSET = "USDC"
   TRADING_PAIRS = "BTCUSDC"
-  POLL_INTERVAL_SECONDS = "14400"
+  POLL_INTERVAL_SECONDS = "900"
+  TREND_INTERVAL = "4h"
+  SIGNAL_INTERVAL = "15m"
+  RISK_PER_TRADE_PCT = "10"
+  DAILY_DRAWDOWN_PCT = "25"
   LOG_LEVEL = "info"
 
 [[vm]]

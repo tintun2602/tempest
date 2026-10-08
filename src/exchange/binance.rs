@@ -584,6 +584,10 @@ mod tests {
             poll_interval_secs: 300,
             backtest_mode: false,
             risk_per_trade: 0.015,
+            trend_interval: "1d".to_string(),
+            signal_interval: "4h".to_string(),
+            max_open_positions: 4,
+            daily_drawdown_limit: 0.05,
         })
     }
 

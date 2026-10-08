@@ -160,9 +160,12 @@ pub fn macd(closes: &[f64], fast: usize, slow: usize, signal_period: usize) -> M
 
 /// Find the most recent swing low using a pivot-point method.
 /// A swing low at index `i` means `lows[i]` is the minimum within `i-window..=i+window`.
-/// Returns the price of the nearest (most recent) confirmed swing low, or falls back
-/// to the minimum of the last 20 candles if no pivot is found.
-pub fn find_nearest_swing_low(lows: &[f64], window: usize) -> Option<f64> {
+/// Returns the price of the nearest (most recent) confirmed swing low *below*
+/// `below`, or falls back to the minimum of the last 20 candles if none is.
+///
+/// A pivot price has since fallen through is broken support, not a stop: taking
+/// it anyway put the stop above the entry and rejected the trade outright.
+pub fn find_nearest_swing_low(lows: &[f64], window: usize, below: f64) -> Option<f64> {
     if lows.is_empty() {
         return None;
     }
@@ -180,10 +183,15 @@ pub fn find_nearest_swing_low(lows: &[f64], window: usize) -> Option<f64> {
         }
     }
 
-    swing_lows.last().map(|(_, price)| *price).or_else(|| {
-        // Fallback: minimum of last 20 candles
-        lows.iter().rev().take(20).copied().reduce(f64::min)
-    })
+    swing_lows
+        .iter()
+        .rev()
+        .map(|(_, price)| *price)
+        .find(|price| *price < below)
+        .or_else(|| {
+            // Fallback: minimum of last 20 candles
+            lows.iter().rev().take(20).copied().reduce(f64::min)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -309,15 +317,25 @@ mod tests {
         //                     0     1     2     3     4     5     6     7     8     9
         let lows = vec![10.0, 8.0, 5.0, 7.0, 9.0, 11.0, 6.0, 4.0, 7.0, 10.0];
         // window=2: index 2 (5.0) is a pivot, index 7 (4.0) is a pivot
-        let result = find_nearest_swing_low(&lows, 2);
+        let result = find_nearest_swing_low(&lows, 2, 100.0);
         assert_eq!(result, Some(4.0));
+    }
+
+    #[test]
+    fn test_swing_low_skips_pivots_price_has_broken() {
+        // The latest pivot (6.0) sits above a price of 5.5, so it is broken
+        // support; the stop must come from the older pivot (3.0) below price.
+        //                     0     1    2    3    4    5     6    7    8    9
+        let lows = vec![10.0, 8.0, 3.0, 7.0, 9.0, 11.0, 6.0, 7.0, 8.0, 9.0];
+        assert_eq!(find_nearest_swing_low(&lows, 2, 5.5), Some(3.0));
+        assert_eq!(find_nearest_swing_low(&lows, 2, 6.5), Some(6.0));
     }
 
     #[test]
     fn test_swing_low_fallback() {
         // Too few candles for any pivot with window=5
         let lows = vec![10.0, 9.0, 8.0, 7.0, 6.0];
-        let result = find_nearest_swing_low(&lows, 5);
+        let result = find_nearest_swing_low(&lows, 5, 100.0);
         assert_eq!(result, Some(6.0)); // falls back to min
     }
 }

@@ -56,7 +56,22 @@ fly.toml
    To trade a USDC pair instead, set `QUOTE_ASSET=USDC` and use a supported pair,
    for example `TRADING_PAIRS=BTCUSDC`.
 
-3. Build and run:
+3. Optional — timeframes and risk limits (defaults shown):
+
+   ```
+   TREND_INTERVAL=1d          # EMA50/EMA200 trend, RSI and swing-low stop
+   SIGNAL_INTERVAL=4h         # MACD entry trigger
+   RISK_PER_TRADE_PCT=1.5     # % of equity lost if the stop is hit
+   MAX_OPEN_POSITIONS=4
+   DAILY_DRAWDOWN_PCT=5       # % down on the day that halts new entries
+   ```
+
+   Intervals take any Binance kline interval (`5m`, `15m`, `1h`, `4h`, `1d`, ...).
+   Spot has no leverage, so an entry is also capped at 95% of free cash: with a
+   tight stop, the cash cap binds before `RISK_PER_TRADE_PCT` does. The backtest
+   still walks `1d`/`4h` candles regardless of these settings.
+
+4. Build and run:
    ```bash
    cargo run
    ```

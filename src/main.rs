@@ -77,6 +77,10 @@ async fn main() {
     info!("Tempest swing trading bot starting");
     info!("Trading pairs: {:?}", config.trading_pairs);
     info!("Poll interval: {}s", config.poll_interval_secs);
+    info!(
+        "Candles: trend {} | signal {}",
+        config.trend_interval, config.signal_interval
+    );
 
     let notifier = Notifier::from_env();
 
@@ -112,7 +116,13 @@ async fn main() {
         "Risk per trade: {:.2}% of equity",
         config.risk_per_trade * 100.0
     );
-    let mut risk_manager = RiskManager::with_risk_per_trade(equity.total, config.risk_per_trade);
+    info!(
+        "Max open positions: {} | daily drawdown halt: {:.1}%",
+        config.max_open_positions,
+        config.daily_drawdown_limit * 100.0
+    );
+    let mut risk_manager = RiskManager::with_risk_per_trade(equity.total, config.risk_per_trade)
+        .with_limits(config.max_open_positions, config.daily_drawdown_limit);
     let mut status = StatusTracker::default();
     let params = StrategyParams::from_env();
     info!(
@@ -188,18 +198,18 @@ where
     for symbol in &config.trading_pairs {
         info!("--- Evaluating {symbol} ---");
 
-        let daily = match client.klines(symbol, "1d", 250).await {
+        let trend = match client.klines(symbol, &config.trend_interval, 250).await {
             Ok(c) => c,
             Err(e) => {
-                error!("{symbol}: daily klines failed: {e}");
+                error!("{symbol}: {} klines failed: {e}", config.trend_interval);
                 continue;
             }
         };
 
-        let four_hour = match client.klines(symbol, "4h", 100).await {
+        let signal_candles = match client.klines(symbol, &config.signal_interval, 100).await {
             Ok(c) => c,
             Err(e) => {
-                error!("{symbol}: 4h klines failed: {e}");
+                error!("{symbol}: {} klines failed: {e}", config.signal_interval);
                 continue;
             }
         };
@@ -221,7 +231,7 @@ where
             error!("{symbol}: protection maintenance failed: {e}");
         }
 
-        let snap = match strategy::compute_indicators(&daily, &four_hour, price) {
+        let snap = match strategy::compute_indicators(&trend, &signal_candles, price) {
             Some(s) => s,
             None => {
                 warn!("{symbol}: insufficient candle data for indicators");

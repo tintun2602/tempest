@@ -10,6 +10,27 @@ pub struct Config {
     pub backtest_mode: bool,
     /// Fraction of equity risked per trade.
     pub risk_per_trade: f64,
+    /// Candles for the trend filter, RSI and swing-low stop (EMA50/EMA200).
+    pub trend_interval: String,
+    /// Candles for the MACD entry trigger.
+    pub signal_interval: String,
+    /// Most positions held at once.
+    pub max_open_positions: usize,
+    /// Fraction of day-open equity that halts new trades until the next UTC day.
+    pub daily_drawdown_limit: f64,
+}
+
+/// Kline intervals Binance spot accepts.
+const BINANCE_INTERVALS: &[&str] = &[
+    "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w",
+];
+
+fn read_interval(key: &str, default: &str) -> String {
+    let value = env::var(key).unwrap_or_else(|_| default.to_string());
+    if !BINANCE_INTERVALS.contains(&value.as_str()) {
+        panic!("Invalid configuration: {key}={value} is not one of {BINANCE_INTERVALS:?}");
+    }
+    value
 }
 
 /// Every configured symbol must be quoted in `quote_asset`.
@@ -87,6 +108,23 @@ impl Config {
             .map(|pct| pct / 100.0)
             .unwrap_or(crate::risk::DEFAULT_RISK_PER_TRADE);
 
+        let trend_interval = read_interval("TREND_INTERVAL", "1d");
+        let signal_interval = read_interval("SIGNAL_INTERVAL", "4h");
+
+        let max_open_positions = env::var("MAX_OPEN_POSITIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(crate::risk::DEFAULT_MAX_OPEN_POSITIONS);
+
+        // Percent, like RISK_PER_TRADE_PCT.
+        let daily_drawdown_limit = env::var("DAILY_DRAWDOWN_PCT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|pct| *pct > 0.0 && *pct <= 100.0)
+            .map(|pct| pct / 100.0)
+            .unwrap_or(crate::risk::DEFAULT_DAILY_DRAWDOWN_LIMIT);
+
         Self {
             base_url,
             api_key,
@@ -96,6 +134,10 @@ impl Config {
             poll_interval_secs,
             backtest_mode,
             risk_per_trade,
+            trend_interval,
+            signal_interval,
+            max_open_positions,
+            daily_drawdown_limit,
         }
     }
 }
