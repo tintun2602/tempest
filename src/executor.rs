@@ -160,10 +160,14 @@ impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
             }
         };
 
+        // Track what we can actually sell, not what filled. Tracking the gross
+        // fill made every later market sell ask for more than the account
+        // holds (-2010 insufficient balance), retried every poll while the
+        // position sat with no working exit.
         risk_manager.open_position(Position {
             symbol: signal.asset.clone(),
             entry_price: fill_price,
-            quantity: executed_qty,
+            quantity: sellable,
             stop_loss,
             take_profit,
             entry_time: now_ms(),
@@ -762,6 +766,31 @@ mod tests {
         let (_, oco_qty, _, _) = venue.oco_requests.lock().unwrap()[0].clone();
         assert_eq!(oco_qty, 0.00011);
         assert!(oco_qty < 0.00012);
+    }
+
+    #[tokio::test]
+    async fn exit_sells_only_what_the_fee_left_behind() {
+        // The NEARUSDC incident: the position was tracked at the gross fill,
+        // so the exit asked for more than the account held and failed -2010
+        // on every poll.
+        let venue = FakeExchange {
+            base_fee: 0.00000012,
+            ..FakeExchange::filling_at(50_000.0, 0.00012)
+        };
+        let notifier = Notifier::disabled("USDC");
+        let mut rm = RiskManager::new(19.0);
+        let executor = Executor::new(&venue, &notifier);
+
+        executor
+            .execute_buy(&buy_signal(), 0.00012, &mut rm, &StrategyParams::default())
+            .await
+            .unwrap();
+        assert_eq!(rm.positions[0].quantity, 0.00011);
+
+        executor.execute_sell("BTCUSDC", &mut rm).await.unwrap();
+        let (_, side, sell_qty) = venue.market_orders.lock().unwrap()[1].clone();
+        assert_eq!(side, Side::Sell);
+        assert!(sell_qty <= 0.00012 - 0.00000012, "sold {sell_qty}");
     }
 
     #[tokio::test]
