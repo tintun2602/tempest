@@ -37,7 +37,10 @@ const _: () = assert!(BREAKOUT_LOOKBACK < crate::lab::SIGNAL_WINDOW);
 /// Breakout exit: a close below the lowest low of this many signal bars.
 const BREAKOUT_EXIT_LOOKBACK: usize = 10;
 const OVERSOLD: f64 = 30.0;
-const RECOVERED: f64 = 60.0;
+/// Mean-reversion exit. At 60 the 15m RSI cleared on a small bounce: wins were
+/// about 0.57x the size of losses against a 1.5 trend-ATR stop, so a win rate
+/// above 50% still lost money. 70 gives a winning dip room to revert further.
+const RECOVERED: f64 = 70.0;
 /// Stops for the new strategies sit this many *trend-interval* ATRs below
 /// entry. A signal-interval ATR is so tight on 15m bars that fees and noise
 /// would decide most trades.
@@ -353,6 +356,24 @@ mod tests {
         let price = bars.last().unwrap().close;
         let s = StrategyKind::MeanReversion.evaluate("X", &snap(price), &bars, &Default::default());
         assert_eq!(s.signal, Signal::Sell);
+    }
+
+    #[test]
+    fn mean_reversion_holds_through_a_partial_recovery() {
+        // Alternating +1.3 / -0.7 closes settle signal RSI in the 60s:
+        // recovered under the old exit, not yet under RECOVERED.
+        let bars: Vec<Candle> = (0..60)
+            .map(|i| {
+                let c = 100.0 + (i / 2) as f64 * 0.6 + if i % 2 == 1 { 1.3 } else { 0.0 };
+                bar(i, c - 0.1, c + 0.1, c)
+            })
+            .collect();
+        let closes: Vec<f64> = bars.iter().map(|c| c.close).collect();
+        let rsi = *indicators::rsi(&closes, 14).last().unwrap();
+        assert!(rsi > 60.0 && rsi < RECOVERED, "fixture RSI {rsi}");
+        let price = bars.last().unwrap().close;
+        let s = StrategyKind::MeanReversion.evaluate("X", &snap(price), &bars, &Default::default());
+        assert_eq!(s.signal, Signal::Hold, "{}", s.reasoning);
     }
 
     #[test]
