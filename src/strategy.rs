@@ -71,11 +71,16 @@ pub struct StrategyParams {
     pub trailing_stop_atr: f64,
 }
 
+/// Buffers used when `ENTRY_BUFFER_ATR` / `EXIT_BUFFER_ATR` are unset. Change
+/// these only on a `MODE=lab` buffer recommendation.
+pub const DEFAULT_ENTRY_BUFFER_ATR: f64 = 0.0;
+pub const DEFAULT_EXIT_BUFFER_ATR: f64 = 0.0;
+
 impl Default for StrategyParams {
     fn default() -> Self {
         Self {
-            entry_buffer_atr: 0.0,
-            exit_buffer_atr: 0.0,
+            entry_buffer_atr: DEFAULT_ENTRY_BUFFER_ATR,
+            exit_buffer_atr: DEFAULT_EXIT_BUFFER_ATR,
             trailing_stop_atr: 0.0,
         }
     }
@@ -83,17 +88,18 @@ impl Default for StrategyParams {
 
 impl StrategyParams {
     pub fn from_env() -> Self {
-        let read = |key: &str| {
+        let defaults = Self::default();
+        let read = |key: &str, default: f64| {
             std::env::var(key)
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v >= 0.0)
-                .unwrap_or(0.0)
+                .unwrap_or(default)
         };
         Self {
-            entry_buffer_atr: read("ENTRY_BUFFER_ATR"),
-            exit_buffer_atr: read("EXIT_BUFFER_ATR"),
-            trailing_stop_atr: read("TRAILING_STOP_ATR"),
+            entry_buffer_atr: read("ENTRY_BUFFER_ATR", defaults.entry_buffer_atr),
+            exit_buffer_atr: read("EXIT_BUFFER_ATR", defaults.exit_buffer_atr),
+            trailing_stop_atr: read("TRAILING_STOP_ATR", defaults.trailing_stop_atr),
         }
     }
 

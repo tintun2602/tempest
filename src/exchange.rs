@@ -179,6 +179,21 @@ pub struct AccountSnapshot {
     pub assets: Vec<Balance>,
 }
 
+/// A deposit or withdrawal: money moved into or out of the account, as opposed
+/// to money made or lost trading.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transfer {
+    /// Venue identifier, unique per transfer, so a cycle that sees the same
+    /// deposit again does not count it twice.
+    pub id: String,
+    pub asset: String,
+    /// Change to the balance: positive for a deposit, negative for a
+    /// withdrawal, network fee included.
+    pub amount: f64,
+    /// When the balance changed, Unix epoch milliseconds.
+    pub time_ms: u64,
+}
+
 /// The venue's trading rules for one symbol.
 ///
 /// Orders that violate any of these are rejected outright (Binance `-1013`),
@@ -377,6 +392,15 @@ pub trait AccountProvider {
         &self,
         quote_asset: &str,
     ) -> impl Future<Output = Result<AccountSnapshot, String>> + Send;
+
+    /// Completed deposits and withdrawals of `assets` that changed the balance
+    /// at or after `since_ms`. Pending and failed transfers are left out: they
+    /// have not moved any money yet.
+    fn transfers(
+        &self,
+        assets: &[String],
+        since_ms: u64,
+    ) -> impl Future<Output = Result<Vec<Transfer>, String>> + Send;
 }
 
 /// Order placement and cancellation.

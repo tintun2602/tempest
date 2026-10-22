@@ -7,7 +7,7 @@
 use super::{
     weighted_average_price, AccountProvider, AccountSnapshot, Balance, Candle, ExecutionProvider,
     Fill, InstrumentProvider, MarketDataProvider, OcoPlacement, OpenOrder, OrderKind, OrderOutcome,
-    Side, StopPlacement, SymbolFilters,
+    Side, StopPlacement, SymbolFilters, Transfer,
 };
 use crate::config::Config;
 use hmac::{Hmac, Mac};
@@ -31,12 +31,21 @@ const HISTORY_BASE_URL: &str = MARKET_DATA_URL;
 /// reads the data-only host, anything else (a testnet) reads itself so prices
 /// match the venue being traded.
 fn market_data_url(base_url: &str) -> String {
-    if base_url.trim_end_matches('/') == "https://api.binance.com" {
+    if base_url.trim_end_matches('/') == PRODUCTION_URL {
         MARKET_DATA_URL.to_string()
     } else {
         base_url.to_string()
     }
 }
+
+/// The only host with wallet (deposit and withdrawal) history. Testnets have
+/// no wallet endpoints.
+const PRODUCTION_URL: &str = "https://api.binance.com";
+
+/// Deposit history is filtered on when the deposit was first seen, but it is
+/// credited only after confirmations. Ask from this much earlier so a deposit
+/// seen yesterday and credited today is still returned.
+const TRANSFER_LOOKBACK_MS: u64 = 86_400_000;
 
 /// Largest page the klines endpoint will return.
 const MAX_KLINES_PER_REQUEST: usize = 1000;
@@ -253,6 +262,27 @@ impl AccountProvider for BinanceClient {
             .await?;
         parse_account(&resp, quote_asset)
     }
+
+    async fn transfers(&self, assets: &[String], since_ms: u64) -> Result<Vec<Transfer>, String> {
+        if self.base_url.trim_end_matches('/') != PRODUCTION_URL {
+            return Ok(Vec::new());
+        }
+        let ts = self.timestamp_ms();
+        let query = format!(
+            "startTime={}&timestamp={ts}",
+            since_ms.saturating_sub(TRANSFER_LOOKBACK_MS)
+        );
+        let deposits = self
+            .signed_get("/sapi/v1/capital/deposit/hisrec", &query)
+            .await?;
+        let withdrawals = self
+            .signed_get("/sapi/v1/capital/withdraw/history", &query)
+            .await?;
+        let mut found = parse_deposits(&deposits)?;
+        found.extend(parse_withdrawals(&withdrawals)?);
+        found.retain(|t| t.time_ms >= since_ms && assets.contains(&t.asset));
+        Ok(found)
+    }
 }
 
 impl ExecutionProvider for BinanceClient {
@@ -452,6 +482,76 @@ fn parse_account(resp: &serde_json::Value, quote_asset: &str) -> Result<AccountS
     }
 
     Ok(AccountSnapshot { free_quote, assets })
+}
+
+/// Credited deposits. Status 1 is a completed deposit and 6 one credited but
+/// not yet withdrawable; either way the balance already holds it.
+fn parse_deposits(resp: &serde_json::Value) -> Result<Vec<Transfer>, String> {
+    let rows = resp
+        .as_array()
+        .ok_or_else(|| format!("Unexpected deposit history: {resp}"))?;
+    Ok(rows
+        .iter()
+        .filter(|d| matches!(d["status"].as_u64(), Some(1 | 6)))
+        .filter_map(|d| {
+            // Credited at `completeTime` when the venue reports it, otherwise
+            // first seen at `insertTime`.
+            let time_ms = d["completeTime"]
+                .as_u64()
+                .filter(|t| *t > 0)
+                .or_else(|| d["insertTime"].as_u64())?;
+            Some(Transfer {
+                id: format!("deposit:{}", d["id"].as_str()?),
+                asset: d["coin"].as_str()?.to_string(),
+                amount: parse_str_f64(&d["amount"])?,
+                time_ms,
+            })
+        })
+        .collect())
+}
+
+/// Withdrawals that have left the balance. Cancelled (1), rejected (3) and
+/// failed (5) ones never did; every other status has already been debited.
+/// Binance reports the network fee apart from the amount, and the balance
+/// pays both.
+fn parse_withdrawals(resp: &serde_json::Value) -> Result<Vec<Transfer>, String> {
+    let rows = resp
+        .as_array()
+        .ok_or_else(|| format!("Unexpected withdrawal history: {resp}"))?;
+    Ok(rows
+        .iter()
+        .filter(|w| !matches!(w["status"].as_u64(), Some(1 | 3 | 5) | None))
+        .filter_map(|w| {
+            let amount = parse_str_f64(&w["amount"])? + parse_str_f64_or_zero(&w["transactionFee"]);
+            Some(Transfer {
+                id: format!("withdrawal:{}", w["id"].as_str()?),
+                asset: w["coin"].as_str()?.to_string(),
+                amount: -amount,
+                time_ms: parse_utc_datetime_ms(w["applyTime"].as_str()?)?,
+            })
+        })
+        .collect())
+}
+
+/// `"2026-10-22 09:15:02"`, which Binance writes in UTC, to epoch milliseconds.
+fn parse_utc_datetime_ms(text: &str) -> Option<u64> {
+    let (date, time) = text.trim().split_once(' ')?;
+    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let mut t = time.split(':').map(|p| p.parse::<i64>().ok());
+    let (h, min, sec) = (t.next()??, t.next()??, t.next()??);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) || h > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // Days since the epoch for a proleptic Gregorian date (Howard Hinnant's
+    // `days_from_civil`).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from((days * 86_400 + h * 3_600 + min * 60 + sec) * 1_000).ok()
 }
 
 /// Normalise a FULL market-order response.
@@ -836,6 +936,72 @@ mod tests {
                 quantity: 19.42
             }]
         );
+    }
+
+    // ----- deposits and withdrawals -----
+
+    #[test]
+    fn only_credited_deposits_count() {
+        let resp = json!([
+            {"id": "a", "coin": "USDC", "amount": "500", "status": 1,
+             "insertTime": 1_000, "completeTime": 2_000},
+            {"id": "b", "coin": "BTC", "amount": "0.01", "status": 6, "insertTime": 3_000},
+            {"id": "c", "coin": "USDC", "amount": "900", "status": 0, "insertTime": 4_000}
+        ]);
+        let found = parse_deposits(&resp).unwrap();
+        assert_eq!(
+            found,
+            vec![
+                Transfer {
+                    id: "deposit:a".into(),
+                    asset: "USDC".into(),
+                    amount: 500.0,
+                    time_ms: 2_000,
+                },
+                Transfer {
+                    id: "deposit:b".into(),
+                    asset: "BTC".into(),
+                    amount: 0.01,
+                    time_ms: 3_000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn withdrawals_are_negative_and_include_the_fee() {
+        let resp = json!([
+            {"id": "w1", "coin": "USDC", "amount": "200", "transactionFee": "1",
+             "status": 6, "applyTime": "2026-10-22 09:15:02"},
+            {"id": "w2", "coin": "USDC", "amount": "300", "transactionFee": "1",
+             "status": 1, "applyTime": "2026-10-22 10:00:00"},
+            {"id": "w3", "coin": "USDC", "amount": "50", "transactionFee": "1",
+             "status": 4, "applyTime": "2026-10-22 11:00:00"}
+        ]);
+        let found = parse_withdrawals(&resp).unwrap();
+        assert_eq!(found.len(), 2, "the cancelled withdrawal moved nothing");
+        assert_eq!(found[0].id, "withdrawal:w1");
+        assert_eq!(found[0].amount, -201.0);
+        assert_eq!(found[0].time_ms, 1_792_660_502_000);
+        assert_eq!(found[1].amount, -51.0, "processing is already debited");
+    }
+
+    #[test]
+    fn utc_datetimes_convert_to_epoch_milliseconds() {
+        assert_eq!(parse_utc_datetime_ms("1970-01-01 00:00:00"), Some(0));
+        assert_eq!(
+            parse_utc_datetime_ms("2024-02-29 23:59:59"),
+            Some(1_709_251_199_000)
+        );
+        assert_eq!(parse_utc_datetime_ms("2024-13-01 00:00:00"), None);
+        assert_eq!(parse_utc_datetime_ms("not a date"), None);
+    }
+
+    #[test]
+    fn a_non_array_history_is_an_error() {
+        let err = json!({"code": -2015, "msg": "Invalid API-key"});
+        assert!(parse_deposits(&err).is_err());
+        assert!(parse_withdrawals(&err).is_err());
     }
 
     #[test]

@@ -134,6 +134,7 @@ impl Notifier {
         equity: f64,
         free: f64,
         day_open_equity: f64,
+        net_cash_flow: f64,
         open: &[OpenPositionSummary],
     ) {
         self.send(&format_summary(
@@ -141,6 +142,7 @@ impl Notifier {
             equity,
             free,
             day_open_equity,
+            net_cash_flow,
             open,
         ))
         .await;
@@ -297,11 +299,15 @@ fn format_summary(
     equity: f64,
     free: f64,
     day_open_equity: f64,
+    net_cash_flow: f64,
     open: &[OpenPositionSummary],
 ) -> String {
-    let day_pnl = equity - day_open_equity;
-    let day_pct = if day_open_equity > 0.0 {
-        day_pnl / day_open_equity * 100.0
+    // Deposits and withdrawals are not P&L: measure against what the account
+    // would hold had nothing been traded.
+    let baseline = day_open_equity + net_cash_flow;
+    let day_pnl = equity - baseline;
+    let day_pct = if baseline > 0.0 {
+        day_pnl / baseline * 100.0
     } else {
         0.0
     };
@@ -310,6 +316,11 @@ fn format_summary(
          Equity: `{equity:.2}` {quote} (`{free:.2}` free)\n\
          Today: `{day_pnl:+.2}` {quote} (`{day_pct:+.2}%`)\n"
     );
+    if net_cash_flow.abs() >= 0.005 {
+        msg.push_str(&format!(
+            "Deposits/withdrawals today: `{net_cash_flow:+.2}` {quote}\n"
+        ));
+    }
     if open.is_empty() {
         msg.push_str("Open positions: none");
     } else {
@@ -354,7 +365,7 @@ mod interval_tests {
             stop_loss: 2_400.0,
             take_profit: 2_700.0,
         }];
-        let msg = format_summary("USDC", 1_050.0, 40.0, 1_000.0, &open);
+        let msg = format_summary("USDC", 1_050.0, 40.0, 1_000.0, 0.0, &open);
         assert!(msg.contains("`+50.00` USDC (`+5.00%`)"), "got: {msg}");
         assert!(msg.contains("Open positions: 1"), "got: {msg}");
         assert!(
@@ -362,9 +373,25 @@ mod interval_tests {
             "got: {msg}"
         );
 
-        let flat = format_summary("USDC", 990.0, 990.0, 1_000.0, &[]);
+        let flat = format_summary("USDC", 990.0, 990.0, 1_000.0, 0.0, &[]);
         assert!(flat.contains("`-10.00` USDC (`-1.00%`)"), "got: {flat}");
         assert!(flat.contains("Open positions: none"), "got: {flat}");
+        assert!(!flat.contains("Deposits"), "no line without a transfer: {flat}");
+    }
+
+    #[test]
+    fn summary_leaves_deposits_and_withdrawals_out_of_day_pnl() {
+        // 500 deposited and 20 made: today is +20, not +520.
+        let msg = format_summary("USDC", 1_520.0, 1_520.0, 1_000.0, 500.0, &[]);
+        assert!(msg.contains("Today: `+20.00` USDC (`+1.33%`)"), "got: {msg}");
+        assert!(
+            msg.contains("Deposits/withdrawals today: `+500.00` USDC"),
+            "got: {msg}"
+        );
+
+        // 300 withdrawn and nothing traded: flat, not -300.
+        let out = format_summary("USDC", 700.0, 700.0, 1_000.0, -300.0, &[]);
+        assert!(out.contains("Today: `+0.00` USDC (`+0.00%`)"), "got: {out}");
     }
 
     #[test]

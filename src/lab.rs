@@ -14,6 +14,10 @@
 //! History is split by time into an earlier `IN_SAMPLE_SHARE` and a later
 //! out-of-sample period. A recommendation needs both, and is ranked on the
 //! later one.
+//!
+//! The lab also sweeps `trend_pullback`'s EMA50 buffers (`EXIT_BUFFER_ATR` x
+//! `ENTRY_BUFFER_ATR`) and recommends a pair under the same bars, reported as
+//! `buffer_grid` in the `LAB_REPORT` line.
 
 use crate::backtest;
 use crate::config::Config;
@@ -96,6 +100,7 @@ pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
     let trend_bars = (signal_bars as u64 * signal_ms / trend_ms) as usize + TREND_WINDOW + 10;
 
     let mut trades: Vec<LabTrade> = Vec::new();
+    let mut feeds: Vec<(Vec<Candle>, Vec<Candle>)> = Vec::new();
     for symbol in &config.trading_pairs {
         let trend = match client
             .klines_extended(symbol, &config.trend_interval, trend_bars)
@@ -122,13 +127,24 @@ pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
         let now = now_ms();
         let trend: Vec<Candle> = trend.into_iter().filter(|c| c.close_time <= now).collect();
         let signal: Vec<Candle> = signal.into_iter().filter(|c| c.close_time <= now).collect();
-        let found = simulate(&trend, &signal, config.risk_per_trade, &costs, &params);
+        let found = simulate(
+            &trend,
+            &signal,
+            config.risk_per_trade,
+            &costs,
+            &params,
+            &StrategyKind::ALL,
+        );
         info!("lab {symbol}: {} trades across strategies", found.len());
         trades.extend(found);
+        feeds.push((trend, signal));
     }
 
-    let report = build_report(&trades, live, days, config);
+    let mut report = build_report(&trades, live, days, config);
+    let grid = buffer_grid(&feeds, config.risk_per_trade, &costs, &params);
+    report["buffer_grid"] = buffer_grid_json(&grid, &params);
     print_table(&report);
+    print_buffer_grid(&report["buffer_grid"]);
     // One line the Trading department parses; keep the prefix stable.
     println!("LAB_REPORT {report}");
 }
@@ -140,6 +156,7 @@ fn simulate(
     risk_per_trade: f64,
     costs: &CostModel,
     params: &StrategyParams,
+    kinds: &[StrategyKind],
 ) -> Vec<LabTrade> {
     let mut trades = Vec::new();
     let Some(first) = signal.first() else {
@@ -148,7 +165,7 @@ fn simulate(
     let last = signal.last().map_or(first.close_time, |c| c.close_time);
     let split_time = first.open_time + ((last - first.open_time) as f64 * IN_SAMPLE_SHARE) as u64;
 
-    let mut open: Vec<Option<OpenTrade>> = vec![None; StrategyKind::ALL.len()];
+    let mut open: Vec<Option<OpenTrade>> = vec![None; kinds.len()];
     let mut closed_trend = 0usize;
     let mut trend_view: Vec<Candle> = Vec::with_capacity(TREND_WINDOW);
 
@@ -167,8 +184,7 @@ fn simulate(
         for (k, slot) in open.iter_mut().enumerate() {
             let Some(pos) = slot.as_mut() else { continue };
             if let Some((price, resting)) = exit_on_bar(pos, bar, params, costs) {
-                let kind = StrategyKind::ALL[k];
-                trades.push(close(kind, pos, price, resting, bar, split_time, costs));
+                trades.push(close(kinds[k], pos, price, resting, bar, split_time, costs));
                 *slot = None;
             } else {
                 // Ratchet after the exit test, never before it.
@@ -192,7 +208,7 @@ fn simulate(
             continue;
         };
 
-        for (k, kind) in StrategyKind::ALL.into_iter().enumerate() {
+        for (k, &kind) in kinds.iter().enumerate() {
             let decision = kind.evaluate("LAB", &snap, signal_view, params);
             match (decision.signal, open[k]) {
                 (Signal::Sell, Some(pos)) => {
@@ -227,8 +243,7 @@ fn simulate(
         for (k, slot) in open.iter().enumerate() {
             if let Some(pos) = slot {
                 let price = costs.sell_fill(bar.close);
-                let kind = StrategyKind::ALL[k];
-                trades.push(close(kind, pos, price, false, bar, split_time, costs));
+                trades.push(close(kinds[k], pos, price, false, bar, split_time, costs));
             }
         }
     }
@@ -443,6 +458,150 @@ fn build_report(
     })
 }
 
+/// ATR buffers swept by the lab: how far price must fall below EMA50 to exit,
+/// and rise above it to enter. Only `trend_pullback` reads them.
+const EXIT_BUFFERS_ATR: [f64; 4] = [0.0, 0.5, 1.0, 1.5];
+const ENTRY_BUFFERS_ATR: [f64; 3] = [0.0, 0.25, 0.5];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GridRow {
+    entry_buffer_atr: f64,
+    exit_buffer_atr: f64,
+    in_sample: Stats,
+    out_of_sample: Stats,
+}
+
+/// Replay `trend_pullback` on every pair under each buffer pair, everything
+/// else (trailing stop, costs, risk) as configured.
+fn buffer_grid(
+    feeds: &[(Vec<Candle>, Vec<Candle>)],
+    risk_per_trade: f64,
+    costs: &CostModel,
+    params: &StrategyParams,
+) -> Vec<GridRow> {
+    let mut rows = Vec::new();
+    for exit in EXIT_BUFFERS_ATR {
+        for entry in ENTRY_BUFFERS_ATR {
+            let p = StrategyParams {
+                entry_buffer_atr: entry,
+                exit_buffer_atr: exit,
+                ..*params
+            };
+            let trades: Vec<LabTrade> = feeds
+                .iter()
+                .flat_map(|(trend, signal)| {
+                    simulate(
+                        trend,
+                        signal,
+                        risk_per_trade,
+                        costs,
+                        &p,
+                        &[StrategyKind::TrendPullback],
+                    )
+                })
+                .collect();
+            let of = |oos: bool| -> Vec<&LabTrade> {
+                trades.iter().filter(|t| t.out_of_sample == oos).collect()
+            };
+            rows.push(GridRow {
+                entry_buffer_atr: entry,
+                exit_buffer_atr: exit,
+                in_sample: stats(&of(false)),
+                out_of_sample: stats(&of(true)),
+            });
+        }
+    }
+    rows
+}
+
+/// The buffer pair to make the default, if any: the best out-of-sample
+/// expectancy among rows that clear the same bars a strategy switch must, and
+/// only if it beats the buffers running now. `None` means keep them.
+fn pick_buffers(rows: &[GridRow], current: &StrategyParams) -> Option<GridRow> {
+    let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    let current_oos = rows
+        .iter()
+        .find(|r| {
+            same(r.entry_buffer_atr, current.entry_buffer_atr)
+                && same(r.exit_buffer_atr, current.exit_buffer_atr)
+        })
+        .map(|r| r.out_of_sample.expectancy)
+        .unwrap_or(0.0);
+    rows.iter()
+        .filter(|r| {
+            r.out_of_sample.trades >= MIN_OOS_TRADES
+                && r.out_of_sample.profit_factor >= MIN_OOS_PROFIT_FACTOR
+                && r.out_of_sample.expectancy > 0.0
+                && r.in_sample.trades >= MIN_OOS_TRADES
+                && r.in_sample.expectancy > 0.0
+                && r.out_of_sample.expectancy > current_oos
+        })
+        .max_by(|a, b| {
+            a.out_of_sample
+                .expectancy
+                .total_cmp(&b.out_of_sample.expectancy)
+        })
+        .copied()
+}
+
+fn buffer_grid_json(rows: &[GridRow], current: &StrategyParams) -> serde_json::Value {
+    let as_json = |s: &Stats| {
+        json!({
+            "trades": s.trades,
+            "win_rate": round(s.win_rate),
+            "expectancy_pct": round(s.expectancy * 100.0),
+            "profit_factor": if s.profit_factor.is_finite() { round(s.profit_factor) } else { 999.0 },
+            "compounded_pct": round(s.compounded * 100.0),
+            "max_drawdown_pct": round(s.max_drawdown * 100.0),
+        })
+    };
+    let rows_json: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "entry_buffer_atr": r.entry_buffer_atr,
+                "exit_buffer_atr": r.exit_buffer_atr,
+                "in_sample": as_json(&r.in_sample),
+                "out_of_sample": as_json(&r.out_of_sample),
+            })
+        })
+        .collect();
+    json!({
+        "current": {
+            "entry_buffer_atr": current.entry_buffer_atr,
+            "exit_buffer_atr": current.exit_buffer_atr,
+        },
+        "rows": rows_json,
+        "recommendation": match pick_buffers(rows, current) {
+            Some(r) => json!({
+                "entry_buffer_atr": r.entry_buffer_atr,
+                "exit_buffer_atr": r.exit_buffer_atr,
+            }),
+            None => json!("keep"),
+        },
+    })
+}
+
+fn print_buffer_grid(grid: &serde_json::Value) {
+    info!("trend_pullback buffers | OOS trades | win%  | exp%/trade | PF    | maxDD% | IS trades | IS exp%");
+    for r in grid["rows"].as_array().into_iter().flatten() {
+        let oos = &r["out_of_sample"];
+        info!(
+            "entry {:<4} exit {:<4}  | {:>10} | {:>5} | {:>10} | {:>5} | {:>6} | {:>9} | {}",
+            r["entry_buffer_atr"],
+            r["exit_buffer_atr"],
+            oos["trades"],
+            oos["win_rate"],
+            oos["expectancy_pct"],
+            oos["profit_factor"],
+            oos["max_drawdown_pct"],
+            r["in_sample"]["trades"],
+            r["in_sample"]["expectancy_pct"],
+        );
+    }
+    info!("buffer recommendation: {}", grid["recommendation"]);
+}
+
 fn print_table(report: &serde_json::Value) {
     info!("strategy          | OOS trades | win%  | exp%/trade | PF    | maxDD% | IS exp%");
     for s in report["strategies"].as_array().into_iter().flatten() {
@@ -632,6 +791,7 @@ mod tests {
             0.10,
             &CostModel::default(),
             &StrategyParams::default(),
+            &StrategyKind::ALL,
         );
         assert!(
             trades.iter().any(|t| t.strategy == StrategyKind::Breakout),
@@ -740,6 +900,68 @@ mod tests {
             costed.out_of_sample,
             "entry at the split boundary counts as out of sample"
         );
+    }
+
+    fn row(entry: f64, exit: f64, oos_trades: usize, is_exp: f64, oos_exp: f64) -> GridRow {
+        let s = |trades, expectancy| Stats {
+            trades,
+            expectancy,
+            profit_factor: if expectancy > 0.0 { 1.5 } else { 0.8 },
+            ..Default::default()
+        };
+        GridRow {
+            entry_buffer_atr: entry,
+            exit_buffer_atr: exit,
+            in_sample: s(40, is_exp),
+            out_of_sample: s(oos_trades, oos_exp),
+        }
+    }
+
+    #[test]
+    fn the_best_qualifying_buffers_win_out_of_sample() {
+        let rows = [
+            row(0.0, 0.0, 40, 0.001, 0.001),
+            row(0.25, 1.0, 40, 0.002, 0.004),
+            row(0.5, 1.5, 40, 0.003, 0.003),
+        ];
+        let pick = pick_buffers(&rows, &StrategyParams::default()).unwrap();
+        assert_eq!((pick.entry_buffer_atr, pick.exit_buffer_atr), (0.25, 1.0));
+    }
+
+    #[test]
+    fn buffers_are_not_changed_on_thin_or_in_sample_losing_evidence() {
+        let rows = [
+            row(0.0, 0.0, 40, 0.001, 0.001),
+            // Best out of sample, but too few trades to mean anything.
+            row(0.25, 1.0, MIN_OOS_TRADES - 1, 0.002, 0.010),
+            // Lost money in sample: a good recent run is luck.
+            row(0.5, 1.5, 40, -0.001, 0.008),
+        ];
+        assert_eq!(pick_buffers(&rows, &StrategyParams::default()), None);
+    }
+
+    #[test]
+    fn buffers_that_do_not_beat_the_current_ones_are_kept() {
+        let rows = [
+            row(0.0, 0.0, 40, 0.002, 0.003),
+            row(0.25, 1.0, 40, 0.004, 0.005),
+        ];
+        let current = StrategyParams {
+            entry_buffer_atr: 0.25,
+            exit_buffer_atr: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(pick_buffers(&rows, &current), None);
+    }
+
+    #[test]
+    fn the_grid_covers_every_buffer_pair() {
+        let rows = buffer_grid(&[], 0.01, &CostModel::default(), &StrategyParams::default());
+        assert_eq!(rows.len(), EXIT_BUFFERS_ATR.len() * ENTRY_BUFFERS_ATR.len());
+        assert!(rows.iter().all(|r| r.out_of_sample.trades == 0));
+        let json = buffer_grid_json(&rows, &StrategyParams::default());
+        assert_eq!(json["recommendation"], "keep");
+        assert_eq!(json["rows"].as_array().map(Vec::len), Some(12));
     }
 
     #[test]

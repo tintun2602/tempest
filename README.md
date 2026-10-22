@@ -109,6 +109,18 @@ and one `LAB_REPORT {json}` line with a `recommendation` of `keep` or
 `switch:<strategy>`, made only when a strategy beats live out of sample with at
 least 30 trades and a profit factor of 1.1 or more.
 
+The lab also replays `trend_pullback` under every combination of
+`EXIT_BUFFER_ATR` (0, 0.5, 1, 1.5) and `ENTRY_BUFFER_ATR` (0, 0.25, 0.5) and
+reports it as `buffer_grid` in the same line. Its `recommendation` is a buffer
+pair only when that pair clears the same out-of-sample bars and beats the
+buffers in use; otherwise `keep`. Adopting one means changing
+`DEFAULT_ENTRY_BUFFER_ATR` / `DEFAULT_EXIT_BUFFER_ATR` in `src/strategy.rs`.
+For example:
+
+```bash
+MODE=lab TRADING_PAIRS=BTCUSDC QUOTE_ASSET=USDC TREND_INTERVAL=4h SIGNAL_INTERVAL=15m LAB_DAYS=730 cargo run
+```
+
 The live loop trades `STRATEGY` if set, otherwise `LIVE_STRATEGY` in
 `src/strategies.rs`. Switching strategies is a reviewed pull request that
 changes that constant.
@@ -135,6 +147,13 @@ changes that constant.
 - Position size: `(balance * 0.015) / stop_distance`
 - Max simultaneous positions: 4
 - Daily drawdown halt: portfolio down >5% from day-open triggers HALT until next UTC midnight
+
+Deposits and withdrawals are cash flows, not P&L. Each cycle reads the day's
+completed deposits and withdrawals of the quote asset and the traded base
+assets (Binance wallet history; needs the API key's read permission, and is
+skipped on testnet), and measures today's P&L and the drawdown halt against
+day-open equity plus net deposits. If the history cannot be read, the halt
+still runs on unadjusted equity.
 
 ## Deployment
 

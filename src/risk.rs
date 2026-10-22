@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
@@ -42,8 +43,23 @@ pub struct RiskManager {
     /// Total portfolio equity at the start of the current UTC day — the baseline
     /// the daily drawdown limit is measured against.
     pub day_open_equity: f64,
+    /// When `day_open_equity` was measured. Deposits and withdrawals from then
+    /// on are cash flows; anything earlier is already in the baseline.
+    day_open_at_ms: u64,
+    /// Today's deposits (positive) and withdrawals (negative) by transfer id,
+    /// in quote currency, valued when first seen.
+    cash_flows: HashMap<String, f64>,
     current_utc_day: u32,
     pub halted: bool,
+}
+
+/// A deposit or withdrawal, valued in the quote currency.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CashFlow {
+    pub id: String,
+    pub time_ms: u64,
+    /// Positive for money in, negative for money out.
+    pub value: f64,
 }
 
 impl RiskManager {
@@ -61,6 +77,8 @@ impl RiskManager {
             max_open_positions: DEFAULT_MAX_OPEN_POSITIONS,
             daily_drawdown_limit: DEFAULT_DAILY_DRAWDOWN_LIMIT,
             day_open_equity: starting_equity,
+            day_open_at_ms: now_ms(),
+            cash_flows: HashMap::new(),
             current_utc_day: utc_day_number(),
             halted: false,
         }
@@ -82,9 +100,53 @@ impl RiskManager {
                 today, current_equity
             );
             self.day_open_equity = current_equity;
+            self.day_open_at_ms = now_ms();
+            self.cash_flows.clear();
             self.current_utc_day = today;
             self.halted = false;
         }
+    }
+
+    /// When the day-open equity was measured: transfers from then on are
+    /// today's cash flows.
+    pub fn day_open_at_ms(&self) -> u64 {
+        self.day_open_at_ms
+    }
+
+    /// Replace today's cash flows with every transfer the venue now reports.
+    ///
+    /// Idempotent, so the same deposit seen on every poll counts once, and a
+    /// withdrawal that is later cancelled drops out. A transfer keeps the value
+    /// it had when first seen: revaluing a base-asset deposit at each poll
+    /// would hide that asset's price move since it arrived, which is P&L.
+    /// Transfers before the day-open measurement are already in it.
+    pub fn set_cash_flows(&mut self, flows: &[CashFlow]) {
+        let previous = std::mem::take(&mut self.cash_flows);
+        for flow in flows {
+            if flow.time_ms < self.day_open_at_ms || !flow.value.is_finite() {
+                continue;
+            }
+            let value = previous.get(&flow.id).copied().unwrap_or(flow.value);
+            self.cash_flows.insert(flow.id.clone(), value);
+        }
+    }
+
+    /// Net deposits minus withdrawals since the day opened.
+    pub fn net_cash_flow(&self) -> f64 {
+        self.cash_flows.values().sum()
+    }
+
+    /// What equity would be now had nothing been made or lost: the day-open
+    /// equity plus whatever was deposited or withdrawn since. Today's P&L and
+    /// drawdown are measured against this, so moving money in or out is
+    /// neither a gain nor a loss.
+    pub fn day_baseline(&self) -> f64 {
+        self.day_open_equity + self.net_cash_flow()
+    }
+
+    /// Today's trading P&L in quote currency, cash flows excluded.
+    pub fn day_pnl(&self, current_equity: f64) -> f64 {
+        current_equity - self.day_baseline()
     }
 
     /// Returns `true` if the daily drawdown limit has been breached (sets `halted`).
@@ -92,17 +154,23 @@ impl RiskManager {
     /// `current_equity` must be *total* portfolio equity — free USDT plus the
     /// mark-to-market value of open positions. Passing free USDT alone makes
     /// every entry look like a loss the size of the position notional.
+    ///
+    /// Deposits and withdrawals recorded with [`Self::set_cash_flows`] move
+    /// the baseline, not the drawdown.
     pub fn check_drawdown(&mut self, current_equity: f64) -> bool {
-        if self.day_open_equity <= 0.0 {
+        let baseline = self.day_baseline();
+        if baseline <= 0.0 {
             return false;
         }
-        let drawdown = (self.day_open_equity - current_equity) / self.day_open_equity;
+        let drawdown = (baseline - current_equity) / baseline;
         if drawdown >= self.daily_drawdown_limit {
             warn!(
-                "HALT: drawdown {:.2}% >= {:.1}% limit (day open: {:.2}, now: {:.2})",
+                "HALT: drawdown {:.2}% >= {:.1}% limit (day open: {:.2}, net deposits: {:.2}, \
+                 now: {:.2})",
                 drawdown * 100.0,
                 self.daily_drawdown_limit * 100.0,
                 self.day_open_equity,
+                self.net_cash_flow(),
                 current_equity
             );
             self.halted = true;
@@ -111,12 +179,13 @@ impl RiskManager {
         false
     }
 
-    /// Current drawdown from the day-open equity, as a percentage.
+    /// Current drawdown from the day's baseline, as a percentage.
     pub fn drawdown_pct(&self, current_equity: f64) -> f64 {
-        if self.day_open_equity <= 0.0 {
+        let baseline = self.day_baseline();
+        if baseline <= 0.0 {
             return 0.0;
         }
-        (self.day_open_equity - current_equity) / self.day_open_equity * 100.0
+        -self.day_pnl(current_equity) / baseline * 100.0
     }
 
     /// Whether a new position is allowed right now.
@@ -214,6 +283,12 @@ impl RiskManager {
             hit_stop || hit_target
         })
     }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Number of days since the Unix epoch in UTC.
@@ -412,5 +487,75 @@ mod tests {
         assert!(!rm.check_drawdown(10_000.0));
         assert!(!rm.halted);
         assert!((rm.drawdown_pct(9_500.0) - 5.0).abs() < 1e-9);
+    }
+
+    fn flow(id: &str, rm: &RiskManager, value: f64) -> CashFlow {
+        CashFlow {
+            id: id.into(),
+            time_ms: rm.day_open_at_ms() + 1,
+            value,
+        }
+    }
+
+    #[test]
+    fn a_withdrawal_does_not_trigger_the_drawdown_halt() {
+        let mut rm = RiskManager::new(10_000.0);
+        // 2,000 withdrawn: equity falls 20%, but nothing was lost trading.
+        rm.set_cash_flows(&[flow("w", &rm, -2_000.0)]);
+        assert!(!rm.check_drawdown(8_000.0));
+        assert!(!rm.halted);
+        assert!(rm.day_pnl(8_000.0).abs() < 1e-9);
+        assert!(rm.drawdown_pct(8_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_deposit_is_not_todays_profit() {
+        let mut rm = RiskManager::new(10_000.0);
+        rm.set_cash_flows(&[flow("d", &rm, 5_000.0)]);
+        assert!(rm.day_pnl(15_000.0).abs() < 1e-9);
+        assert!((rm.day_pnl(15_300.0) - 300.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_deposit_cannot_mask_a_trading_loss() {
+        let mut rm = RiskManager::new(10_000.0);
+        // 5,000 deposited, then 900 lost: 6% of the 15,000 baseline, halted,
+        // even though equity is well above the day open.
+        rm.set_cash_flows(&[flow("d", &rm, 5_000.0)]);
+        assert!(rm.check_drawdown(14_100.0));
+        assert!((rm.drawdown_pct(14_100.0) - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn drawdown_after_a_withdrawal_is_measured_on_what_is_left() {
+        let mut rm = RiskManager::new(10_000.0);
+        rm.set_cash_flows(&[flow("w", &rm, -5_000.0)]);
+        // 300 lost on the remaining 5,000 is 6%.
+        assert!(rm.check_drawdown(4_700.0));
+    }
+
+    #[test]
+    fn the_same_transfer_counts_once_and_keeps_its_first_value() {
+        let mut rm = RiskManager::new(10_000.0);
+        rm.set_cash_flows(&[flow("d", &rm, 1_000.0)]);
+        // Seen again next poll, now priced higher: still 1,000.
+        rm.set_cash_flows(&[flow("d", &rm, 1_100.0)]);
+        assert!((rm.net_cash_flow() - 1_000.0).abs() < 1e-9);
+        // A second transfer adds; one that disappears (cancelled) drops out.
+        rm.set_cash_flows(&[flow("w", &rm, -400.0)]);
+        assert!((rm.net_cash_flow() + 400.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transfers_before_the_day_open_are_already_in_the_baseline() {
+        let mut rm = RiskManager::new(10_000.0);
+        let earlier = CashFlow {
+            id: "d".into(),
+            time_ms: rm.day_open_at_ms() - 1,
+            value: 1_000.0,
+        };
+        rm.set_cash_flows(&[earlier]);
+        assert_eq!(rm.net_cash_flow(), 0.0);
+        assert_eq!(rm.day_baseline(), 10_000.0);
     }
 }

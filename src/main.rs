@@ -17,7 +17,7 @@ use exchange::{
 };
 use executor::Executor;
 use notify::{Notifier, OpenPositionSummary};
-use risk::{Position, RiskManager};
+use risk::{CashFlow, Position, RiskManager};
 use std::env;
 use strategy::{Signal, StrategyParams};
 use tokio::time::{sleep, Duration};
@@ -251,6 +251,13 @@ where
 
     risk_manager.check_day_reset(equity.total);
 
+    // Deposits and withdrawals move equity without anything being made or
+    // lost. If they cannot be read, the drawdown check still runs on what is
+    // known: a false halt costs a day of entries, a missed one costs money.
+    if let Err(e) = record_cash_flows(client, config, risk_manager, &equity).await {
+        warn!("Deposits and withdrawals not read this cycle: {e}");
+    }
+
     // Checked before the drawdown so the HALT alert goes out once, when the
     // limit is first breached, not on every poll for the rest of the day.
     if risk_manager.halted {
@@ -470,6 +477,7 @@ where
                         after.total,
                         after.free_quote,
                         risk_manager.day_open_equity,
+                        risk_manager.net_cash_flow(),
                         &open,
                     )
                     .await;
@@ -609,6 +617,61 @@ async fn sync_positions_with_exchange(
         }
     }
     closed_any
+}
+
+/// Read today's deposits and withdrawals of the assets that make up equity,
+/// value them in the quote currency, and hand them to the risk manager.
+async fn record_cash_flows<C>(
+    client: &C,
+    config: &Config,
+    risk_manager: &mut RiskManager,
+    equity: &Equity,
+) -> Result<(), String>
+where
+    C: MarketDataProvider + AccountProvider,
+{
+    let mut assets = vec![config.quote_asset.clone()];
+    assets.extend(
+        config
+            .trading_pairs
+            .iter()
+            .filter_map(|p| p.strip_suffix(config.quote_asset.as_str()))
+            .map(str::to_string),
+    );
+    let transfers = client
+        .transfers(&assets, risk_manager.day_open_at_ms())
+        .await?;
+
+    let mut flows = Vec::with_capacity(transfers.len());
+    for t in transfers {
+        let price = if t.asset == config.quote_asset {
+            1.0
+        } else {
+            let symbol = format!("{}{}", t.asset, config.quote_asset);
+            match equity.holding(&symbol) {
+                Some(h) => h.price,
+                None => client
+                    .price(&symbol)
+                    .await
+                    .map_err(|e| format!("cannot price {symbol} transfer: {e}"))?,
+            }
+        };
+        flows.push(CashFlow {
+            id: t.id,
+            time_ms: t.time_ms,
+            value: t.amount * price,
+        });
+    }
+    let before = risk_manager.net_cash_flow();
+    risk_manager.set_cash_flows(&flows);
+    let after = risk_manager.net_cash_flow();
+    if (after - before).abs() > 1e-9 {
+        info!(
+            "Net deposits today: {after:+.2} {} (was {before:+.2})",
+            config.quote_asset
+        );
+    }
+    Ok(())
 }
 
 /// Total equity: free quote asset plus the mark-to-market value of every held
