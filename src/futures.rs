@@ -43,6 +43,19 @@ const SIGNAL_LIMIT: u32 = 101;
 /// Margin assets valued at one dollar when a transfer moves them.
 const DOLLAR_ASSETS: [&str; 4] = ["USDC", "USDT", "FDUSD", "BNFCR"];
 
+/// Waits between attempts at a call that must not be given up on: the stop
+/// for a position just opened, and closing it again if that stop never goes
+/// in. Binance's IP limit resets each minute, so the last retry lands after
+/// it; the IP is shared with other Railway services, so their bursts count.
+const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(50),
+];
+/// Rate-limited cycles in a row before Telegram hears about it. One is
+/// someone else on the shared IP; an hour of them is worth knowing.
+const RATE_LIMIT_ALERT_AFTER: u32 = 4;
+
 const HEDGE_MODE_REFUSAL: &str =
     "the account is in hedge mode; switch USDⓈ-M futures to one-way mode";
 
@@ -125,7 +138,9 @@ pub async fn run(config: &Config) {
 
     let mut risk = RiskManager::with_risk_per_trade(equity, config.risk_per_trade)
         .with_limits(config.max_open_positions, config.daily_drawdown_limit);
+    let mut rate_limited_cycles = 0u32;
     loop {
+        let mut wait = poll;
         match run_cycle(
             &client,
             config,
@@ -136,18 +151,75 @@ pub async fn run(config: &Config) {
         )
         .await
         {
-            Ok(()) => last_error.clear(),
+            Ok(()) => {
+                last_error.clear();
+                rate_limited_cycles = 0;
+            }
             Err(e) => {
-                error!("Futures cycle error: {e}");
-                // Once per distinct error, not once per poll.
-                if e != last_error {
-                    notifier.notify_error("Futures cycle", &e).await;
-                    last_error = e;
+                if let Some(ms) = rate_limit_wait_ms(&e, now_ms(), poll.as_millis() as u64) {
+                    // The exchange still holds every stop; skipping a cycle
+                    // costs nothing, and hammering turns a limit into a ban.
+                    rate_limited_cycles += 1;
+                    wait = Duration::from_millis(ms);
+                    warn!(
+                        "Binance rate limit ({rate_limited_cycles} cycles in a row); \
+                         pausing {}s: {e}",
+                        ms / 1000
+                    );
+                    if rate_limited_cycles == RATE_LIMIT_ALERT_AFTER {
+                        notifier
+                            .send(&format!(
+                                "\u{26d4} *Binance rate limit* for {rate_limited_cycles} cycles in a \
+                                 row. Stops on the exchange stay in place.\n`{e}`"
+                            ))
+                            .await;
+                    }
+                } else {
+                    rate_limited_cycles = 0;
+                    error!("Futures cycle error: {e}");
+                    // Once per distinct error, not once per poll.
+                    if e != last_error {
+                        notifier.notify_error("Futures cycle", &e).await;
+                        last_error = e;
+                    }
                 }
             }
         }
-        sleep(poll).await;
+        sleep(wait).await;
     }
+}
+
+/// How long to pause after `error`, if it is Binance rate-limiting this IP
+/// (`-1003`, or HTTP 418/429 bans): until a reported ban ends, otherwise one
+/// poll. `None` for any other error.
+fn rate_limit_wait_ms(error: &str, now: u64, poll_ms: u64) -> Option<u64> {
+    let limited = error.contains("error -1003")
+        || error.contains("\"code\":-1003")
+        || error.contains("banned until");
+    if !limited {
+        return None;
+    }
+    Some(match crate::banned_until_ms(error) {
+        Some(until) if until > now => crate::ban_wait_ms(until, now, poll_ms),
+        _ => poll_ms,
+    })
+}
+
+/// Run `call` until it succeeds, waiting `delays` between attempts; the last
+/// error if every attempt fails.
+async fn with_retries<T, F, Fut>(delays: &[Duration], what: &str, mut call: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut result = call().await;
+    for delay in delays {
+        let Err(e) = &result else { break };
+        warn!("{what} failed ({e}); retrying in {}s", delay.as_secs());
+        sleep(*delay).await;
+        result = call().await;
+    }
+    result
 }
 
 /// Refuse to trade an account the loop cannot reason about, set leverage, and
@@ -352,7 +424,7 @@ async fn manage_symbol<E: FuturesExchange>(
             return Ok(Traded::Nothing);
         }
     };
-    open_position(ex, &filters, short, plan, stop, notifier).await?;
+    open_position(ex, &filters, short, plan, stop, notifier, &RETRY_DELAYS).await?;
     Ok(Traded::Opened)
 }
 
@@ -492,6 +564,7 @@ async fn open_position<E: FuturesExchange>(
     plan: EntryPlan,
     stop: f64,
     notifier: &Notifier,
+    retry: &[Duration],
 ) -> Result<(), String> {
     let symbol = filters.symbol.as_str();
     let (open_side, close_side) = if short {
@@ -516,26 +589,20 @@ async fn open_position<E: FuturesExchange>(
     let stop_ok = if short { stop > price } else { stop < price };
     let stop_price = round_away(filters, stop, short);
     let placed = if stop_ok {
-        match ex
-            .place_trigger(symbol, close_side, TriggerKind::Stop, stop_price)
-            .await
-        {
-            Ok(id) => Ok(id),
-            Err(first) => {
-                warn!("{symbol}: stop rejected ({first}); retrying once");
-                ex.place_trigger(symbol, close_side, TriggerKind::Stop, stop_price)
-                    .await
-            }
-        }
+        with_retries(retry, &format!("{symbol} stop"), || {
+            ex.place_trigger(symbol, close_side, TriggerKind::Stop, stop_price)
+        })
+        .await
     } else {
         Err(format!(
             "filled at {price:.2}, already past the stop {stop:.2}"
         ))
     };
     if let Err(e) = placed {
-        let undo = ex
-            .market_order(symbol, close_side, fill.filled_quantity, true)
-            .await;
+        let undo = with_retries(retry, &format!("{symbol} close"), || {
+            ex.market_order(symbol, close_side, fill.filled_quantity, true)
+        })
+        .await;
         let _ = ex.cancel_all(symbol).await;
         let msg = format!(
             "\u{1f6a8} *{symbol}* {label} opened but no stop could be placed ({e}). {}",
@@ -720,6 +787,8 @@ mod tests {
         log: Mutex<Vec<String>>,
         fill_price: f64,
         stop_rejects: bool,
+        /// Stop attempts rejected before one goes through.
+        stop_failures: Mutex<u32>,
         hedge: bool,
     }
 
@@ -790,6 +859,13 @@ mod tests {
             if self.stop_rejects && kind == TriggerKind::Stop {
                 return Err("rejected".into());
             }
+            if kind == TriggerKind::Stop {
+                let mut left = self.stop_failures.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err("Binance API error -1003: Too many requests".into());
+                }
+            }
             Ok(1)
         }
         async fn cancel_all(&self, _: &str) -> Result<(), String> {
@@ -831,6 +907,9 @@ mod tests {
             liquidation_price: 0.0,
         }
     }
+
+    /// Three retries, no waiting.
+    const NO_WAIT: [Duration; 3] = [Duration::ZERO; 3];
 
     fn quiet() -> Notifier {
         Notifier::disabled("USDC")
@@ -921,9 +1000,17 @@ mod tests {
             ..Default::default()
         };
         let plan = EntryPlan { quantity: 0.025 };
-        open_position(&ex, &eth("ETHUSDC"), false, plan, 1_960.0, &quiet())
-            .await
-            .unwrap();
+        open_position(
+            &ex,
+            &eth("ETHUSDC"),
+            false,
+            plan,
+            1_960.0,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             ex.log(),
             vec![
@@ -941,9 +1028,17 @@ mod tests {
             ..Default::default()
         };
         let plan = EntryPlan { quantity: 0.025 };
-        open_position(&ex, &eth("ETHUSDC"), true, plan, 2_040.0, &quiet())
-            .await
-            .unwrap();
+        open_position(
+            &ex,
+            &eth("ETHUSDC"),
+            true,
+            plan,
+            2_040.0,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             ex.log(),
             vec![
@@ -962,7 +1057,16 @@ mod tests {
             ..Default::default()
         };
         let plan = EntryPlan { quantity: 0.025 };
-        let result = open_position(&ex, &eth("ETHUSDC"), false, plan, 1_960.0, &quiet()).await;
+        let result = open_position(
+            &ex,
+            &eth("ETHUSDC"),
+            false,
+            plan,
+            1_960.0,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(
             ex.log(),
@@ -970,9 +1074,60 @@ mod tests {
                 "market BUY 0.025",
                 "trigger Stop SELL 1960",
                 "trigger Stop SELL 1960",
+                "trigger Stop SELL 1960",
+                "trigger Stop SELL 1960",
                 "market SELL 0.025 reduce",
                 "cancel_all",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_stop_is_retried_until_it_goes_in() {
+        let ex = Fake {
+            fill_price: 2_000.0,
+            stop_failures: Mutex::new(2),
+            ..Default::default()
+        };
+        let plan = EntryPlan { quantity: 0.025 };
+        open_position(
+            &ex,
+            &eth("ETHUSDC"),
+            false,
+            plan,
+            1_960.0,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ex.log(),
+            vec![
+                "market BUY 0.025",
+                "trigger Stop SELL 1960",
+                "trigger Stop SELL 1960",
+                "trigger Stop SELL 1960",
+                "trigger TakeProfit SELL 2080",
+            ],
+            "kept, not closed: the third attempt went in"
+        );
+    }
+
+    #[test]
+    fn rate_limits_pause_and_other_errors_do_not() {
+        let poll = 900_000;
+        let limited = "Binance API error -1003: Too many requests; current limit of IP(1.2.3.4) \
+                       is 2400 requests per minute.";
+        assert_eq!(rate_limit_wait_ms(limited, 0, poll), Some(poll));
+        // A ban waits until it lifts, plus a margin.
+        let banned = "Binance API error -1003: Way too many requests; IP(1.2.3.4) banned \
+                      until 7200000. Please use the websocket for live updates to avoid bans.";
+        let wait = rate_limit_wait_ms(banned, 0, poll).unwrap();
+        assert!(wait > 7_200_000 && wait < 7_300_000, "{wait}");
+        assert_eq!(
+            rate_limit_wait_ms("Binance API error -2019: Margin is insufficient.", 0, poll),
+            None
         );
     }
 
@@ -983,7 +1138,16 @@ mod tests {
             ..Default::default()
         };
         let plan = EntryPlan { quantity: 0.025 };
-        let result = open_position(&ex, &eth("ETHUSDC"), false, plan, 1_960.0, &quiet()).await;
+        let result = open_position(
+            &ex,
+            &eth("ETHUSDC"),
+            false,
+            plan,
+            1_960.0,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(
             ex.log(),
