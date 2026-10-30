@@ -132,7 +132,7 @@ come from Binance's public archive (`data.binance.vision`), which answers even
 where the futures API refuses service; the last day or two is not archived yet,
 and the current month's funding is estimated from the latest rates. Each
 strategy also trades a short-side mirror of its rules. Positions are sized from
-the stop as on spot, capped at 95% of equity times `LEVERAGE` (1-3, default 3),
+the stop as on spot, capped at 95% of equity times `LEVERAGE` (1-5, default 3),
 pay or receive funding every 8 hours, pay futures fees (0.05% taker, 0.02%
 maker unless `TAKER_FEE_BPS`/`MAKER_FEE_BPS` say otherwise), and are skipped
 when the stop lies beyond the isolated-margin liquidation price. The table
@@ -152,7 +152,7 @@ in the lab. The API key needs **Enable Futures**.
 
 - **Account:** the account must be in one-way position mode (the bot refuses
   to start in hedge mode). It works in cross or Multi-Assets margin and
-  changes neither. `LEVERAGE` (1-3, default 3) is set on each pair at startup.
+  changes neither. `LEVERAGE` (1-5, default 3) is set on each pair at startup.
 - **Sizing:** `RISK_PER_TRADE_PCT` of equity at the stop, capped at 95% of
   available margin x `LEVERAGE`. A size under the exchange minimum is skipped,
   never rounded up, and so is a trade whose stop lies beyond the estimated

@@ -26,7 +26,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 const DEFAULT_LEVERAGE: u32 = 3;
-const MAX_LEVERAGE: u32 = 3;
+const MAX_LEVERAGE: u32 = 5;
 /// Largest share of available margin x leverage one entry may use.
 const MAX_NOTIONAL_FRACTION: f64 = 0.95;
 /// Maintenance margin rate for the pre-trade liquidation estimate. Binance's
@@ -52,13 +52,9 @@ pub struct FuturesSettings {
 }
 
 impl FuturesSettings {
-    /// `FUTURES_BASE_URL` (default production) and `LEVERAGE` (1-3, default 3).
+    /// `FUTURES_BASE_URL` (default production) and `LEVERAGE` (1-5, default 3).
     pub fn from_env() -> Self {
-        let leverage = std::env::var("LEVERAGE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(DEFAULT_LEVERAGE)
-            .clamp(1, MAX_LEVERAGE);
+        let leverage = parse_leverage(std::env::var("LEVERAGE").ok().as_deref());
         Self {
             base_url: std::env::var("FUTURES_BASE_URL")
                 .ok()
@@ -67,6 +63,15 @@ impl FuturesSettings {
             leverage,
         }
     }
+}
+
+/// `LEVERAGE` as set, held to 1-`MAX_LEVERAGE`; the default when unset or
+/// unreadable.
+fn parse_leverage(value: Option<&str>) -> u32 {
+    value
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_LEVERAGE)
+        .clamp(1, MAX_LEVERAGE)
 }
 
 pub async fn run(config: &Config) {
@@ -845,6 +850,29 @@ mod tests {
         // A short sizes the same from above.
         let p = plan_entry(true, 2_000.0, 2_040.0, 100.0, 100.0, 0.01, 3, &f).unwrap();
         assert!((p.quantity - 0.025).abs() < 1e-12);
+    }
+
+    #[test]
+    fn leverage_is_held_between_one_and_five() {
+        assert_eq!(parse_leverage(None), 3);
+        assert_eq!(parse_leverage(Some("5")), 5);
+        assert_eq!(parse_leverage(Some(" 4 ")), 4);
+        assert_eq!(parse_leverage(Some("10")), 5);
+        assert_eq!(parse_leverage(Some("0")), 1);
+        assert_eq!(parse_leverage(Some("lots")), 3);
+    }
+
+    #[test]
+    fn five_x_lifts_the_margin_cap_but_not_the_risk() {
+        let f = eth("ETHUSDC");
+        // 10% of 83 at a 2.5% stop wants 0.166 ETH (332 notional).
+        // 3x on 83 caps at 236.55 -> 0.118; 5x allows 394 -> the full 0.166.
+        let at3 = plan_entry(false, 2_000.0, 1_950.0, 83.0, 83.0, 0.10, 3, &f).unwrap();
+        let at5 = plan_entry(false, 2_000.0, 1_950.0, 83.0, 83.0, 0.10, 5, &f).unwrap();
+        assert!((at3.quantity - 0.118).abs() < 1e-12);
+        assert!((at5.quantity - 0.166).abs() < 1e-12);
+        // Same stop distance, so a stop-out at 5x still costs 10% of equity.
+        assert!((at5.quantity * 50.0 - 8.3).abs() < 1e-9);
     }
 
     #[test]
