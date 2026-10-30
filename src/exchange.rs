@@ -10,6 +10,7 @@
 //! be handed something that cannot place an order at all.
 
 pub mod binance;
+pub mod binance_futures;
 
 use std::future::Future;
 
@@ -446,6 +447,115 @@ pub trait ExecutionProvider {
         &self,
         symbol: &str,
     ) -> impl Future<Output = Result<Vec<OpenOrder>, String>> + Send;
+}
+
+/// USDⓈ-M futures account totals, in the margin currency's USD value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FuturesAccount {
+    /// Wallet balance plus unrealised P&L: what the account is worth now.
+    pub equity: f64,
+    /// Margin free to open new positions.
+    pub available: f64,
+}
+
+/// An open USDⓈ-M perpetual position in one-way mode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuturesPosition {
+    pub symbol: String,
+    /// Contracts held: positive long, negative short.
+    pub amount: f64,
+    pub entry_price: f64,
+    pub mark_price: f64,
+    /// Zero when the venue reports none.
+    pub liquidation_price: f64,
+}
+
+impl FuturesPosition {
+    pub fn is_short(&self) -> bool {
+        self.amount < 0.0
+    }
+}
+
+/// What a conditional (trigger) order does when it fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerKind {
+    /// `STOP_MARKET`: the protective stop.
+    Stop,
+    /// `TAKE_PROFIT_MARKET`: the target.
+    TakeProfit,
+}
+
+/// A resting conditional order. `kind` is `None` for types the bot never
+/// places.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriggerOrder {
+    pub id: u64,
+    pub kind: Option<TriggerKind>,
+    pub side: Side,
+    pub trigger_price: f64,
+}
+
+/// USDⓈ-M perpetual futures: market data, account, and orders. One trait
+/// because the futures loop needs all of it from one venue, and a test fake
+/// implements it whole.
+pub trait FuturesExchange {
+    /// Perpetual candles, oldest first; the newest may still be forming.
+    fn klines(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<Candle>, String>> + Send;
+
+    fn filters(&self, symbol: &str) -> impl Future<Output = Result<SymbolFilters, String>> + Send;
+
+    fn account(&self) -> impl Future<Output = Result<FuturesAccount, String>> + Send;
+
+    /// Every position with a non-zero amount.
+    fn positions(&self) -> impl Future<Output = Result<Vec<FuturesPosition>, String>> + Send;
+
+    fn trigger_orders(
+        &self,
+        symbol: &str,
+    ) -> impl Future<Output = Result<Vec<TriggerOrder>, String>> + Send;
+
+    /// A market order. `reduce_only` orders can only shrink a position.
+    fn market_order(
+        &self,
+        symbol: &str,
+        side: Side,
+        quantity: f64,
+        reduce_only: bool,
+    ) -> impl Future<Output = Result<OrderOutcome, String>> + Send;
+
+    /// A conditional market order that closes the whole position when the
+    /// mark price reaches `trigger_price`. Returns the venue's order id.
+    fn place_trigger(
+        &self,
+        symbol: &str,
+        side: Side,
+        kind: TriggerKind,
+        trigger_price: f64,
+    ) -> impl Future<Output = Result<u64, String>> + Send;
+
+    /// Cancel every open order on `symbol`, conditional ones included.
+    fn cancel_all(&self, symbol: &str) -> impl Future<Output = Result<(), String>> + Send;
+
+    fn set_leverage(
+        &self,
+        symbol: &str,
+        leverage: u32,
+    ) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// Whether the account is in hedge (dual-side) position mode.
+    fn hedge_mode(&self) -> impl Future<Output = Result<bool, String>> + Send;
+
+    /// Money moved into (positive) or out of (negative) the futures wallet at
+    /// or after `since_ms`.
+    fn transfers(
+        &self,
+        since_ms: u64,
+    ) -> impl Future<Output = Result<Vec<Transfer>, String>> + Send;
 }
 
 /// Extract `(stop_loss, take_profit)` from a symbol's resting sell orders.

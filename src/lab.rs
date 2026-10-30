@@ -19,7 +19,7 @@
 //! public data archive: every strategy also trades its short-side mirror, with
 //! leverage up to `LEVERAGE` (default and maximum 3), funding every 8 hours,
 //! futures fees, and no entry whose stop lies beyond the liquidation price.
-//! Nothing trades futures live; this only measures whether it would pay.
+//! `MARKET=futures` trades the same rules live (see `futures.rs`).
 //!
 //! The lab also sweeps `trend_pullback`'s EMA50 buffers (`EXIT_BUFFER_ATR` x
 //! `ENTRY_BUFFER_ATR`) and recommends a pair under the same bars, reported as

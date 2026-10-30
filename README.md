@@ -138,8 +138,44 @@ maker unless `TAKER_FEE_BPS`/`MAKER_FEE_BPS` say otherwise), and are skipped
 when the stop lies beyond the isolated-margin liquidation price. The table
 splits each strategy's out-of-sample record into longs and shorts, and the
 `recommendation` reads `futures:<strategy>` only when a strategy clears the
-same out-of-sample bars on both sides together. The live bot still trades spot
-only.
+same out-of-sample bars on both sides together.
+
+## Live futures
+
+```bash
+MARKET=futures TRADING_PAIRS=ETHUSDC QUOTE_ASSET=USDC LEVERAGE=3 cargo run
+```
+
+Trades Binance USDⓈ-M perpetuals, long and short, with the strategy's rules
+and their short-side mirror, evaluated on closed `SIGNAL_INTERVAL` candles as
+in the lab. The API key needs **Enable Futures**.
+
+- **Account:** the account must be in one-way position mode (the bot refuses
+  to start in hedge mode). It works in cross or Multi-Assets margin and
+  changes neither. `LEVERAGE` (1-3, default 3) is set on each pair at startup.
+- **Sizing:** `RISK_PER_TRADE_PCT` of equity at the stop, capped at 95% of
+  available margin x `LEVERAGE`. A size under the exchange minimum is skipped,
+  never rounded up, and so is a trade whose stop lies beyond the estimated
+  liquidation price. The startup message lists each pair's smallest order and
+  warns about pairs this balance cannot trade (at 3x, BTCUSDC's 0.001 BTC
+  minimum needs about 27.40 USDC of margin).
+- **Protection:** every entry gets a mark-price stop and a 2R target, both
+  closing the whole position. If the stop cannot be placed, the position is
+  closed again at once. A position found without a stop, after a restart or a
+  manual trade, gets an emergency stop 1.5 ATR from mark. Flat pairs have
+  leftover orders cancelled.
+- **Exits:** stop, target, or the strategy's exit signal (reduce-only market
+  order). `FORCE_CLOSE=true` closes every futures position.
+- **Risk:** the daily drawdown halt stops new entries but keeps managing open
+  positions. Transfers into and out of the futures wallet are cash flows, not
+  P&L.
+- **Not supported:** the trailing stop, hedge mode, more than one position
+  per pair.
+
+`FUTURES_BASE_URL=https://testnet.binancefuture.com` runs it against Binance's
+futures testnet with testnet keys. Binance refuses futures API access from
+restricted locations, including where the server runs: the Fly region must be
+one where your account may trade futures.
 
 The live loop trades `STRATEGY` if set, otherwise `LIVE_STRATEGY` in
 `src/strategies.rs`. Switching strategies is a reviewed pull request that

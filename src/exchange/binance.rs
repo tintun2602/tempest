@@ -47,6 +47,14 @@ const PRODUCTION_URL: &str = "https://api.binance.com";
 /// seen yesterday and credited today is still returned.
 const TRANSFER_LOOKBACK_MS: u64 = 86_400_000;
 
+/// HMAC-SHA256 of `query` under `secret`, hex-encoded: Binance's request
+/// signature, spot and futures alike.
+pub(super) fn sign(secret: &str, query: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
+    mac.update(query.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
 /// Largest page the klines endpoint will return.
 const MAX_KLINES_PER_REQUEST: usize = 1000;
 
@@ -85,10 +93,7 @@ impl BinanceClient {
     }
 
     fn sign(&self, query: &str) -> String {
-        let mut mac =
-            HmacSha256::new_from_slice(self.api_secret.as_bytes()).expect("HMAC accepts any key");
-        mac.update(query.as_bytes());
-        hex::encode(mac.finalize().into_bytes())
+        sign(&self.api_secret, query)
     }
 
     /// GET a signed endpoint, returning the decoded body.
@@ -421,7 +426,7 @@ impl ExecutionProvider for BinanceClient {
 
 /// Binance reports failures as `{"code": -1013, "msg": "..."}` with an HTTP 200
 /// in some paths, so the body must be inspected rather than the status alone.
-fn check_api_error(resp: &serde_json::Value) -> Result<(), String> {
+pub(super) fn check_api_error(resp: &serde_json::Value) -> Result<(), String> {
     match resp.get("code").and_then(serde_json::Value::as_i64) {
         Some(code) if code != 0 => {
             let msg = resp["msg"].as_str().unwrap_or("unknown error");
@@ -432,16 +437,16 @@ fn check_api_error(resp: &serde_json::Value) -> Result<(), String> {
 }
 
 /// Binance encodes every number as a JSON string.
-fn parse_str_f64(v: &serde_json::Value) -> Option<f64> {
+pub(super) fn parse_str_f64(v: &serde_json::Value) -> Option<f64> {
     v.as_str()?.parse().ok()
 }
 
-fn parse_str_f64_or_zero(v: &serde_json::Value) -> f64 {
+pub(super) fn parse_str_f64_or_zero(v: &serde_json::Value) -> f64 {
     parse_str_f64(v).unwrap_or(0.0)
 }
 
 /// A kline row is a positional array: `[openTime, o, h, l, c, v, closeTime, ..]`.
-fn parse_candle(row: &serde_json::Value) -> Option<Candle> {
+pub(super) fn parse_candle(row: &serde_json::Value) -> Option<Candle> {
     let k = row.as_array()?;
     if k.len() < 7 {
         return None;
@@ -673,7 +678,7 @@ fn parse_open_order(o: &serde_json::Value) -> Option<OpenOrder> {
 /// via [`SymbolFilters`]; this only has to avoid *losing* that precision.
 /// Fixed 6-decimal quantities silently violated a 1e-5 step size, and fixed
 /// 2-decimal prices would destroy the price of any sub-cent asset.
-fn format_decimal(value: f64) -> String {
+pub(super) fn format_decimal(value: f64) -> String {
     let text = format!("{value:.8}");
     let text = text.trim_end_matches('0');
     text.trim_end_matches('.').to_string()

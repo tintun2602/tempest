@@ -4,6 +4,7 @@ mod config;
 mod costs;
 mod exchange;
 mod executor;
+mod futures;
 mod indicators;
 mod lab;
 mod notify;
@@ -126,6 +127,10 @@ async fn main() {
     }
     if env::var("MODE").unwrap_or_default() == "lab" {
         lab::run(&client, &config).await;
+        return;
+    }
+    if env::var("MARKET").unwrap_or_default().trim() == "futures" {
+        futures::run(&config).await;
         return;
     }
 
