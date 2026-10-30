@@ -13,6 +13,9 @@ const DEFAULT_FEE_BPS: f64 = 10.0;
 /// Market orders cross the spread. Small relative to fees on a liquid pair,
 /// but it compounds with frequency.
 const DEFAULT_SLIPPAGE_BPS: f64 = 5.0;
+/// Binance USDⓈ-M futures standard tier: 0.05% taker, 0.02% maker.
+const FUTURES_TAKER_BPS: f64 = 5.0;
+const FUTURES_MAKER_BPS: f64 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostModel {
@@ -36,6 +39,15 @@ impl Default for CostModel {
 
 impl CostModel {
     pub fn from_env() -> Self {
+        Self::from_env_with(DEFAULT_FEE_BPS, DEFAULT_FEE_BPS)
+    }
+
+    /// Futures fees by default, overridable by the same variables as spot.
+    pub fn futures_from_env() -> Self {
+        Self::from_env_with(FUTURES_TAKER_BPS, FUTURES_MAKER_BPS)
+    }
+
+    fn from_env_with(taker_bps: f64, maker_bps: f64) -> Self {
         let bps = |key: &str, fallback: f64| {
             env::var(key)
                 .ok()
@@ -44,8 +56,8 @@ impl CostModel {
                 * BPS
         };
         Self {
-            taker_fee: bps("TAKER_FEE_BPS", DEFAULT_FEE_BPS),
-            maker_fee: bps("MAKER_FEE_BPS", DEFAULT_FEE_BPS),
+            taker_fee: bps("TAKER_FEE_BPS", taker_bps),
+            maker_fee: bps("MAKER_FEE_BPS", maker_bps),
             slippage: bps("SLIPPAGE_BPS", DEFAULT_SLIPPAGE_BPS),
         }
     }

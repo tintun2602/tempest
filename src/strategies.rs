@@ -7,7 +7,9 @@
 
 use crate::exchange::Candle;
 use crate::indicators;
-use crate::strategy::{self, IndicatorSnapshot, Signal, StrategyParams, TradeSignal};
+use crate::strategy::{
+    self, IndicatorSnapshot, ShortDecision, Signal, StrategyParams, TradeSignal,
+};
 
 /// The strategy traded when `STRATEGY` is unset. The Trading department
 /// proposes changes here by pull request; merging one is what switches live.
@@ -38,6 +40,10 @@ const _: () = assert!(BREAKOUT_LOOKBACK < crate::lab::SIGNAL_WINDOW);
 const BREAKOUT_EXIT_LOOKBACK: usize = 10;
 const OVERSOLD: f64 = 30.0;
 const RECOVERED: f64 = 60.0;
+/// Mean-reversion short: signal RSI above `OVERBOUGHT` below the trend EMA200,
+/// covered once it falls back under `FADED`. Mirrors of the long thresholds.
+const OVERBOUGHT: f64 = 70.0;
+const FADED: f64 = 40.0;
 /// Stops for the new strategies sit this many *trend-interval* ATRs below
 /// entry. A signal-interval ATR is so tight on 15m bars that fees and noise
 /// would decide most trades.
@@ -90,6 +96,77 @@ impl StrategyKind {
             StrategyKind::Breakout => breakout(symbol, snap, signal_candles),
             StrategyKind::MeanReversion => mean_reversion(symbol, snap, signal_candles),
         }
+    }
+}
+
+impl StrategyKind {
+    /// The short-side mirror of [`Self::evaluate`], for the lab's futures
+    /// mode. Same inputs, same no-look-ahead contract.
+    pub fn evaluate_short(
+        self,
+        snap: &IndicatorSnapshot,
+        signal_candles: &[Candle],
+        params: &StrategyParams,
+    ) -> ShortDecision {
+        match self {
+            StrategyKind::TrendPullback => strategy::evaluate_short(snap, params),
+            StrategyKind::Breakout => breakout_short(snap, signal_candles),
+            StrategyKind::MeanReversion => mean_reversion_short(snap, signal_candles),
+        }
+    }
+}
+
+/// Close below the lowest low of the channel while under EMA200; covered on a
+/// close above the recent high.
+fn breakout_short(snap: &IndicatorSnapshot, bars: &[Candle]) -> ShortDecision {
+    let price = snap.current_price;
+    let n = bars.len();
+    if n < BREAKOUT_LOOKBACK + 1 {
+        return ShortDecision::Hold;
+    }
+    let channel_low = bars[n - 1 - BREAKOUT_LOOKBACK..n - 1]
+        .iter()
+        .map(|c| c.low)
+        .fold(f64::MAX, f64::min);
+    let exit_high = bars[n.saturating_sub(1 + BREAKOUT_EXIT_LOOKBACK)..n - 1]
+        .iter()
+        .map(|c| c.high)
+        .fold(f64::MIN, f64::max);
+    if price > exit_high {
+        return ShortDecision::Cover;
+    }
+    if price < channel_low && price < snap.ema_200 {
+        return short_with_atr_stop(snap);
+    }
+    ShortDecision::Hold
+}
+
+fn mean_reversion_short(snap: &IndicatorSnapshot, bars: &[Candle]) -> ShortDecision {
+    let closes: Vec<f64> = bars.iter().map(|c| c.close).collect();
+    let Some(rsi) = indicators::rsi(&closes, 14)
+        .last()
+        .copied()
+        .filter(|v| v.is_finite())
+    else {
+        return ShortDecision::Hold;
+    };
+    if rsi < FADED {
+        return ShortDecision::Cover;
+    }
+    if rsi > OVERBOUGHT && snap.current_price < snap.ema_200 {
+        return short_with_atr_stop(snap);
+    }
+    ShortDecision::Hold
+}
+
+/// A short with its stop `STOP_ATR` trend ATRs above price. No usable ATR, no
+/// trade.
+fn short_with_atr_stop(snap: &IndicatorSnapshot) -> ShortDecision {
+    if !(snap.atr_14.is_finite() && snap.atr_14 > 0.0) {
+        return ShortDecision::Hold;
+    }
+    ShortDecision::Enter {
+        stop_loss: snap.current_price + STOP_ATR * snap.atr_14,
     }
 }
 
@@ -229,6 +306,8 @@ mod tests {
             macd_crossed_bullish_recently: false,
             current_price: price,
             swing_low: 80.0,
+            macd_crossed_bearish_recently: false,
+            swing_high: 110.0,
             atr_14: 2.0,
         }
     }
@@ -353,6 +432,52 @@ mod tests {
         let price = bars.last().unwrap().close;
         let s = StrategyKind::MeanReversion.evaluate("X", &snap(price), &bars, &Default::default());
         assert_eq!(s.signal, Signal::Sell);
+    }
+
+    #[test]
+    fn breakout_shorts_a_close_below_the_channel_in_a_downtrend() {
+        let bars = flat_then(97.0);
+        let mut below = snap(97.0);
+        below.ema_200 = 105.0;
+        let d = StrategyKind::Breakout.evaluate_short(&below, &bars, &Default::default());
+        // 1.5 trend ATRs above entry.
+        assert_eq!(d, ShortDecision::Enter { stop_loss: 100.0 });
+        // Above EMA200 it stays out.
+        let d = StrategyKind::Breakout.evaluate_short(&snap(97.0), &bars, &Default::default());
+        assert_ne!(d, ShortDecision::Enter { stop_loss: 100.0 });
+    }
+
+    #[test]
+    fn breakout_covers_above_the_recent_high() {
+        let bars = flat_then(103.0);
+        let d = StrategyKind::Breakout.evaluate_short(&snap(103.0), &bars, &Default::default());
+        assert_eq!(d, ShortDecision::Cover);
+    }
+
+    #[test]
+    fn mean_reversion_shorts_a_spike_below_the_trend_ema_and_covers_on_a_fade() {
+        let rising: Vec<Candle> = (0..40)
+            .map(|i| {
+                let c = 80.0 + i as f64 * 0.5;
+                bar(i, c - 0.1, c + 0.1, c)
+            })
+            .collect();
+        let price = rising.last().unwrap().close;
+        let mut below = snap(price);
+        below.ema_200 = 120.0;
+        let d = StrategyKind::MeanReversion.evaluate_short(&below, &rising, &Default::default());
+        assert!(matches!(d, ShortDecision::Enter { .. }), "{d:?}");
+
+        let falling: Vec<Candle> = (0..40)
+            .map(|i| {
+                let c = 120.0 - i as f64 * 0.5;
+                bar(i, c - 0.1, c + 0.1, c)
+            })
+            .collect();
+        let price = falling.last().unwrap().close;
+        let d =
+            StrategyKind::MeanReversion.evaluate_short(&snap(price), &falling, &Default::default());
+        assert_eq!(d, ShortDecision::Cover);
     }
 
     #[test]

@@ -15,16 +15,23 @@
 //! out-of-sample period. A recommendation needs both, and is ranked on the
 //! later one.
 //!
+//! `LAB_MARKET=futures` replays Binance USDⓈ-M perpetuals instead, from the
+//! public data archive: every strategy also trades its short-side mirror, with
+//! leverage up to `LEVERAGE` (default and maximum 3), funding every 8 hours,
+//! futures fees, and no entry whose stop lies beyond the liquidation price.
+//! Nothing trades futures live; this only measures whether it would pay.
+//!
 //! The lab also sweeps `trend_pullback`'s EMA50 buffers (`EXIT_BUFFER_ATR` x
 //! `ENTRY_BUFFER_ATR`) and recommends a pair under the same bars, reported as
 //! `buffer_grid` in the `LAB_REPORT` line.
 
+use crate::archive;
 use crate::backtest;
 use crate::config::Config;
 use crate::costs::CostModel;
 use crate::exchange::{Candle, MarketDataProvider};
 use crate::strategies::{StrategyKind, REWARD_RISK};
-use crate::strategy::{self, Signal, StrategyParams};
+use crate::strategy::{self, ShortDecision, Signal, StrategyParams};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde_json::json;
@@ -45,30 +52,113 @@ const MONTE_CARLO_TRADES: usize = 100;
 /// Same windows the live loop requests.
 const TREND_WINDOW: usize = 250;
 pub(crate) const SIGNAL_WINDOW: usize = 100;
-/// Largest share of equity one entry may use, as in `risk.rs`.
+/// Largest share of equity one entry may use, as in `risk.rs`. On futures
+/// this is per unit of leverage.
 const MAX_NOTIONAL_FRACTION: f64 = 0.95;
+/// Highest leverage the futures lab accepts.
+const MAX_LEVERAGE: f64 = 3.0;
+/// Maintenance margin rate assumed for the liquidation price. Binance's lowest
+/// BTC tier is 0.4%; rounded up so the estimate errs toward liquidating early.
+const MAINT_MARGIN: f64 = 0.005;
+/// Perpetuals fund every 8 hours.
+const FUNDING_INTERVAL_MS: u64 = 8 * 3_600_000;
+/// Funding events averaged to estimate the stretch the archive has not
+/// published yet: the last ten days.
+const FUNDING_ESTIMATE_EVENTS: usize = 30;
+
+/// Where the lab trades.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Venue {
+    /// USDⓈ-M perpetuals: shorts, leverage, funding and a liquidation price.
+    /// Otherwise spot: long only, no leverage.
+    futures: bool,
+    /// Leverage set on the exchange, isolated margin. Caps notional at
+    /// `MAX_NOTIONAL_FRACTION` x leverage and sets the liquidation price.
+    leverage: f64,
+}
+
+impl Venue {
+    const SPOT: Venue = Venue {
+        futures: false,
+        leverage: 1.0,
+    };
+
+    /// `LAB_MARKET=futures` with `LEVERAGE` (1-3, default 3); spot otherwise.
+    fn from_env() -> Self {
+        if std::env::var("LAB_MARKET").unwrap_or_default().trim() != "futures" {
+            return Self::SPOT;
+        }
+        let leverage = std::env::var("LEVERAGE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(MAX_LEVERAGE)
+            .clamp(1.0, MAX_LEVERAGE);
+        Venue {
+            futures: true,
+            leverage,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        if self.futures {
+            "futures"
+        } else {
+            "spot"
+        }
+    }
+
+    /// Price at which an isolated position at this leverage is liquidated, or
+    /// `None` on spot.
+    fn liquidation_price(&self, entry: f64, short: bool) -> Option<f64> {
+        if !self.futures {
+            return None;
+        }
+        let distance = 1.0 / self.leverage - MAINT_MARGIN;
+        Some(if short {
+            entry * (1.0 + distance)
+        } else {
+            entry * (1.0 - distance)
+        })
+    }
+}
+
+/// One pair's history: trend and signal candles, and funding events
+/// `(time_ms, rate)` (empty on spot).
+struct Feed {
+    trend: Vec<Candle>,
+    signal: Vec<Candle>,
+    funding: Vec<(u64, f64)>,
+}
 
 #[derive(Debug, Clone)]
 struct LabTrade {
     strategy: StrategyKind,
+    short: bool,
     exit_time: u64,
-    /// Net return on account equity, after fees and slippage.
+    /// Net return on account equity, after fees, slippage and funding.
     ret: f64,
     out_of_sample: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct OpenTrade {
+    short: bool,
     entry_time: u64,
     entry_price: f64,
     stop: f64,
     target: f64,
     /// Share of equity committed.
     notional: f64,
-    /// Highest high since entry, for the trailing stop.
-    highest_high: f64,
+    /// Best price since entry, for the trailing stop: the highest high on a
+    /// long, the lowest low on a short.
+    extreme: f64,
     /// Trend ATR at entry, held fixed as the live executor does.
     atr_at_entry: f64,
+    /// Funding paid so far as a share of equity; negative when received.
+    funding: f64,
+    /// Where the venue would liquidate, if it can.
+    liquidation: Option<f64>,
 }
 
 pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
@@ -77,7 +167,12 @@ pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|d| (1..=MAX_LAB_DAYS).contains(d))
         .unwrap_or(DEFAULT_LAB_DAYS);
-    let costs = CostModel::from_env();
+    let venue = Venue::from_env();
+    let costs = if venue.futures {
+        CostModel::futures_from_env()
+    } else {
+        CostModel::from_env()
+    };
     let params = StrategyParams::from_env();
     let live = config.strategy;
     let (Some(trend_ms), Some(signal_ms)) = (
@@ -89,7 +184,12 @@ pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
     };
 
     info!(
-        "=== LAB === {days} days | trend {} | signal {} | {} pairs | live: {}",
+        "=== LAB === {days} days | {} | trend {} | signal {} | {} pairs | live: {}",
+        if venue.futures {
+            format!("futures {}x", venue.leverage)
+        } else {
+            "spot".to_string()
+        },
         config.trend_interval,
         config.signal_interval,
         config.trading_pairs.len(),
@@ -98,50 +198,47 @@ pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
 
     let signal_bars = (days * 86_400_000 / signal_ms) as usize;
     let trend_bars = (signal_bars as u64 * signal_ms / trend_ms) as usize + TREND_WINDOW + 10;
+    let http = reqwest::Client::new();
 
     let mut trades: Vec<LabTrade> = Vec::new();
-    let mut feeds: Vec<(Vec<Candle>, Vec<Candle>)> = Vec::new();
+    let mut feeds: Vec<Feed> = Vec::new();
     for symbol in &config.trading_pairs {
-        let trend = match client
-            .klines_extended(symbol, &config.trend_interval, trend_bars)
+        let loaded = if venue.futures {
+            load_futures(
+                &http,
+                symbol,
+                config,
+                trend_bars,
+                trend_ms,
+                signal_bars,
+                signal_ms,
+            )
             .await
-        {
-            Ok(c) => c,
+        } else {
+            load_spot(client, symbol, config, trend_bars, signal_bars).await
+        };
+        let feed = match loaded {
+            Ok(feed) => feed,
             Err(e) => {
-                error!("lab {symbol}: trend klines failed: {e}");
+                error!("lab {symbol}: {e}");
                 continue;
             }
         };
-        let signal = match client
-            .klines_extended(symbol, &config.signal_interval, signal_bars)
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                error!("lab {symbol}: signal klines failed: {e}");
-                continue;
-            }
-        };
-        // The newest candle of each series may still be forming; the lab only
-        // trades bars that have closed.
-        let now = now_ms();
-        let trend: Vec<Candle> = trend.into_iter().filter(|c| c.close_time <= now).collect();
-        let signal: Vec<Candle> = signal.into_iter().filter(|c| c.close_time <= now).collect();
         let found = simulate(
-            &trend,
-            &signal,
+            &feed,
             config.risk_per_trade,
             &costs,
             &params,
+            venue,
             &StrategyKind::ALL,
         );
         info!("lab {symbol}: {} trades across strategies", found.len());
         trades.extend(found);
-        feeds.push((trend, signal));
+        feeds.push(feed);
     }
 
-    let mut report = build_report(&trades, live, days, config);
-    let grid = buffer_grid(&feeds, config.risk_per_trade, &costs, &params);
+    let mut report = build_report(&trades, live, days, config, venue);
+    let grid = buffer_grid(&feeds, config.risk_per_trade, &costs, &params, venue);
     report["buffer_grid"] = buffer_grid_json(&grid, &params);
     print_table(&report);
     print_buffer_grid(&report["buffer_grid"]);
@@ -149,15 +246,101 @@ pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
     println!("LAB_REPORT {report}");
 }
 
+async fn load_spot<M: MarketDataProvider>(
+    client: &M,
+    symbol: &str,
+    config: &Config,
+    trend_bars: usize,
+    signal_bars: usize,
+) -> Result<Feed, String> {
+    let trend = client
+        .klines_extended(symbol, &config.trend_interval, trend_bars)
+        .await
+        .map_err(|e| format!("trend klines failed: {e}"))?;
+    let signal = client
+        .klines_extended(symbol, &config.signal_interval, signal_bars)
+        .await
+        .map_err(|e| format!("signal klines failed: {e}"))?;
+    Ok(closed_only(Feed {
+        trend,
+        signal,
+        funding: Vec::new(),
+    }))
+}
+
+/// Perpetual candles and funding from Binance's public archive, which answers
+/// even where the futures API refuses service.
+async fn load_futures(
+    http: &reqwest::Client,
+    symbol: &str,
+    config: &Config,
+    trend_bars: usize,
+    trend_ms: u64,
+    signal_bars: usize,
+    signal_ms: u64,
+) -> Result<Feed, String> {
+    let end = now_ms();
+    let trend_start = end.saturating_sub(trend_bars as u64 * trend_ms);
+    let signal_start = end.saturating_sub(signal_bars as u64 * signal_ms);
+    let trend =
+        archive::futures_klines(http, symbol, &config.trend_interval, trend_start, end).await?;
+    let signal =
+        archive::futures_klines(http, symbol, &config.signal_interval, signal_start, end).await?;
+    let mut funding = archive::funding_rates(http, symbol, signal_start, end).await?;
+    if signal.is_empty() {
+        return Err("no futures candles in the archive".into());
+    }
+    let last_bar = signal.last().map_or(end, |c| c.close_time);
+    let archived = funding.len();
+    extend_funding(&mut funding, last_bar);
+    if funding.len() > archived {
+        info!(
+            "lab {symbol}: {} recent funding events not archived yet; estimated at the \
+             last ten days' mean",
+            funding.len() - archived
+        );
+    }
+    Ok(closed_only(Feed {
+        trend,
+        signal,
+        funding,
+    }))
+}
+
+/// Drop candles still forming: the lab only trades bars that have closed.
+fn closed_only(mut feed: Feed) -> Feed {
+    let now = now_ms();
+    feed.trend.retain(|c| c.close_time <= now);
+    feed.signal.retain(|c| c.close_time <= now);
+    feed
+}
+
+/// The archive publishes funding a month at a time, so the running month has
+/// none. Fill it every 8 hours up to `until_ms` with the mean of the latest
+/// archived rates, rather than pretend those positions paid nothing.
+fn extend_funding(funding: &mut Vec<(u64, f64)>, until_ms: u64) {
+    let Some(&(last, _)) = funding.last() else {
+        return;
+    };
+    let recent = &funding[funding.len().saturating_sub(FUNDING_ESTIMATE_EVENTS)..];
+    let mean = recent.iter().map(|(_, r)| r).sum::<f64>() / recent.len() as f64;
+    let mut t = last + FUNDING_INTERVAL_MS;
+    while t <= until_ms {
+        funding.push((t, mean));
+        t += FUNDING_INTERVAL_MS;
+    }
+}
+
 /// Replay one pair. Pure, so it is testable on synthetic candles.
 fn simulate(
-    trend: &[Candle],
-    signal: &[Candle],
+    feed: &Feed,
     risk_per_trade: f64,
     costs: &CostModel,
     params: &StrategyParams,
+    venue: Venue,
     kinds: &[StrategyKind],
 ) -> Vec<LabTrade> {
+    let (trend, signal) = (&feed.trend, &feed.signal);
     let mut trades = Vec::new();
     let Some(first) = signal.first() else {
         return trades;
@@ -167,15 +350,13 @@ fn simulate(
 
     let mut open: Vec<Option<OpenTrade>> = vec![None; kinds.len()];
     let mut closed_trend = 0usize;
+    let mut next_funding = 0usize;
     let mut trend_view: Vec<Candle> = Vec::with_capacity(TREND_WINDOW);
 
     for j in 0..signal.len() {
         let bar = &signal[j];
         while closed_trend < trend.len() && trend[closed_trend].close_time <= bar.close_time {
             closed_trend += 1;
-        }
-        if closed_trend < 200 || j + 1 < 35 {
-            continue;
         }
 
         // Exits on resting levels first, against this bar's range, for
@@ -186,10 +367,23 @@ fn simulate(
             if let Some((price, resting)) = exit_on_bar(pos, bar, params, costs) {
                 trades.push(close(kinds[k], pos, price, resting, bar, split_time, costs));
                 *slot = None;
-            } else {
+            } else if pos.short {
                 // Ratchet after the exit test, never before it.
-                pos.highest_high = pos.highest_high.max(bar.high);
+                pos.extreme = pos.extreme.min(bar.low);
+            } else {
+                pos.extreme = pos.extreme.max(bar.high);
             }
+        }
+
+        // Funding settled during this bar, on what is still open, at the
+        // bar's close as the mark. Longs pay a positive rate, shorts receive.
+        while next_funding < feed.funding.len() && feed.funding[next_funding].0 <= bar.close_time {
+            accrue_funding(&mut open, feed.funding[next_funding].1, bar.close);
+            next_funding += 1;
+        }
+
+        if closed_trend < 200 || j + 1 < 35 {
+            continue;
         }
 
         // What the venue reports at this bar: the closed trend candles plus
@@ -209,31 +403,52 @@ fn simulate(
         };
 
         for (k, &kind) in kinds.iter().enumerate() {
-            let decision = kind.evaluate("LAB", &snap, signal_view, params);
-            match (decision.signal, open[k]) {
-                (Signal::Sell, Some(pos)) => {
-                    let price = costs.sell_fill(bar.close);
-                    trades.push(close(kind, &pos, price, false, bar, split_time, costs));
-                    open[k] = None;
-                }
-                (Signal::Buy, None) => {
-                    let entry_price = costs.buy_fill(decision.entry_price);
-                    let stop_pct = (entry_price - decision.stop_loss) / entry_price;
-                    if !(stop_pct > 0.0 && stop_pct.is_finite()) {
-                        continue;
+            match open[k] {
+                Some(pos) if pos.short => {
+                    if kind.evaluate_short(&snap, signal_view, params) == ShortDecision::Cover {
+                        let price = costs.buy_fill(bar.close);
+                        trades.push(close(kind, &pos, price, false, bar, split_time, costs));
+                        open[k] = None;
                     }
-                    open[k] = Some(OpenTrade {
-                        entry_time: bar.close_time,
-                        entry_price,
-                        stop: decision.stop_loss,
-                        // Re-derived from the fill, as the live executor does.
-                        target: entry_price + REWARD_RISK * (entry_price - decision.stop_loss),
-                        notional: (risk_per_trade / stop_pct).min(MAX_NOTIONAL_FRACTION),
-                        highest_high: entry_price,
-                        atr_at_entry: decision.atr,
-                    });
                 }
-                _ => {}
+                Some(pos) => {
+                    let decision = kind.evaluate("LAB", &snap, signal_view, params);
+                    if decision.signal == Signal::Sell {
+                        let price = costs.sell_fill(bar.close);
+                        trades.push(close(kind, &pos, price, false, bar, split_time, costs));
+                        open[k] = None;
+                    }
+                }
+                None => {
+                    let decision = kind.evaluate("LAB", &snap, signal_view, params);
+                    open[k] = if decision.signal == Signal::Buy {
+                        let entry_price = costs.buy_fill(decision.entry_price);
+                        open_position(
+                            false,
+                            entry_price,
+                            decision.stop_loss,
+                            decision.atr,
+                            bar,
+                            risk_per_trade,
+                            venue,
+                        )
+                    } else if venue.futures {
+                        match kind.evaluate_short(&snap, signal_view, params) {
+                            ShortDecision::Enter { stop_loss } => open_position(
+                                true,
+                                costs.sell_fill(bar.close),
+                                stop_loss,
+                                snap.atr_14,
+                                bar,
+                                risk_per_trade,
+                                venue,
+                            ),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                }
             }
         }
     }
@@ -242,7 +457,11 @@ fn simulate(
     if let Some(bar) = signal.last() {
         for (k, slot) in open.iter().enumerate() {
             if let Some(pos) = slot {
-                let price = costs.sell_fill(bar.close);
+                let price = if pos.short {
+                    costs.buy_fill(bar.close)
+                } else {
+                    costs.sell_fill(bar.close)
+                };
                 trades.push(close(kinds[k], pos, price, false, bar, split_time, costs));
             }
         }
@@ -250,11 +469,69 @@ fn simulate(
     trades
 }
 
+/// One funding settlement at `rate` on every open position, marked at
+/// `mark`: a long pays a positive rate, a short receives it.
+fn accrue_funding(open: &mut [Option<OpenTrade>], rate: f64, mark: f64) {
+    for pos in open.iter_mut().flatten() {
+        let notional = pos.notional * mark / pos.entry_price;
+        pos.funding += if pos.short { -rate } else { rate } * notional;
+    }
+}
+
+/// Size and open a position at `entry_price`, or `None` when the stop is on
+/// the wrong side or no closer than the liquidation price: a trade the venue
+/// would close before its own stop is not taken.
+fn open_position(
+    short: bool,
+    entry_price: f64,
+    stop: f64,
+    atr: f64,
+    bar: &Candle,
+    risk_per_trade: f64,
+    venue: Venue,
+) -> Option<OpenTrade> {
+    let risk = if short {
+        stop - entry_price
+    } else {
+        entry_price - stop
+    };
+    let stop_pct = risk / entry_price;
+    if !(stop_pct > 0.0 && stop_pct.is_finite()) {
+        return None;
+    }
+    let liquidation = venue.liquidation_price(entry_price, short);
+    if let Some(liq) = liquidation {
+        if (short && stop >= liq) || (!short && stop <= liq) {
+            return None;
+        }
+    }
+    // The target is re-derived from the fill, as the live executor does.
+    let target = if short {
+        entry_price - REWARD_RISK * risk
+    } else {
+        entry_price + REWARD_RISK * risk
+    };
+    Some(OpenTrade {
+        short,
+        entry_time: bar.close_time,
+        entry_price,
+        stop,
+        target,
+        notional: (risk_per_trade / stop_pct).min(MAX_NOTIONAL_FRACTION * venue.leverage),
+        extreme: entry_price,
+        atr_at_entry: atr,
+        funding: 0.0,
+        liquidation,
+    })
+}
+
 /// Whether a resting stop or target fills inside `bar`, and at what price.
 ///
 /// A bar that touches both resolves as the stop, the conservative reading. A
-/// bar that opens through a level fills at the open: a stop then sells lower
-/// than its trigger, a target higher than its limit.
+/// bar that opens through a level fills at the open: a stop then fills worse
+/// than its trigger, a target better than its limit. A gap past the
+/// liquidation price fills there instead: the venue closes the position, and
+/// the margin is all that is lost.
 fn exit_on_bar(
     pos: &OpenTrade,
     bar: &Candle,
@@ -263,8 +540,18 @@ fn exit_on_bar(
 ) -> Option<(f64, bool)> {
     let stop = effective_stop(pos, params);
     let trailing = params.trailing_stop_atr > 0.0;
-    if bar.low <= stop {
-        Some((costs.sell_fill(stop.min(bar.open)), false))
+    if pos.short {
+        if bar.high >= stop {
+            let fill = costs.buy_fill(stop.max(bar.open));
+            Some((pos.liquidation.map_or(fill, |liq| fill.min(liq)), false))
+        } else if !trailing && bar.low <= pos.target {
+            Some((costs.limit_fill(pos.target.min(bar.open)), true))
+        } else {
+            None
+        }
+    } else if bar.low <= stop {
+        let fill = costs.sell_fill(stop.min(bar.open));
+        Some((pos.liquidation.map_or(fill, |liq| fill.max(liq)), false))
     } else if !trailing && bar.high >= pos.target {
         Some((costs.limit_fill(pos.target.max(bar.open)), true))
     } else {
@@ -273,13 +560,17 @@ fn exit_on_bar(
 }
 
 /// The stop as the live executor holds it: the chandelier trail when
-/// `TRAILING_STOP_ATR` is set, never below the initial stop.
+/// `TRAILING_STOP_ATR` is set, never looser than the initial stop.
 fn effective_stop(pos: &OpenTrade, params: &StrategyParams) -> f64 {
     if params.trailing_stop_atr <= 0.0 || !pos.atr_at_entry.is_finite() || pos.atr_at_entry <= 0.0 {
         return pos.stop;
     }
-    pos.stop
-        .max(pos.highest_high - params.trailing_stop_atr * pos.atr_at_entry)
+    let trail = params.trailing_stop_atr * pos.atr_at_entry;
+    if pos.short {
+        pos.stop.min(pos.extreme + trail)
+    } else {
+        pos.stop.max(pos.extreme - trail)
+    }
 }
 
 fn close(
@@ -291,7 +582,8 @@ fn close(
     split_time: u64,
     costs: &CostModel,
 ) -> LabTrade {
-    let gross = pos.notional * (exit_price / pos.entry_price - 1.0);
+    let moved = exit_price / pos.entry_price - 1.0;
+    let gross = pos.notional * if pos.short { -moved } else { moved };
     let exit_notional = pos.notional * exit_price / pos.entry_price;
     let fees = costs.taker_cost(pos.notional)
         + if resting {
@@ -301,8 +593,9 @@ fn close(
         };
     LabTrade {
         strategy,
+        short: pos.short,
         exit_time: bar.close_time,
-        ret: gross - fees,
+        ret: gross - fees - pos.funding,
         out_of_sample: pos.entry_time >= split_time,
     }
 }
@@ -395,11 +688,27 @@ fn recommend(rows: &[(StrategyKind, Stats, Stats)], live: StrategyKind) -> Optio
         .map(|r| r.0)
 }
 
+/// On futures there is no live strategy to beat: anything that clears every
+/// bar, longs and shorts together, is a candidate, best first.
+fn recommend_futures(rows: &[(StrategyKind, Stats, Stats)]) -> Option<StrategyKind> {
+    rows.iter()
+        .filter(|(_, is, oos)| {
+            oos.trades >= MIN_OOS_TRADES
+                && oos.profit_factor >= MIN_OOS_PROFIT_FACTOR
+                && oos.expectancy > 0.0
+                && is.trades >= MIN_OOS_TRADES
+                && is.expectancy > 0.0
+        })
+        .max_by(|a, b| a.2.expectancy.total_cmp(&b.2.expectancy))
+        .map(|r| r.0)
+}
+
 fn build_report(
     trades: &[LabTrade],
     live: StrategyKind,
     days: u64,
     config: &Config,
+    venue: Venue,
 ) -> serde_json::Value {
     let rows: Vec<(StrategyKind, Stats, Stats)> = StrategyKind::ALL
         .into_iter()
@@ -414,7 +723,11 @@ fn build_report(
         })
         .collect();
 
-    let recommendation = recommend(&rows, live);
+    let recommendation = if venue.futures {
+        recommend_futures(&rows).map(|kind| format!("futures:{}", kind.name()))
+    } else {
+        recommend(&rows, live).map(|kind| format!("switch:{}", kind.name()))
+    };
     let as_json = |s: &Stats| {
         json!({
             "trades": s.trades,
@@ -433,13 +746,24 @@ fn build_report(
                 .filter(|t| t.strategy == *kind && t.out_of_sample)
                 .map(|t| t.ret)
                 .collect();
-            json!({
+            let mut row = json!({
                 "name": kind.name(),
                 "live": *kind == live,
                 "in_sample": as_json(is),
                 "out_of_sample": as_json(oos),
                 "mc_p5_100_trades_pct": monte_carlo_p5(&oos_returns).map(|v| round(v * 100.0)),
-            })
+            });
+            if venue.futures {
+                let side = |short: bool| -> Vec<&LabTrade> {
+                    trades
+                        .iter()
+                        .filter(|t| t.strategy == *kind && t.out_of_sample && t.short == short)
+                        .collect()
+                };
+                row["out_of_sample_long"] = as_json(&stats(&side(false)));
+                row["out_of_sample_short"] = as_json(&stats(&side(true)));
+            }
+            row
         })
         .collect();
 
@@ -449,12 +773,11 @@ fn build_report(
         "signal_interval": config.signal_interval,
         "pairs": config.trading_pairs,
         "risk_per_trade_pct": round(config.risk_per_trade * 100.0),
+        "market": venue.name(),
+        "leverage": venue.leverage,
         "live": live.name(),
         "strategies": strategies,
-        "recommendation": match recommendation {
-            Some(kind) => format!("switch:{}", kind.name()),
-            None => "keep".to_string(),
-        },
+        "recommendation": recommendation.unwrap_or_else(|| "keep".to_string()),
     })
 }
 
@@ -472,12 +795,14 @@ struct GridRow {
 }
 
 /// Replay `trend_pullback` on every pair under each buffer pair, everything
-/// else (trailing stop, costs, risk) as configured.
+/// else (venue, trailing stop, costs, risk) as configured. On futures that is
+/// both sides together.
 fn buffer_grid(
-    feeds: &[(Vec<Candle>, Vec<Candle>)],
+    feeds: &[Feed],
     risk_per_trade: f64,
     costs: &CostModel,
     params: &StrategyParams,
+    venue: Venue,
 ) -> Vec<GridRow> {
     let mut rows = Vec::new();
     for exit in EXIT_BUFFERS_ATR {
@@ -489,13 +814,13 @@ fn buffer_grid(
             };
             let trades: Vec<LabTrade> = feeds
                 .iter()
-                .flat_map(|(trend, signal)| {
+                .flat_map(|feed| {
                     simulate(
-                        trend,
-                        signal,
+                        feed,
                         risk_per_trade,
                         costs,
                         &p,
+                        venue,
                         &[StrategyKind::TrendPullback],
                     )
                 })
@@ -603,6 +928,11 @@ fn print_buffer_grid(grid: &serde_json::Value) {
 }
 
 fn print_table(report: &serde_json::Value) {
+    info!(
+        "market: {} (leverage {})",
+        report["market"].as_str().unwrap_or("?"),
+        report["leverage"]
+    );
     info!("strategy          | OOS trades | win%  | exp%/trade | PF    | maxDD% | IS exp%");
     for s in report["strategies"].as_array().into_iter().flatten() {
         let oos = &s["out_of_sample"];
@@ -620,6 +950,21 @@ fn print_table(report: &serde_json::Value) {
             oos["max_drawdown_pct"],
             s["in_sample"]["expectancy_pct"],
         );
+        for (label, side) in [
+            ("  long", &s["out_of_sample_long"]),
+            ("  short", &s["out_of_sample_short"]),
+        ] {
+            if side.is_object() {
+                info!(
+                    "{label:<17} | {:>10} | {:>5} | {:>10} | {:>5} | {:>6} |",
+                    side["trades"],
+                    side["win_rate"],
+                    side["expectancy_pct"],
+                    side["profit_factor"],
+                    side["max_drawdown_pct"],
+                );
+            }
+        }
     }
     info!("recommendation: {}", report["recommendation"]);
 }
@@ -667,6 +1012,7 @@ mod tests {
     fn trade(strategy: StrategyKind, ret: f64, oos: bool, t: u64) -> LabTrade {
         LabTrade {
             strategy,
+            short: false,
             exit_time: t + 1,
             ret,
             out_of_sample: oos,
@@ -785,12 +1131,18 @@ mod tests {
                 }
             })
             .collect();
+        let warmup_end = signal[34].close_time;
+        let feed = Feed {
+            trend,
+            signal,
+            funding: Vec::new(),
+        };
         let trades = simulate(
-            &trend,
-            &signal,
+            &feed,
             0.10,
             &CostModel::default(),
             &StrategyParams::default(),
+            Venue::SPOT,
             &StrategyKind::ALL,
         );
         assert!(
@@ -798,22 +1150,265 @@ mod tests {
             "fixture must exercise the simulator"
         );
         for t in &trades {
-            assert!(t.exit_time > signal[34].close_time, "traded during warmup");
+            assert!(t.exit_time > warmup_end, "traded during warmup");
             assert!(t.ret.is_finite());
             assert!(t.ret.abs() < MAX_NOTIONAL_FRACTION);
+            assert!(!t.short, "spot never shorts");
         }
+    }
+
+    /// The mirror of the fixture above: a falling trend, and signal bars that
+    /// keep making new lows and bouncing.
+    fn falling_feed() -> Feed {
+        let trend: Vec<Candle> = (0..260)
+            .map(|i| candle(i * 14_400_000, 14_400_000, 200.0 - i as f64 * 0.1))
+            .collect();
+        let start = 210 * 14_400_000;
+        let signal: Vec<Candle> = (0..2_000)
+            .map(|i| {
+                let x = i as f64;
+                let close = 160.0 + 5.0 * (x * 0.03).sin() - x * 0.002;
+                Candle {
+                    high: close + 0.01,
+                    low: close - 0.01,
+                    ..candle(start + i * 900_000, 900_000, close)
+                }
+            })
+            .collect();
+        let funding = (0..200)
+            .map(|i| (start + i * FUNDING_INTERVAL_MS, 0.0001))
+            .collect();
+        Feed {
+            trend,
+            signal,
+            funding,
+        }
+    }
+
+    fn futures(leverage: f64) -> Venue {
+        Venue {
+            futures: true,
+            leverage,
+        }
+    }
+
+    #[test]
+    fn futures_short_a_falling_market_and_spot_does_not() {
+        let feed = falling_feed();
+        let run = |venue| {
+            simulate(
+                &feed,
+                0.10,
+                &CostModel::futures_from_env(),
+                &StrategyParams::default(),
+                venue,
+                &StrategyKind::ALL,
+            )
+        };
+        let shorts: Vec<LabTrade> = run(futures(3.0)).into_iter().filter(|t| t.short).collect();
+        assert!(
+            shorts.iter().any(|t| t.strategy == StrategyKind::Breakout),
+            "fixture must exercise the short side"
+        );
+        assert!(shorts.iter().all(|t| t.ret.is_finite()));
+        assert!(run(Venue::SPOT).iter().all(|t| !t.short));
+    }
+
+    #[test]
+    fn longs_pay_positive_funding_and_shorts_receive_it() {
+        let mut open = vec![
+            Some(open_trade()),
+            Some(OpenTrade {
+                short: true,
+                ..open_trade()
+            }),
+            None,
+        ];
+        // 0.01% on half of equity, marked 10% higher: 0.0055% of equity.
+        accrue_funding(&mut open, 0.0001, 110.0);
+        let paid = |i: usize| open[i].map(|p| p.funding).unwrap();
+        assert!((paid(0) - 0.000_055).abs() < 1e-12);
+        assert!((paid(1) + 0.000_055).abs() < 1e-12);
+
+        let bar = range(100.0, 99.0, 101.0);
+        let free = CostModel::frictionless();
+        let pos = open[0].unwrap();
+        let t = close(StrategyKind::Breakout, &pos, 100.0, false, &bar, 0, &free);
+        assert!(
+            (t.ret + 0.000_055).abs() < 1e-12,
+            "funding comes off the return"
+        );
+    }
+
+    #[test]
+    fn missing_recent_funding_is_estimated_from_the_latest_rates() {
+        let mut funding = vec![(0, 0.0001), (FUNDING_INTERVAL_MS, 0.0003)];
+        extend_funding(&mut funding, 3 * FUNDING_INTERVAL_MS + 5);
+        assert_eq!(funding.len(), 4);
+        for (i, (t, rate)) in funding[2..].iter().enumerate() {
+            assert_eq!(*t, (i as u64 + 2) * FUNDING_INTERVAL_MS);
+            assert!((rate - 0.0002).abs() < 1e-12);
+        }
+
+        let mut none: Vec<(u64, f64)> = Vec::new();
+        extend_funding(&mut none, FUNDING_INTERVAL_MS * 10);
+        assert!(none.is_empty(), "nothing to estimate from");
+    }
+
+    #[test]
+    fn leverage_caps_notional_and_sets_the_liquidation_price() {
+        let bar = range(100.0, 99.0, 101.0);
+        // A 0.5% stop at 1% risk wants 2x equity: spot caps at 0.95, 3x at 2.85.
+        let spot = open_position(false, 100.0, 99.5, 1.0, &bar, 0.01, Venue::SPOT).unwrap();
+        assert!((spot.notional - 0.95).abs() < 1e-12);
+        assert_eq!(spot.liquidation, None);
+        let lev = open_position(false, 100.0, 99.5, 1.0, &bar, 0.01, futures(3.0)).unwrap();
+        assert!((lev.notional - 2.0).abs() < 1e-12);
+        // 1/3 away less maintenance margin.
+        let liq = lev.liquidation.unwrap();
+        assert!((liq - 100.0 * (1.0 - 1.0 / 3.0 + MAINT_MARGIN)).abs() < 1e-9);
+
+        let short = open_position(true, 100.0, 102.0, 1.0, &bar, 0.01, futures(3.0)).unwrap();
+        assert!((short.target - 96.0).abs() < 1e-12, "2R below a short");
+        assert!(short.liquidation.unwrap() > 102.0);
+    }
+
+    #[test]
+    fn a_stop_beyond_liquidation_is_not_taken() {
+        let bar = range(100.0, 99.0, 101.0);
+        // At 3x a long liquidates near 67: a stop at 60 would never be reached.
+        assert!(open_position(false, 100.0, 60.0, 1.0, &bar, 0.01, futures(3.0)).is_none());
+        assert!(open_position(true, 100.0, 140.0, 1.0, &bar, 0.01, futures(3.0)).is_none());
+        // Wrong-side stops are rejected on either side.
+        assert!(open_position(true, 100.0, 99.0, 1.0, &bar, 0.01, futures(3.0)).is_none());
+        assert!(open_position(false, 100.0, 60.0, 1.0, &bar, 0.01, Venue::SPOT).is_some());
     }
 
     fn open_trade() -> OpenTrade {
         OpenTrade {
+            short: false,
             entry_time: 0,
             entry_price: 100.0,
             stop: 95.0,
             target: 110.0,
             notional: 0.5,
-            highest_high: 100.0,
+            extreme: 100.0,
             atr_at_entry: 2.0,
+            funding: 0.0,
+            liquidation: None,
         }
+    }
+
+    fn open_short() -> OpenTrade {
+        OpenTrade {
+            short: true,
+            stop: 105.0,
+            target: 90.0,
+            ..open_trade()
+        }
+    }
+
+    #[test]
+    fn a_short_stops_above_and_takes_profit_below() {
+        let free = CostModel::frictionless();
+        let p = StrategyParams::default();
+        let short = open_short();
+        // Touches both: the stop wins.
+        assert_eq!(
+            exit_on_bar(&short, &range(100.0, 89.0, 106.0), &p, &free),
+            Some((105.0, false))
+        );
+        // Gaps up through the stop: fills at the open.
+        assert_eq!(
+            exit_on_bar(&short, &range(108.0, 107.0, 109.0), &p, &free),
+            Some((108.0, false))
+        );
+        // Target is a resting order.
+        assert_eq!(
+            exit_on_bar(&short, &range(95.0, 89.5, 96.0), &p, &free),
+            Some((90.0, true))
+        );
+        assert_eq!(
+            exit_on_bar(&short, &range(100.0, 95.0, 104.0), &p, &free),
+            None
+        );
+    }
+
+    #[test]
+    fn a_short_trails_down_from_its_lowest_low() {
+        let free = CostModel::frictionless();
+        let params = StrategyParams {
+            trailing_stop_atr: 2.0,
+            ..Default::default()
+        };
+        let mut short = open_short();
+        short.extreme = 92.0;
+        // Stop trails to 92 + 4 = 96.
+        assert_eq!(
+            exit_on_bar(&short, &range(95.0, 94.0, 96.5), &params, &free),
+            Some((96.0, false))
+        );
+    }
+
+    #[test]
+    fn a_gap_past_liquidation_loses_only_the_margin() {
+        let free = CostModel::frictionless();
+        let p = StrategyParams::default();
+        let long = OpenTrade {
+            liquidation: Some(70.0),
+            ..open_trade()
+        };
+        assert_eq!(
+            exit_on_bar(&long, &range(60.0, 55.0, 61.0), &p, &free),
+            Some((70.0, false))
+        );
+        let short = OpenTrade {
+            liquidation: Some(130.0),
+            ..open_short()
+        };
+        assert_eq!(
+            exit_on_bar(&short, &range(140.0, 139.0, 141.0), &p, &free),
+            Some((130.0, false))
+        );
+    }
+
+    #[test]
+    fn a_short_profits_when_price_falls() {
+        let bar = range(90.0, 89.0, 91.0);
+        let t = close(
+            StrategyKind::Breakout,
+            &open_short(),
+            90.0,
+            true,
+            &bar,
+            0,
+            &CostModel::frictionless(),
+        );
+        // Half of equity short, price -10%: +5%.
+        assert!((t.ret - 0.05).abs() < 1e-12);
+        assert!(t.short);
+    }
+
+    #[test]
+    fn futures_recommend_anything_that_clears_every_bar() {
+        let good = Stats {
+            trades: 40,
+            expectancy: 0.003,
+            profit_factor: 1.3,
+            ..Default::default()
+        };
+        let losing = Stats {
+            expectancy: -0.001,
+            profit_factor: 0.8,
+            ..good
+        };
+        let rows = [
+            (StrategyKind::TrendPullback, good, good),
+            (StrategyKind::Breakout, losing, losing),
+        ];
+        // The live strategy itself qualifies: on futures nothing runs yet.
+        assert_eq!(recommend_futures(&rows), Some(StrategyKind::TrendPullback));
+        assert_eq!(recommend_futures(&rows[1..]), None);
     }
 
     fn range(open: f64, low: f64, high: f64) -> Candle {
@@ -866,7 +1461,7 @@ mod tests {
             None
         );
         // After the high reaches 112 the stop trails to 108.
-        pos.highest_high = 112.0;
+        pos.extreme = 112.0;
         let hit = exit_on_bar(&pos, &range(109.0, 107.0, 109.5), &params, &free);
         assert_eq!(hit, Some((108.0, false)));
     }
@@ -956,7 +1551,13 @@ mod tests {
 
     #[test]
     fn the_grid_covers_every_buffer_pair() {
-        let rows = buffer_grid(&[], 0.01, &CostModel::default(), &StrategyParams::default());
+        let rows = buffer_grid(
+            &[],
+            0.01,
+            &CostModel::default(),
+            &StrategyParams::default(),
+            Venue::SPOT,
+        );
         assert_eq!(rows.len(), EXIT_BUFFERS_ATR.len() * ENTRY_BUFFERS_ATR.len());
         assert!(rows.iter().all(|r| r.out_of_sample.trades == 0));
         let json = buffer_grid_json(&rows, &StrategyParams::default());

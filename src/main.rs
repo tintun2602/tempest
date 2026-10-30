@@ -1,3 +1,4 @@
+mod archive;
 mod backtest;
 mod config;
 mod costs;

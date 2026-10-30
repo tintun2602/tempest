@@ -121,6 +121,26 @@ For example:
 MODE=lab TRADING_PAIRS=BTCUSDC QUOTE_ASSET=USDC TREND_INTERVAL=4h SIGNAL_INTERVAL=15m LAB_DAYS=730 cargo run
 ```
 
+### Futures (research only)
+
+```bash
+MODE=lab LAB_MARKET=futures LEVERAGE=3 TRADING_PAIRS=BTCUSDC QUOTE_ASSET=USDC TREND_INTERVAL=4h SIGNAL_INTERVAL=15m LAB_DAYS=730 cargo run
+```
+
+Replays Binance USDⓈ-M perpetuals instead of spot. Candles and funding rates
+come from Binance's public archive (`data.binance.vision`), which answers even
+where the futures API refuses service; the last day or two is not archived yet,
+and the current month's funding is estimated from the latest rates. Each
+strategy also trades a short-side mirror of its rules. Positions are sized from
+the stop as on spot, capped at 95% of equity times `LEVERAGE` (1-3, default 3),
+pay or receive funding every 8 hours, pay futures fees (0.05% taker, 0.02%
+maker unless `TAKER_FEE_BPS`/`MAKER_FEE_BPS` say otherwise), and are skipped
+when the stop lies beyond the isolated-margin liquidation price. The table
+splits each strategy's out-of-sample record into longs and shorts, and the
+`recommendation` reads `futures:<strategy>` only when a strategy clears the
+same out-of-sample bars on both sides together. The live bot still trades spot
+only.
+
 The live loop trades `STRATEGY` if set, otherwise `LIVE_STRATEGY` in
 `src/strategies.rs`. Switching strategies is a reviewed pull request that
 changes that constant.

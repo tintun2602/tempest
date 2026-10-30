@@ -194,6 +194,14 @@ pub fn find_nearest_swing_low(lows: &[f64], window: usize, below: f64) -> Option
         })
 }
 
+/// Mirror of [`find_nearest_swing_low`]: the most recent confirmed swing high
+/// *above* `above`, else the maximum of the last 20 candles. The stop for a
+/// short.
+pub fn find_nearest_swing_high(highs: &[f64], window: usize, above: f64) -> Option<f64> {
+    let negated: Vec<f64> = highs.iter().map(|h| -h).collect();
+    find_nearest_swing_low(&negated, window, -above).map(|v| -v)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -310,6 +318,16 @@ mod tests {
         assert_eq!(result.macd_line.len(), 100);
         assert_eq!(result.signal_line.len(), 100);
         assert_eq!(result.histogram.len(), 100);
+    }
+
+    #[test]
+    fn swing_high_mirrors_swing_low() {
+        let highs = [10.0, 11.0, 15.0, 12.0, 11.0, 13.0, 12.0, 11.0, 10.5];
+        // Pivots at 15 and 13: the most recent one above price wins.
+        assert_eq!(find_nearest_swing_high(&highs, 2, 12.0), Some(13.0));
+        assert_eq!(find_nearest_swing_high(&highs, 2, 14.0), Some(15.0));
+        // Nothing confirmed above 20: fall back to the 20-bar max.
+        assert_eq!(find_nearest_swing_high(&highs, 2, 20.0), Some(15.0));
     }
 
     #[test]

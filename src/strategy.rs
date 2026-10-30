@@ -43,6 +43,10 @@ pub struct IndicatorSnapshot {
     pub macd_crossed_bullish_recently: bool,
     pub current_price: f64,
     pub swing_low: f64,
+    /// Short-side mirrors of the two fields above, read only by the lab's
+    /// futures mode.
+    pub macd_crossed_bearish_recently: bool,
+    pub swing_high: f64,
     /// Daily ATR(14) — "normal" movement in price units, used to size the
     /// signal buffer so a threshold is neither too tight for a volatile asset
     /// nor too loose for a calm one.
@@ -176,6 +180,15 @@ pub fn compute_indicators(
         }
         prev_m <= prev_s && macd_line > macd_signal
     });
+    let macd_crossed_bearish_recently = (1..=3.min(n - 1)).any(|offset| {
+        let i = n - 1 - offset;
+        let prev_m = macd_result.macd_line[i];
+        let prev_s = macd_result.signal_line[i];
+        if prev_m.is_nan() || prev_s.is_nan() {
+            return false;
+        }
+        prev_m >= prev_s && macd_line < macd_signal
+    });
 
     // --- Swing low for stop-loss ---
     let swing_low = indicators::find_nearest_swing_low(&daily_lows, 3, current_price)
@@ -201,6 +214,16 @@ pub fn compute_indicators(
         "indicators computed"
     );
 
+    let swing_high = indicators::find_nearest_swing_high(&daily_highs, 3, current_price)
+        .unwrap_or_else(|| {
+            daily_highs
+                .iter()
+                .rev()
+                .take(20)
+                .copied()
+                .fold(f64::MIN, f64::max)
+        });
+
     // A missing ATR is not fatal: buffers simply fall back to the bare EMA50.
     let atr_14 = indicators::atr(&daily_highs, &daily_lows, &daily_closes, 14)
         .last()
@@ -218,6 +241,8 @@ pub fn compute_indicators(
         macd_crossed_bullish_recently,
         current_price,
         swing_low,
+        macd_crossed_bearish_recently,
+        swing_high,
     })
 }
 
@@ -277,6 +302,47 @@ impl EntryConditions {
             ("MACD   bullish cross <=3 bars", self.macd_crossed),
             ("Stop   swing low below price", self.stop_valid),
         ]
+    }
+}
+
+/// A short-side decision. Only the lab's futures mode asks for one: the live
+/// bot trades spot and cannot short.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShortDecision {
+    /// Open a short with its protective stop above price.
+    Enter { stop_loss: f64 },
+    /// Close an open short.
+    Cover,
+    Hold,
+}
+
+/// `trend_pullback` mirrored for a short: price below EMA50 below EMA200,
+/// trend RSI in 45-65 (a bounce inside a downtrend), and a bearish MACD cross
+/// within 3 signal bars. Stop at the nearest swing high, target at 2R.
+/// Covered once price clears EMA50 (plus the exit buffer), or on an oversold
+/// reversal: RSI under 30 with the MACD histogram turning positive.
+pub fn evaluate_short(snap: &IndicatorSnapshot, params: &StrategyParams) -> ShortDecision {
+    let atr = usable_atr(snap);
+    let price = snap.current_price;
+    let trend_bearish =
+        price < snap.ema_50 - params.entry_buffer_atr * atr && snap.ema_50 < snap.ema_200;
+    let rsi_ok = (45.0..=65.0).contains(&snap.rsi_14);
+    if trend_bearish
+        && rsi_ok
+        && snap.macd_crossed_bearish_recently
+        && snap.swing_high > price
+        && snap.swing_high.is_finite()
+    {
+        return ShortDecision::Enter {
+            stop_loss: snap.swing_high,
+        };
+    }
+    let trend_break = price > snap.ema_50 + params.exit_buffer_atr * atr;
+    let oversold_reversal = snap.rsi_14 < 30.0 && snap.macd_histogram > 0.0;
+    if trend_break || oversold_reversal {
+        ShortDecision::Cover
+    } else {
+        ShortDecision::Hold
     }
 }
 
@@ -441,8 +507,85 @@ mod tests {
             macd_crossed_bullish_recently: true,
             current_price: 62_000.0,
             swing_low: 59_000.0,
+            macd_crossed_bearish_recently: false,
+            swing_high: 64_000.0,
             atr_14: 1_000.0,
         }
+    }
+
+    /// A snapshot that satisfies every short entry condition.
+    fn qualifying_short() -> IndicatorSnapshot {
+        IndicatorSnapshot {
+            ema_50: 60_000.0,
+            ema_200: 65_000.0,
+            rsi_14: 55.0,
+            macd_line: -10.0,
+            macd_signal: -5.0,
+            macd_histogram: -5.0,
+            macd_crossed_bullish_recently: false,
+            current_price: 58_000.0,
+            swing_low: 55_000.0,
+            macd_crossed_bearish_recently: true,
+            swing_high: 61_000.0,
+            atr_14: 1_000.0,
+        }
+    }
+
+    #[test]
+    fn a_downtrend_bounce_with_a_bearish_cross_opens_a_short() {
+        assert_eq!(
+            evaluate_short(&qualifying_short(), &bare()),
+            ShortDecision::Enter {
+                stop_loss: 61_000.0
+            }
+        );
+    }
+
+    #[test]
+    fn no_short_in_an_uptrend_or_without_a_stop() {
+        let mut up = qualifying_short();
+        up.ema_200 = 55_000.0;
+        assert!(!matches!(
+            evaluate_short(&up, &bare()),
+            ShortDecision::Enter { .. }
+        ));
+        let mut no_stop = qualifying_short();
+        no_stop.swing_high = no_stop.current_price - 1.0;
+        assert!(!matches!(
+            evaluate_short(&no_stop, &bare()),
+            ShortDecision::Enter { .. }
+        ));
+    }
+
+    #[test]
+    fn a_short_is_covered_above_ema50_unless_the_buffer_holds() {
+        let mut s = qualifying_short();
+        s.macd_crossed_bearish_recently = false;
+        s.current_price = 60_400.0;
+        assert_eq!(evaluate_short(&s, &bare()), ShortDecision::Cover);
+        let buffered = StrategyParams {
+            exit_buffer_atr: 0.5,
+            ..bare()
+        };
+        assert_eq!(evaluate_short(&s, &buffered), ShortDecision::Hold);
+    }
+
+    #[test]
+    fn a_short_entry_buffer_rejects_a_marginal_break() {
+        let mut s = qualifying_short();
+        s.current_price = 59_800.0;
+        let buffered = StrategyParams {
+            entry_buffer_atr: 0.5,
+            ..bare()
+        };
+        assert!(matches!(
+            evaluate_short(&s, &bare()),
+            ShortDecision::Enter { .. }
+        ));
+        assert!(!matches!(
+            evaluate_short(&s, &buffered),
+            ShortDecision::Enter { .. }
+        ));
     }
 
     /// The original behaviour: entry and exit both sit exactly on EMA50.

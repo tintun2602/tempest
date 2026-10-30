@@ -13,5 +13,8 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
+zip = { version = "~2.2", default-features = false, features = ["deflate-flate2", "flate2"] }
+# zip's deflate decoder, in pure Rust.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
