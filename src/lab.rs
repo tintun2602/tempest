@@ -366,6 +366,7 @@ fn simulate(
         for (k, slot) in open.iter_mut().enumerate() {
             let Some(pos) = slot.as_mut() else { continue };
             if let Some((price, resting)) = exit_on_bar(pos, bar, params, costs) {
+                let (price, resting) = venue_fill(pos, price, resting, venue, costs);
                 trades.push(close(kinds[k], pos, price, resting, bar, split_time, costs));
                 *slot = None;
             } else if pos.short {
@@ -558,6 +559,26 @@ fn exit_on_bar(
     } else {
         None
     }
+}
+
+/// Live futures targets are `TAKE_PROFIT_MARKET` orders: they fill as takers
+/// with slippage, not as the resting limit the spot OCO uses.
+fn venue_fill(
+    pos: &OpenTrade,
+    price: f64,
+    resting: bool,
+    venue: Venue,
+    costs: &CostModel,
+) -> (f64, bool) {
+    if !(venue.futures && resting) {
+        return (price, resting);
+    }
+    let fill = if pos.short {
+        costs.buy_fill(price)
+    } else {
+        costs.sell_fill(price)
+    };
+    (fill, false)
 }
 
 /// The stop as the live executor holds it: the chandelier trail when
@@ -1191,6 +1212,27 @@ mod tests {
             futures: true,
             leverage,
         }
+    }
+
+    #[test]
+    fn futures_targets_pay_taker_and_slippage() {
+        let costs = CostModel::futures_from_env();
+        let long = open_trade();
+        // Spot: the OCO target rests and fills at its limit as a maker.
+        assert_eq!(
+            venue_fill(&long, 110.0, true, Venue::SPOT, &costs),
+            (110.0, true)
+        );
+        // Futures: a market fill below the trigger for a long, above for a short.
+        let (fill, resting) = venue_fill(&long, 110.0, true, futures(3.0), &costs);
+        assert!(!resting && fill < 110.0);
+        let (fill, _) = venue_fill(&open_short(), 90.0, true, futures(3.0), &costs);
+        assert!(fill > 90.0);
+        // Stops were already priced as takers and are left alone.
+        assert_eq!(
+            venue_fill(&long, 95.0, false, futures(3.0), &costs),
+            (95.0, false)
+        );
     }
 
     #[test]
