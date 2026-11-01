@@ -280,7 +280,7 @@ async fn load_futures(
     signal_bars: usize,
     signal_ms: u64,
 ) -> Result<Feed, String> {
-    let end = now_ms();
+    let end = lab_end_ms(now_ms());
     let trend_start = end.saturating_sub(trend_bars as u64 * trend_ms);
     let signal_start = end.saturating_sub(signal_bars as u64 * signal_ms);
     let trend =
@@ -309,6 +309,17 @@ async fn load_futures(
 }
 
 /// Drop candles still forming: the lab only trades bars that have closed.
+/// Where the replayed history ends: `LAB_END_DAYS_AGO` days before `now`
+/// (futures only), so a rule can be checked on a period it was never tuned
+/// on. Defaults to now.
+fn lab_end_ms(now: u64) -> u64 {
+    let days_ago = std::env::var("LAB_END_DAYS_AGO")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    now.saturating_sub(days_ago * 86_400_000)
+}
+
 fn closed_only(mut feed: Feed) -> Feed {
     let now = now_ms();
     feed.trend.retain(|c| c.close_time <= now);

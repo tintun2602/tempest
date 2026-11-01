@@ -135,7 +135,9 @@ strategy also trades a short-side mirror of its rules. Positions are sized from
 the stop as on spot, capped at 95% of equity times `LEVERAGE` (1-5, default 3),
 pay or receive funding every 8 hours, pay futures fees (0.05% taker, 0.02%
 maker unless `TAKER_FEE_BPS`/`MAKER_FEE_BPS` say otherwise), and are skipped
-when the stop lies beyond the isolated-margin liquidation price. The table
+when the stop lies beyond the isolated-margin liquidation price. `LAB_END_DAYS_AGO=N`
+ends the replay N days in the past, to check a rule on a period it was never
+tuned on (USDT perpetuals reach back to 2019-2020). The table
 splits each strategy's out-of-sample record into longs and shorts, and the
 `recommendation` reads `futures:<strategy>` only when a strategy clears the
 same out-of-sample bars on both sides together.
