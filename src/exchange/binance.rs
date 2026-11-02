@@ -426,9 +426,12 @@ impl ExecutionProvider for BinanceClient {
 
 /// Binance reports failures as `{"code": -1013, "msg": "..."}` with an HTTP 200
 /// in some paths, so the body must be inspected rather than the status alone.
+/// Binance error codes are negative. Some successful calls also carry a
+/// `code`: futures "cancel all open orders" answers `{"code":200,"msg":"The
+/// operation of cancel all open order is done."}`.
 pub(super) fn check_api_error(resp: &serde_json::Value) -> Result<(), String> {
     match resp.get("code").and_then(serde_json::Value::as_i64) {
-        Some(code) if code != 0 => {
+        Some(code) if code < 0 => {
             let msg = resp["msg"].as_str().unwrap_or("unknown error");
             Err(format!("Binance API error {code}: {msg}"))
         }
@@ -861,6 +864,13 @@ mod tests {
     fn api_error_body_is_detected() {
         let err = check_api_error(&json!({"code": -1013, "msg": "Filter failure: MIN_NOTIONAL"}));
         assert!(err.unwrap_err().contains("MIN_NOTIONAL"));
+    }
+
+    #[test]
+    fn a_success_code_is_not_an_error() {
+        let done = json!({"code": 200, "msg": "The operation of cancel all open order is done."});
+        assert!(check_api_error(&done).is_ok());
+        assert!(check_api_error(&json!({"code": -1003, "msg": "Too many requests"})).is_err());
     }
 
     #[test]
