@@ -1,0 +1,27 @@
+# Tempest on a single server: the futures bot always on, the lab run by cron.
+# Secrets live in /etc/tempest/*.env on the server, never in this repo.
+name: tempest
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  bot:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: tempest:latest
+    env_file: /etc/tempest/bot.env
+    restart: unless-stopped
+    logging: *logging
+
+  # Not started by `up`; cron runs it with `docker compose run --rm lab`.
+  lab:
+    image: tempest:latest
+    env_file: /etc/tempest/lab.env
+    profiles: ["lab"]
+    restart: "no"
+    logging: *logging

@@ -215,6 +215,13 @@ still runs on unadjusted equity.
 
 ## Deployment
 
+### Hetzner (own IP)
+
+The recommended home: a small VPS with an IP nobody else uses, so other
+tenants' traffic cannot get the bot rate-limited or banned by Binance. Setup,
+switch-over from Railway and day-to-day commands are in
+[`deploy/hetzner/README.md`](deploy/hetzner/README.md).
+
 ### Docker
 
 ```bash
