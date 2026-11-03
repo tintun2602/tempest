@@ -193,16 +193,20 @@ pub async fn run(config: &Config) {
 /// (`-1003`, or HTTP 418/429 bans): until a reported ban ends, otherwise one
 /// poll. `None` for any other error.
 fn rate_limit_wait_ms(error: &str, now: u64, poll_ms: u64) -> Option<u64> {
-    let limited = error.contains("error -1003")
-        || error.contains("\"code\":-1003")
-        || error.contains("banned until");
-    if !limited {
+    if !is_rate_limited(error) {
         return None;
     }
     Some(match crate::banned_until_ms(error) {
         Some(until) if until > now => crate::ban_wait_ms(until, now, poll_ms),
         _ => poll_ms,
     })
+}
+
+/// Binance is rate-limiting or has banned this IP.
+fn is_rate_limited(error: &str) -> bool {
+    error.contains("error -1003")
+        || error.contains("\"code\":-1003")
+        || error.contains("banned until")
 }
 
 /// Run `call` until it succeeds, waiting `delays` between attempts; the last
@@ -324,6 +328,10 @@ async fn run_cycle<E: FuturesExchange>(
             }
             Ok(Traded::Closed) => traded = true,
             Ok(Traded::Nothing) => {}
+            // A rate limit hits every pair alike: stop the cycle and let
+            // the loop's back-off handle it, rather than spend more
+            // requests and send one alert per pair.
+            Err(e) if is_rate_limited(&e) => return Err(e),
             Err(e) => {
                 error!("{symbol}: {e}");
                 notifier.notify_error(symbol, &e).await;
@@ -789,6 +797,8 @@ mod tests {
         stop_rejects: bool,
         /// Stop attempts rejected before one goes through.
         stop_failures: Mutex<u32>,
+        /// When set, every klines request fails with this error.
+        klines_error: Option<String>,
         hedge: bool,
     }
 
@@ -802,7 +812,11 @@ mod tests {
     }
 
     impl FuturesExchange for Fake {
-        async fn klines(&self, _: &str, _: &str, _: u32) -> Result<Vec<Candle>, String> {
+        async fn klines(&self, symbol: &str, _: &str, _: u32) -> Result<Vec<Candle>, String> {
+            self.push(format!("klines {symbol}"));
+            if let Some(e) = &self.klines_error {
+                return Err(e.clone());
+            }
             Ok(vec![Candle {
                 open_time: 0,
                 open: 2_000.0,
@@ -1114,6 +1128,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_rate_limit_ends_the_cycle_instead_of_trying_every_pair() {
+        let ex = Fake {
+            klines_error: Some("Binance API error -1003: Too many requests".into()),
+            ..Default::default()
+        };
+        let mut config = test_config();
+        config.trading_pairs = vec!["ETHUSDC".into(), "SOLUSDC".into(), "BTCUSDC".into()];
+        let mut risk = RiskManager::with_risk_per_trade(100.0, 0.02);
+        let err = run_cycle(
+            &ex,
+            &config,
+            3,
+            &mut risk,
+            &quiet(),
+            &StrategyParams::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(is_rate_limited(&err), "{err}");
+        assert!(
+            ex.log().iter().all(|l| !l.contains("SOLUSDC")),
+            "stopped at the first pair: {:?}",
+            ex.log()
+        );
+    }
+
     #[test]
     fn rate_limits_pause_and_other_errors_do_not() {
         let poll = 900_000;
@@ -1230,7 +1271,7 @@ mod tests {
         };
         let (equity, report) = startup(&ex, &config, &settings).await.unwrap();
         assert_eq!(equity, 100.0);
-        assert_eq!(ex.log(), vec!["leverage 3"]);
+        assert_eq!(ex.log(), vec!["leverage 3", "klines ETHUSDC"]);
         assert!(
             report.contains("*ETHUSDC*: smallest order `20.00`"),
             "{report}"
