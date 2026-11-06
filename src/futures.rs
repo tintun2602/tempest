@@ -130,7 +130,11 @@ pub async fn run(config: &Config) {
                 if e == HEDGE_MODE_REFUSAL {
                     return;
                 }
-                sleep(poll).await;
+                // During an IP ban every request can extend it: wait until it
+                // lifts rather than retrying each poll.
+                let wait = rate_limit_wait_ms(&e, now_ms(), poll.as_millis() as u64)
+                    .map_or(poll, Duration::from_millis);
+                sleep(wait).await;
             }
         }
     };
