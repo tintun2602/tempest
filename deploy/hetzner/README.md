@@ -108,6 +108,23 @@ changes over time (cron jobs and the like) lives in the repo and reaches the
 server by pushing to master. Secrets stay in `/etc/tempest` and are changed on
 the server itself.
 
+## Status reports (server → GitHub)
+
+`status/report.sh` pushes `status.md` to the private repo
+[tintun2602/diablo](https://github.com/tintun2602/diablo) every hour and a
+minute after every deploy: bot state, deployed commit, trades and errors
+from the bot's log, and the settings without keys, secrets or tokens (and
+anything key-shaped is blanked). It needs a deploy key once:
+
+```bash
+ssh-keygen -t ed25519 -N "" -C "tempest-server -> diablo" -f /root/.ssh/diablo_deploy
+cat /root/.ssh/diablo_deploy.pub
+```
+
+Add the printed line on GitHub: diablo → Settings → Deploy keys → Add deploy
+key, tick **Allow write access**. Then `/opt/tempest/deploy/hetzner/status/report.sh`
+(or wait for the hour). Log: `/var/log/tempest/status.log`.
+
 ## Day to day
 
 | Task | Command |
