@@ -15,7 +15,11 @@ services:
       context: ../..
       dockerfile: Dockerfile
     image: tempest:latest
-    env_file: /etc/tempest/bot.env
+    # bot.env holds secrets and the owner's risk settings; settings.env (in
+    # git) comes second, so its trading settings win.
+    env_file:
+      - /etc/tempest/bot.env
+      - settings.env
     restart: unless-stopped
     logging: *logging
 

@@ -32,12 +32,16 @@ asks.
 - Railway (the old host) is deleted. Its shared IP got the bot rate-limited
   and banned by Binance.
 
-## Live settings (in /etc/tempest/bot.env)
+## Live settings
 
-`MARKET=futures`, `STRATEGY=breakout`, `TREND_INTERVAL=1h`,
-`SIGNAL_INTERVAL=5m`, `POLL_INTERVAL_SECONDS=300`, `LEVERAGE=20`,
-`RISK_PER_TRADE_PCT=80`, `DAILY_DRAWDOWN_PCT=50`, ten pairs (ETH, BTC, SOL,
-XRP, BNB, DOGE, ADA, LINK, AVAX, LTC; all `…USDC`). Account ~75 USDC.
+In git, `deploy/hetzner/settings.env` (wins over bot.env; change by pushing):
+`TRADING_PAIRS=BTCUSDC,ETHUSDC,SOLUSDC`, `MAX_OPEN_POSITIONS=3`,
+`TREND_INTERVAL=1d`, `SIGNAL_INTERVAL=4h` (owner, 2026-11-07). Each position
+gets at most a third of the margin (equity / MAX_OPEN_POSITIONS).
+
+In `/etc/tempest/bot.env` on the server: `MARKET=futures`,
+`STRATEGY=breakout`, `POLL_INTERVAL_SECONDS=300`, `LEVERAGE=20`,
+`RISK_PER_TRADE_PCT=80`, `DAILY_DRAWDOWN_PCT=50`, secrets. Account ~75 USDC.
 Binance key `jmy1…` is IP-restricted to the server, futures on, withdrawals
 off.
 
@@ -55,8 +59,9 @@ off.
 
 Out of sample, only `breakout` on 1d trend / 4h signal across ten coins held
 up (+0.24%/trade, PF 1.45), and only in trending or falling markets; it lost
-in 2023-24. Everything on 15m or faster lost to fees. The owner chose 5m
-signals anyway, knowing fees take ~4% of the account per trade at this size.
+in 2023-24. Everything on 15m or faster lost to fees. The owner ran 5m
+signals for a while (fees took ~4% of the account per trade) and moved to
+1d/4h on 2026-11-07.
 
 ## Rules
 

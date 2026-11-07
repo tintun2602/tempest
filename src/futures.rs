@@ -429,6 +429,7 @@ async fn manage_symbol<E: FuturesExchange>(
         account.available,
         config.risk_per_trade,
         leverage,
+        config.max_open_positions,
         &filters,
     ) {
         Ok(plan) => plan,
@@ -517,7 +518,9 @@ struct EntryPlan {
 /// Size an entry at `price` with its stop at `stop`, or say why not.
 ///
 /// Risk is `risk_per_trade` of equity at the stop, capped by what the margin
-/// can carry at `leverage`. A size under the venue minimum is skipped rather
+/// can carry at `leverage`. That margin is one slot's share: equity split
+/// over `slots` (MAX_OPEN_POSITIONS), so the first signal cannot take it all
+/// and leave the next ones too small to trade. A size under the venue minimum is skipped rather
 /// than rounded up: rounding up would risk more than configured. So is a
 /// trade the venue would liquidate before its own stop.
 #[allow(clippy::too_many_arguments)]
@@ -529,6 +532,7 @@ fn plan_entry(
     available: f64,
     risk_per_trade: f64,
     leverage: u32,
+    slots: usize,
     filters: &SymbolFilters,
 ) -> Result<EntryPlan, String> {
     let distance = if short { stop - price } else { price - stop };
@@ -536,7 +540,8 @@ fn plan_entry(
         return Err(format!("stop {stop:.2} is on the wrong side of {price:.2}"));
     }
     let by_risk = equity * risk_per_trade / distance;
-    let by_margin = MAX_NOTIONAL_FRACTION * f64::from(leverage) * available / price;
+    let slot = available.min(equity / slots.max(1) as f64);
+    let by_margin = MAX_NOTIONAL_FRACTION * f64::from(leverage) * slot / price;
     let quantity = filters.round_quantity(by_risk.min(by_margin));
     if let Err(e) = filters.check_order(quantity, price) {
         return Err(format!(
@@ -943,14 +948,25 @@ mod tests {
     fn size_is_risk_at_the_stop_capped_by_margin() {
         let f = eth("ETHUSDC");
         // 1% of 100 at a 40 stop: 0.025 ETH (50 notional), under the cap.
-        let p = plan_entry(false, 2_000.0, 1_960.0, 100.0, 100.0, 0.01, 3, &f).unwrap();
+        let p = plan_entry(false, 2_000.0, 1_960.0, 100.0, 100.0, 0.01, 3, 1, &f).unwrap();
         assert!((p.quantity - 0.025).abs() < 1e-12);
         // 10% risk wants 0.25 ETH (500); 3x on 100 caps at 285 -> 0.142.
-        let p = plan_entry(false, 2_000.0, 1_960.0, 100.0, 100.0, 0.10, 3, &f).unwrap();
+        let p = plan_entry(false, 2_000.0, 1_960.0, 100.0, 100.0, 0.10, 3, 1, &f).unwrap();
         assert!((p.quantity - 0.142).abs() < 1e-12);
         // A short sizes the same from above.
-        let p = plan_entry(true, 2_000.0, 2_040.0, 100.0, 100.0, 0.01, 3, &f).unwrap();
+        let p = plan_entry(true, 2_000.0, 2_040.0, 100.0, 100.0, 0.01, 3, 1, &f).unwrap();
         assert!((p.quantity - 0.025).abs() < 1e-12);
+    }
+
+    #[test]
+    fn margin_is_split_over_the_position_slots() {
+        let f = eth("ETHUSDC");
+        // 75 of equity at 20x, three slots: 25 each, 475 notional.
+        let p = plan_entry(true, 2_000.0, 2_080.0, 75.0, 75.0, 0.8, 20, 3, &f).unwrap();
+        assert!((p.quantity - 0.237).abs() < 1e-12);
+        // With two slots in use, the last one gets what is left, never more.
+        let p = plan_entry(true, 2_000.0, 2_080.0, 75.0, 20.0, 0.8, 20, 3, &f).unwrap();
+        assert!((p.quantity - 0.19).abs() < 1e-12);
     }
 
     #[test]
@@ -969,8 +985,8 @@ mod tests {
         let f = eth("ETHUSDC");
         // 10% of 83 at a 2.5% stop wants 0.166 ETH (332 notional).
         // 3x on 83 caps at 236.55 -> 0.118; 5x allows 394 -> the full 0.166.
-        let at3 = plan_entry(false, 2_000.0, 1_950.0, 83.0, 83.0, 0.10, 3, &f).unwrap();
-        let at5 = plan_entry(false, 2_000.0, 1_950.0, 83.0, 83.0, 0.10, 5, &f).unwrap();
+        let at3 = plan_entry(false, 2_000.0, 1_950.0, 83.0, 83.0, 0.10, 3, 1, &f).unwrap();
+        let at5 = plan_entry(false, 2_000.0, 1_950.0, 83.0, 83.0, 0.10, 5, 1, &f).unwrap();
         assert!((at3.quantity - 0.118).abs() < 1e-12);
         assert!((at5.quantity - 0.166).abs() < 1e-12);
         // Same stop distance, so a stop-out at 5x still costs 10% of equity.
@@ -984,15 +1000,15 @@ mod tests {
             min_notional: 50.0,
             ..eth("BTCUSDC")
         };
-        let err = plan_entry(false, 78_000.0, 76_000.0, 23.32, 23.32, 0.10, 3, &btc).unwrap_err();
+        let err = plan_entry(false, 78_000.0, 76_000.0, 23.32, 23.32, 0.10, 3, 1, &btc).unwrap_err();
         assert!(err.contains("smallest order 78.00"), "{err}");
     }
 
     #[test]
     fn a_stop_on_the_wrong_side_is_refused() {
         let f = eth("ETHUSDC");
-        assert!(plan_entry(false, 2_000.0, 2_010.0, 100.0, 100.0, 0.01, 3, &f).is_err());
-        assert!(plan_entry(true, 2_000.0, 1_990.0, 100.0, 100.0, 0.01, 3, &f).is_err());
+        assert!(plan_entry(false, 2_000.0, 2_010.0, 100.0, 100.0, 0.01, 3, 1, &f).is_err());
+        assert!(plan_entry(true, 2_000.0, 1_990.0, 100.0, 100.0, 0.01, 3, 1, &f).is_err());
     }
 
     #[test]
@@ -1000,7 +1016,7 @@ mod tests {
         // 0.142 ETH on 100 of equity liquidates about 700 away, so a stop
         // 1,000 away is never reached.
         let f = eth("ETHUSDC");
-        let err = plan_entry(false, 2_000.0, 1_000.0, 100.0, 100.0, 1.0, 3, &f).unwrap_err();
+        let err = plan_entry(false, 2_000.0, 1_000.0, 100.0, 100.0, 1.0, 3, 1, &f).unwrap_err();
         assert!(err.contains("liquidation"), "{err}");
     }
 

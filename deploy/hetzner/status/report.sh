@@ -41,7 +41,8 @@ block() { echo '```'; cat; echo '```'; }
   } | block
   echo
   echo "## Settings (no keys, secrets or tokens)"
-  grep -v -E 'KEY|SECRET|TOKEN|^#|^$' /etc/tempest/bot.env 2>/dev/null | scrub | block
+  # As the bot sees them: the git settings.env wins over bot.env.
+  docker exec "$bot" env 2>/dev/null | grep -v -E 'KEY|SECRET|TOKEN|^PATH=|^HOSTNAME=|^HOME=' | sort | scrub | block
   echo
   echo "## Trades, exits, starts and problems, last 24 h"
   docker logs --since 24h "$bot" 2>&1 | scrub \

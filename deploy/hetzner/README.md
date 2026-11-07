@@ -132,7 +132,7 @@ key, tick **Allow write access**. Then `/opt/tempest/deploy/hetzner/status/repor
 | Bot logs | `docker compose -f /opt/tempest/deploy/hetzner/docker-compose.yml logs -f --tail 200 bot` |
 | FreqAI logs | `tail -f /var/lib/tempest/freqai/logs/freqtrade.log` |
 | Last deploys | `journalctl -u tempest-deploy --since today` |
-| Change a setting | edit `/etc/tempest/bot.env`, then `deploy.sh --force` |
+| Change a setting | pairs, max positions and intervals: `deploy/hetzner/settings.env` in git (push to master); the rest: edit `/etc/tempest/bot.env`, then `deploy.sh --force` |
 | Stop trading now | `docker compose -f /opt/tempest/deploy/hetzner/docker-compose.yml stop bot` (stops on Binance stay) |
 | Close everything | set `FORCE_CLOSE=true` in `bot.env`, `deploy.sh --force` |
 | Last lab report | `grep LAB_REPORT /var/log/tempest/lab-$(date +%F).log` |
