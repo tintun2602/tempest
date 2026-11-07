@@ -101,6 +101,21 @@ minutes). Telegram then gets Freqtrade's own messages, and `/status`,
 `docker compose -f /opt/tempest/deploy/hetzner/docker-compose.yml --profile freqai stop freqai`
 and remove the secrets file so deploys do not start it again.
 
+## Changing the server from git
+
+`deploy.sh` runs `apply.sh` on every deploy, so server-side setup that
+changes over time (cron jobs, the monitor) lives in the repo and reaches the
+server by pushing to master. Secrets stay in `/etc/tempest` and are changed on
+the server itself.
+
+## Uptime monitoring
+
+Every 5 minutes `monitor/check.sh` checks the sites in `monitor/urls.txt` and
+that the bot container is running, and tells Telegram when something goes
+down (two failed checks in a row) and when it is back. Nothing is sent while
+all is well. Add a site by adding a line to `urls.txt` and pushing. Log:
+`/var/log/tempest/monitor.log`.
+
 ## Day to day
 
 | Task | Command |
