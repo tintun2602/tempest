@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Push a status report to the private repo tintun2602/diablo: bot state, the
 # deployed commit, trades and errors from the bot's log, the non-secret
-# settings. Run hourly by cron and after every deploy (both from apply.sh).
+# settings, the latest nightly lab report. Run hourly by cron and after every deploy (both from apply.sh).
 # Does nothing until the deploy key /root/.ssh/diablo_deploy exists.
 set -uo pipefail
 key=/root/.ssh/diablo_deploy
@@ -47,6 +47,14 @@ block() { echo '```'; cat; echo '```'; }
   docker logs --since 24h "$bot" 2>&1 | scrub \
     | grep -E 'LONG|SHORT|closed|ERROR|WARN|started|Equity|New UTC|no stop|rate limit|banned' \
     | tail -80 | block
+  echo
+  echo "## Nightly lab (latest LAB_REPORT, run 01:17 UTC)"
+  lab=$(ls -1t /var/log/tempest/lab-*.log 2>/dev/null | head -1)
+  if [[ -n "$lab" ]]; then
+    { echo "log: $(basename "$lab")"; grep -h 'LAB_REPORT' "$lab" | tail -1; } | scrub | block
+  else
+    echo "No lab log yet."
+  fi
   echo
   echo "## Last 30 log lines"
   docker logs --tail 30 "$bot" 2>&1 | scrub | block

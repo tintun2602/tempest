@@ -1,5 +1,11 @@
 # Tempest
 
+Owner: **Naing ENK** (100 %). HQ and standing rules: `tintun2602/playbook`
+(`CLAUDE.md`, project register `PROJECTS.md`). In short: keep working and ask
+only for what needs a person; check state with a tool before reporting it;
+commits authored as Tintun <tintunn26@gmail.com> with no AI attribution or
+model names; secrets never in chat, logs or git.
+
 Rust trading bot for Binance USDⓈ-M futures (USDC perpetuals), long and
 short. The owner (Tintun) treats the account as fun money he has written
 off; risk settings are his call. Explain consequences once, then do what he
@@ -18,7 +24,8 @@ asks.
   `cargo clippy --all-targets` first.
 - **Status back:** the server pushes `status.md` (bot state, trades, errors,
   settings without secrets) to the private repo `tintun2602/diablo` hourly
-  and a minute after every deploy. Read it there; there is no other access
+  and a minute after every deploy, including the nightly lab's `LAB_REPORT`.
+  Read it there; there is no other access
   to the server from a cloud session.
 - **On the server itself** the owner runs Claude Code as root
   (`ssh tempest`, `cd /opt/tempest && claude`) for secrets and one-off fixes.
