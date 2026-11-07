@@ -7,6 +7,20 @@ cd /opt/tempest
 compose="docker compose -f deploy/hetzner/docker-compose.yml"
 stamp=/var/lib/tempest/deployed-commit
 
+# One deploy at a time: two at once (the timer and a run by hand) race to
+# recreate the bot container and one fails on the name. The lock stays held
+# across the re-exec below, since fd 9 is inherited. The timer skips a run
+# that finds it taken; a run by hand waits up to 10 minutes for it.
+if [[ -z "${TEMPEST_DEPLOY_LOCKED:-}" ]]; then
+  exec 9>/var/lib/tempest/deploy.lock
+  if [[ "${1:-}" == "--force" ]]; then
+    flock -w 600 9 || { echo "another deploy is still running" >&2; exit 1; }
+  else
+    flock -n 9 || exit 0
+  fi
+  export TEMPEST_DEPLOY_LOCKED=1
+fi
+
 git fetch --quiet origin master
 target=$(git rev-parse origin/master)
 deployed=$(cat "$stamp" 2>/dev/null || true)
