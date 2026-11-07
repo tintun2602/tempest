@@ -1,5 +1,0 @@
-# Sites checked every 5 minutes; Telegram hears when one goes down and when
-# it comes back. One per line: <name> <url>. Edit here and push: the server
-# picks it up on its next deploy.
-takstkompass https://takstkompass.no
-reisekrav https://www.reisekrav.no

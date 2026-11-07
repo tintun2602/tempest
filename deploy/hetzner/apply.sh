@@ -4,10 +4,7 @@
 # master instead of by hand. Must stay idempotent and quick. setup.sh remains
 # the one-time install; secrets stay in /etc/tempest, never here.
 set -euo pipefail
-here=/opt/tempest/deploy/hetzner
 
-# Uptime monitoring: sites in monitor/urls.txt and the bot container.
-chmod +x "$here/monitor/check.sh"
-cat > /etc/cron.d/tempest-monitor <<'CRON'
-*/5 * * * * root /opt/tempest/deploy/hetzner/monitor/check.sh >> /var/log/tempest/monitor.log 2>&1
-CRON
+# The uptime monitor was tried and dropped; remove its cron job if an
+# earlier deploy installed it.
+rm -f /etc/cron.d/tempest-monitor
