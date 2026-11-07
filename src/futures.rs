@@ -26,7 +26,11 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 const DEFAULT_LEVERAGE: u32 = 3;
-const MAX_LEVERAGE: u32 = 5;
+/// The owner's ceiling. Positions are still sized from RISK_PER_TRADE_PCT at
+/// the stop, so leverage only matters when that sizing asks for more, and an
+/// entry whose stop lies beyond the liquidation price is still skipped.
+/// Binance caps some pairs lower; set_leverage then fails with a warning.
+const MAX_LEVERAGE: u32 = 50;
 /// Largest share of available margin x leverage one entry may use.
 const MAX_NOTIONAL_FRACTION: f64 = 0.95;
 /// Maintenance margin rate for the pre-trade liquidation estimate. Binance's
@@ -65,7 +69,7 @@ pub struct FuturesSettings {
 }
 
 impl FuturesSettings {
-    /// `FUTURES_BASE_URL` (default production) and `LEVERAGE` (1-5, default 3).
+    /// `FUTURES_BASE_URL` (default production) and `LEVERAGE` (1-50, default 3).
     pub fn from_env() -> Self {
         let leverage = parse_leverage(std::env::var("LEVERAGE").ok().as_deref());
         Self {
@@ -950,11 +954,12 @@ mod tests {
     }
 
     #[test]
-    fn leverage_is_held_between_one_and_five() {
+    fn leverage_is_held_between_one_and_fifty() {
         assert_eq!(parse_leverage(None), 3);
         assert_eq!(parse_leverage(Some("5")), 5);
-        assert_eq!(parse_leverage(Some(" 4 ")), 4);
-        assert_eq!(parse_leverage(Some("10")), 5);
+        assert_eq!(parse_leverage(Some(" 20 ")), 20);
+        assert_eq!(parse_leverage(Some("50")), 50);
+        assert_eq!(parse_leverage(Some("125")), 50);
         assert_eq!(parse_leverage(Some("0")), 1);
         assert_eq!(parse_leverage(Some("lots")), 3);
     }

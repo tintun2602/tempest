@@ -17,7 +17,7 @@
 //!
 //! `LAB_MARKET=futures` replays Binance USDⓈ-M perpetuals instead, from the
 //! public data archive: every strategy also trades its short-side mirror, with
-//! leverage up to `LEVERAGE` (default 3, maximum 5), funding every 8 hours,
+//! leverage up to `LEVERAGE` (default 3, maximum 50), funding every 8 hours,
 //! futures fees, and no entry whose stop lies beyond the liquidation price.
 //! `MARKET=futures` trades the same rules live (see `futures.rs`).
 //!
@@ -56,7 +56,7 @@ pub(crate) const SIGNAL_WINDOW: usize = 100;
 /// this is per unit of leverage.
 const MAX_NOTIONAL_FRACTION: f64 = 0.95;
 /// Highest leverage the futures lab accepts, as live does.
-const MAX_LEVERAGE: f64 = 5.0;
+const MAX_LEVERAGE: f64 = 50.0;
 const DEFAULT_LEVERAGE: f64 = 3.0;
 /// Maintenance margin rate assumed for the liquidation price. Binance's lowest
 /// BTC tier is 0.4%; rounded up so the estimate errs toward liquidating early.
@@ -84,7 +84,7 @@ impl Venue {
         leverage: 1.0,
     };
 
-    /// `LAB_MARKET=futures` with `LEVERAGE` (1-5, default 3); spot otherwise.
+    /// `LAB_MARKET=futures` with `LEVERAGE` (1-50, default 3); spot otherwise.
     fn from_env() -> Self {
         if std::env::var("LAB_MARKET").unwrap_or_default().trim() != "futures" {
             return Self::SPOT;
