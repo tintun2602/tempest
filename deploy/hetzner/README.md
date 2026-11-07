@@ -70,11 +70,43 @@ Only one bot may run at a time, or both will trade the same account.
 When it has run cleanly for a day, cancel Railway Pro and remove the Railway
 IPs from the Binance key.
 
+## FreqAI (optional, live)
+
+[Freqtrade](https://www.freqtrade.io) with FreqAI: a LightGBM model retrained
+every 6 hours on 60 days of 1h candles, trading long and short on its own
+pairs (SUI, ENA, AAVE, NEAR). Settings are in `freqai/config.json`, the
+strategy in `freqai/strategies/TempestFreqAI.py`.
+
+- **It trades real money** (`dry_run: false`), from the same futures wallet
+  as Tempest: 20 USDC per trade at 3x, at most 2 trades, stop on Binance at a
+  5% price move. Its losses count toward Tempest's daily drawdown halt.
+- **Never give it Tempest's pairs.** Tempest adopts any position on its own
+  10 pairs and would manage, or close, FreqAI's trades.
+- It is built on Freqtrade's example strategy, which its authors call a
+  showcase rather than a production strategy, and it has not been
+  backtested here.
+
+To turn it on:
+
+```bash
+cp /opt/tempest/deploy/hetzner/freqai-secrets.example.json /etc/tempest/freqai-secrets.json
+nano /etc/tempest/freqai-secrets.json   # Binance key/secret, Telegram token/chat
+chown 1000:1000 /etc/tempest/freqai-secrets.json && chmod 600 /etc/tempest/freqai-secrets.json
+/opt/tempest/deploy/hetzner/deploy.sh --force
+```
+
+The first start downloads history and trains before it trades (several
+minutes). Telegram then gets Freqtrade's own messages, and `/status`,
+`/profit` and `/stop` work in the chat. To turn it off:
+`docker compose -f /opt/tempest/deploy/hetzner/docker-compose.yml --profile freqai stop freqai`
+and remove the secrets file so deploys do not start it again.
+
 ## Day to day
 
 | Task | Command |
 |---|---|
 | Bot logs | `docker compose -f /opt/tempest/deploy/hetzner/docker-compose.yml logs -f --tail 200 bot` |
+| FreqAI logs | `tail -f /var/lib/tempest/freqai/logs/freqtrade.log` |
 | Last deploys | `journalctl -u tempest-deploy --since today` |
 | Change a setting | edit `/etc/tempest/bot.env`, then `deploy.sh --force` |
 | Stop trading now | `docker compose -f /opt/tempest/deploy/hetzner/docker-compose.yml stop bot` (stops on Binance stay) |

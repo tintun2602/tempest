@@ -1,5 +1,6 @@
-# Tempest on a single server: the futures bot always on, the lab run by cron.
-# Secrets live in /etc/tempest/*.env on the server, never in this repo.
+# Tempest on a single server: the futures bot always on, the lab run by cron,
+# and optionally FreqAI (Freqtrade's self-retraining ML bot) on other pairs.
+# Secrets live in /etc/tempest on the server, never in this repo.
 name: tempest
 
 x-logging: &logging
@@ -24,4 +25,26 @@ services:
     env_file: /etc/tempest/lab.env
     profiles: ["lab"]
     restart: "no"
+    logging: *logging
+
+  # Freqtrade + FreqAI, live on its own pairs (never Tempest's: Tempest adopts
+  # any position on its pairs). Started by deploy.sh only once
+  # /etc/tempest/freqai-secrets.json exists.
+  freqai:
+    image: freqtradeorg/freqtrade:2026.10_freqai
+    profiles: ["freqai"]
+    restart: unless-stopped
+    volumes:
+      - /var/lib/tempest/freqai:/freqtrade/user_data
+      - ./freqai/strategies:/freqtrade/user_data/strategies:ro
+      - ./freqai/config.json:/freqtrade/config/config.json:ro
+      - /etc/tempest/freqai-secrets.json:/freqtrade/config/secrets.json:ro
+    command: >
+      trade
+      --logfile /freqtrade/user_data/logs/freqtrade.log
+      --db-url sqlite:////freqtrade/user_data/tradesv3.sqlite
+      --config /freqtrade/config/config.json
+      --config /freqtrade/config/secrets.json
+      --strategy TempestFreqAI
+      --freqaimodel LightGBMRegressor
     logging: *logging

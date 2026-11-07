@@ -33,6 +33,8 @@ if [[ ! -d /opt/tempest/.git ]]; then
 fi
 install -d -m 700 /etc/tempest
 install -d /var/lib/tempest /var/log/tempest
+# FreqAI's data, models and trade database; the Freqtrade image runs as uid 1000.
+install -d -o 1000 -g 1000 /var/lib/tempest/freqai /var/lib/tempest/freqai/logs
 for f in bot lab; do
   if [[ ! -f /etc/tempest/$f.env ]]; then
     install -m 600 /opt/tempest/deploy/hetzner/$f.env.example /etc/tempest/$f.env
@@ -88,6 +90,7 @@ fi
 echo
 echo "Done. Next:"
 echo "  1. nano /etc/tempest/bot.env   (paste the values from Railway's tempest-bot)"
+echo "  (FreqAI: see 'FreqAI' in /opt/tempest/deploy/hetzner/README.md)"
 echo "  2. Stop the bot on Railway, then:"
 echo "     /opt/tempest/deploy/hetzner/deploy.sh --force && systemctl enable --now tempest-deploy.timer"
 echo "  This server's public IP for the Binance whitelist: $(curl -fsS -4 https://ifconfig.me || echo unknown)"

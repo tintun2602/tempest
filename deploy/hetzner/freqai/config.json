@@ -1,0 +1,65 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "bot_name": "FreqAI",
+    "trading_mode": "futures",
+    "margin_mode": "cross",
+    "dry_run": false,
+    "stake_currency": "USDC",
+    "stake_amount": 20,
+    "max_open_trades": 2,
+    "tradable_balance_ratio": 0.99,
+    "fiat_display_currency": "USD",
+    "timeframe": "1h",
+    "cancel_open_orders_on_exit": false,
+    "unfilledtimeout": {"entry": 10, "exit": 30, "unit": "minutes"},
+    "order_types": {
+        "entry": "market",
+        "exit": "market",
+        "emergency_exit": "market",
+        "force_entry": "market",
+        "force_exit": "market",
+        "stoploss": "market",
+        "stoploss_on_exchange": true,
+        "stoploss_on_exchange_interval": 60
+    },
+    "entry_pricing": {"price_side": "other", "use_order_book": true, "order_book_top": 1},
+    "exit_pricing": {"price_side": "other", "use_order_book": true, "order_book_top": 1},
+    "exchange": {
+        "name": "binance",
+        "proxy_coin": "BNFCR",
+        "pair_whitelist": [
+            "SUI/USDC:USDC",
+            "ENA/USDC:USDC",
+            "AAVE/USDC:USDC",
+            "NEAR/USDC:USDC"
+        ],
+        "pair_blacklist": []
+    },
+    "pairlists": [{"method": "StaticPairList"}],
+    "freqai": {
+        "enabled": true,
+        "identifier": "tempest-1h",
+        "purge_old_models": 2,
+        "train_period_days": 60,
+        "backtest_period_days": 7,
+        "live_retrain_hours": 6,
+        "expiration_hours": 2,
+        "feature_parameters": {
+            "include_timeframes": ["1h", "4h"],
+            "include_corr_pairlist": ["BTC/USDC:USDC", "ETH/USDC:USDC"],
+            "label_period_candles": 24,
+            "include_shifted_candles": 2,
+            "DI_threshold": 0.9,
+            "weight_factor": 0.9,
+            "principal_component_analysis": false,
+            "use_SVM_to_remove_outliers": true,
+            "indicator_periods_candles": [10, 20]
+        },
+        "data_split_parameters": {"test_size": 0.33, "random_state": 1},
+        "model_training_parameters": {}
+    },
+    "telegram": {"enabled": false},
+    "api_server": {"enabled": false},
+    "initial_state": "running",
+    "internals": {"process_throttle_secs": 5}
+}

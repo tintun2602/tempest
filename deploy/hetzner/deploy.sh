@@ -20,5 +20,16 @@ git reset --quiet --hard "$target"
 # run tries again because the stamp still names the old commit.
 $compose build bot
 $compose up -d bot
+if [[ -f /etc/tempest/freqai-secrets.json ]]; then
+  # Restart FreqAI only when its own files changed: a restart costs it the
+  # current candle's predictions, and Tempest commits do not concern it.
+  if [[ -z "$deployed" || "${1:-}" == "--force" ]] \
+     || ! git diff --quiet "$deployed" "$target" -- deploy/hetzner/freqai deploy/hetzner/docker-compose.yml; then
+    $compose --profile freqai pull freqai
+    $compose --profile freqai up -d --force-recreate freqai
+  else
+    $compose --profile freqai up -d freqai
+  fi
+fi
 echo "$target" > "$stamp"
 docker image prune -f >/dev/null
