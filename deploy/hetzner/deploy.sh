@@ -14,8 +14,13 @@ if [[ "$target" == "$deployed" && "${1:-}" != "--force" ]]; then
   exit 0
 fi
 
-echo "$(date -u +%FT%TZ) deploying ${target:0:7} (was ${deployed:0:7})"
-git reset --quiet --hard "$target"
+if [[ -z "${TEMPEST_DEPLOY_CHECKED_OUT:-}" ]]; then
+  echo "$(date -u +%FT%TZ) deploying ${target:0:7} (was ${deployed:0:7})"
+  git reset --quiet --hard "$target"
+  # Carry on as the commit being deployed defines this script, so a change
+  # to the deploy steps takes effect in the same deploy.
+  TEMPEST_DEPLOY_CHECKED_OUT=1 exec bash deploy/hetzner/deploy.sh "$@"
+fi
 # Build first: a failed build leaves the running bot as it was, and the next
 # run tries again because the stamp still names the old commit.
 $compose build bot
@@ -31,5 +36,6 @@ if [[ -f /etc/tempest/freqai-secrets.json ]]; then
     $compose --profile freqai up -d freqai
   fi
 fi
+bash deploy/hetzner/apply.sh
 echo "$target" > "$stamp"
 docker image prune -f >/dev/null
