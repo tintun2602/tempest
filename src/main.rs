@@ -198,8 +198,15 @@ async fn main() {
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
 
     loop {
-        if let Err(e) =
-            run_cycle(&client, &config, &mut risk_manager, &notifier, &mut status, &params).await
+        if let Err(e) = run_cycle(
+            &client,
+            &config,
+            &mut risk_manager,
+            &notifier,
+            &mut status,
+            &params,
+        )
+        .await
         {
             if let Some(until) = banned_until_ms(&e) {
                 // Every request during a ban extends it, and an alert per poll
@@ -345,7 +352,9 @@ where
             }
         };
 
-        let signal = config.strategy.evaluate(symbol, &snap, &signal_candles, params);
+        let signal = config
+            .strategy
+            .evaluate(symbol, &snap, &signal_candles, params);
 
         info!(
             "{symbol}: signal={:?} confidence={} RSI={:.1} EMA50={:.2} EMA200={:.2}",
@@ -535,7 +544,9 @@ impl Equity {
 enum PositionSync {
     Unchanged,
     /// Partially filled or partially sold elsewhere.
-    Resized { to: f64 },
+    Resized {
+        to: f64,
+    },
     /// The exchange no longer backs this position at a tradable size.
     ClosedExternally,
 }
@@ -594,11 +605,11 @@ async fn sync_positions_with_exchange(
         match classify_position(tracked_quantity, held, price) {
             PositionSync::Unchanged => {}
             PositionSync::Resized { to } => {
-                warn!(
-                    "{symbol}: exchange holds {to:.8}, tracked {tracked_quantity:.8} — resizing"
-                );
-                if let Some(position) =
-                    risk_manager.positions.iter_mut().find(|p| p.symbol == symbol)
+                warn!("{symbol}: exchange holds {to:.8}, tracked {tracked_quantity:.8} — resizing");
+                if let Some(position) = risk_manager
+                    .positions
+                    .iter_mut()
+                    .find(|p| p.symbol == symbol)
                 {
                     position.quantity = to;
                 }
@@ -927,9 +938,15 @@ mod tests {
         assert_eq!(ban_wait_ms(now - 1, now, poll), poll + BAN_MARGIN_MS);
         assert_eq!(ban_wait_ms(0, now, poll), poll + BAN_MARGIN_MS);
         // Inside the cap: until the ban lifts.
-        assert_eq!(ban_wait_ms(now + 2 * poll, now, poll), 2 * poll + BAN_MARGIN_MS);
+        assert_eq!(
+            ban_wait_ms(now + 2 * poll, now, poll),
+            2 * poll + BAN_MARGIN_MS
+        );
         // A wild timestamp is capped.
-        assert_eq!(ban_wait_ms(u64::MAX, now, poll), MAX_BAN_WAIT_MS + BAN_MARGIN_MS);
+        assert_eq!(
+            ban_wait_ms(u64::MAX, now, poll),
+            MAX_BAN_WAIT_MS + BAN_MARGIN_MS
+        );
     }
 
     // ----- entry ranking -----

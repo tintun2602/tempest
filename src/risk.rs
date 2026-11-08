@@ -381,8 +381,8 @@ mod tests {
                 take_profit: 120.0,
                 entry_time: 0,
                 protected: false,
-            highest_high: 0.0,
-            atr_at_entry: 0.0,
+                highest_high: 0.0,
+                atr_at_entry: 0.0,
             });
         }
         assert!(!rm.can_open_position());

@@ -76,12 +76,17 @@ struct Venue {
     /// Leverage set on the exchange, isolated margin. Caps notional at
     /// `MAX_NOTIONAL_FRACTION` x leverage and sets the liquidation price.
     leverage: f64,
+    /// Research only (`LAB_FUNDING_MAX`, a per-8h decimal): no long while the
+    /// last settled funding rate is above it, no short while it is below its
+    /// negative. Crowded positioning tends to unwind against the crowd.
+    funding_max: Option<f64>,
 }
 
 impl Venue {
     const SPOT: Venue = Venue {
         futures: false,
         leverage: 1.0,
+        funding_max: None,
     };
 
     /// `LAB_MARKET=futures` with `LEVERAGE` (1-50, default 3); spot otherwise.
@@ -95,9 +100,28 @@ impl Venue {
             .filter(|v| v.is_finite())
             .unwrap_or(DEFAULT_LEVERAGE)
             .clamp(1.0, MAX_LEVERAGE);
+        let funding_max = std::env::var("LAB_FUNDING_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0);
         Venue {
             futures: true,
             leverage,
+            funding_max,
+        }
+    }
+
+    /// Whether the funding filter lets an entry on this side through.
+    fn funding_allows(&self, short: bool, last_rate: Option<f64>) -> bool {
+        match (self.funding_max, last_rate) {
+            (Some(max), Some(rate)) => {
+                if short {
+                    rate >= -max
+                } else {
+                    rate <= max
+                }
+            }
+            _ => true,
         }
     }
 
@@ -434,7 +458,11 @@ fn simulate(
                 }
                 None => {
                     let decision = kind.evaluate("LAB", &snap, signal_view, params);
+                    let last_rate = next_funding.checked_sub(1).map(|i| feed.funding[i].1);
                     open[k] = if decision.signal == Signal::Buy {
+                        if !venue.funding_allows(false, last_rate) {
+                            continue;
+                        }
                         let entry_price = costs.buy_fill(decision.entry_price);
                         open_position(
                             false,
@@ -447,15 +475,19 @@ fn simulate(
                         )
                     } else if venue.futures {
                         match kind.evaluate_short(&snap, signal_view, params) {
-                            ShortDecision::Enter { stop_loss } => open_position(
-                                true,
-                                costs.sell_fill(bar.close),
-                                stop_loss,
-                                snap.atr_14,
-                                bar,
-                                risk_per_trade,
-                                venue,
-                            ),
+                            ShortDecision::Enter { stop_loss }
+                                if venue.funding_allows(true, last_rate) =>
+                            {
+                                open_position(
+                                    true,
+                                    costs.sell_fill(bar.close),
+                                    stop_loss,
+                                    snap.atr_14,
+                                    bar,
+                                    risk_per_trade,
+                                    venue,
+                                )
+                            }
                             _ => None,
                         }
                     } else {
@@ -1222,6 +1254,7 @@ mod tests {
         Venue {
             futures: true,
             leverage,
+            funding_max: None,
         }
     }
 
@@ -1626,5 +1659,126 @@ mod tests {
             .map(|i| if i % 3 == 0 { -0.02 } else { 0.015 })
             .collect();
         assert_eq!(monte_carlo_p5(&returns), monte_carlo_p5(&returns));
+    }
+
+    /// A random walk on 4h bars with the matching daily candles: enough
+    /// swings for every strategy to trade both sides.
+    fn walk_feed(seed: u64, days: u64) -> Feed {
+        const H4: u64 = 14_400_000;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut price = 100.0_f64;
+        let mut bars = Vec::new();
+        for i in 0..days * 6 {
+            let open = price;
+            price *= 1.0 + rng.gen_range(-0.03..0.0305);
+            let wick = price.max(open) * rng.gen_range(0.0..0.01);
+            bars.push(Candle {
+                open_time: i * H4,
+                open,
+                high: price.max(open) + wick,
+                low: price.min(open) - wick,
+                close: price,
+                volume: 1.0,
+                close_time: (i + 1) * H4 - 1,
+            });
+        }
+        let trend = bars
+            .chunks(6)
+            .map(|d| Candle {
+                open_time: d[0].open_time,
+                open: d[0].open,
+                high: d.iter().map(|c| c.high).fold(f64::MIN, f64::max),
+                low: d.iter().map(|c| c.low).fold(f64::MAX, f64::min),
+                close: d[5].close,
+                volume: 6.0,
+                close_time: d[5].close_time,
+            })
+            .collect();
+        let start = 205 * 6;
+        let signal = bars[start as usize..].to_vec();
+        let funding = (0..days * 3)
+            .map(|i| (i * FUNDING_INTERVAL_MS, rng.gen_range(-0.0006..0.0006)))
+            .collect();
+        Feed {
+            trend,
+            signal,
+            funding,
+        }
+    }
+
+    /// Freqtrade's lookahead check, for the lab: replaying only the history
+    /// up to a cut-off must give exactly the trades the full replay closed
+    /// before it. A strategy that peeks at later candles fails this.
+    #[test]
+    fn replays_do_not_look_ahead() {
+        let costs = CostModel::futures_from_env();
+        let params = StrategyParams::default();
+        for seed in 1..=4 {
+            let full = walk_feed(seed, 700);
+            let all = simulate(
+                &full,
+                0.02,
+                &costs,
+                &params,
+                futures(5.0),
+                &StrategyKind::ALL,
+            );
+            assert!(all.len() > 20, "seed {seed}: only {} trades", all.len());
+            for cut in [400usize, 900, 1_600] {
+                let cutoff = full.signal[cut].close_time;
+                let part = Feed {
+                    trend: full
+                        .trend
+                        .iter()
+                        .filter(|c| c.open_time <= cutoff)
+                        .cloned()
+                        .collect(),
+                    signal: full.signal[..=cut].to_vec(),
+                    funding: full.funding.clone(),
+                };
+                let early = simulate(
+                    &part,
+                    0.02,
+                    &costs,
+                    &params,
+                    futures(5.0),
+                    &StrategyKind::ALL,
+                );
+                let key = |t: &LabTrade| (t.strategy.name(), t.short, t.exit_time, t.ret.to_bits());
+                let want: Vec<_> = all
+                    .iter()
+                    .filter(|t| t.exit_time < cutoff)
+                    .map(key)
+                    .collect();
+                let got: Vec<_> = early
+                    .iter()
+                    .filter(|t| t.exit_time < cutoff)
+                    .map(key)
+                    .collect();
+                assert_eq!(got, want, "seed {seed}, cut at bar {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_funding_filter_blocks_entries_against_crowded_funding() {
+        let open = futures(5.0);
+        let filtered = Venue {
+            funding_max: Some(0.0003),
+            ..open
+        };
+        assert!(open.funding_allows(false, Some(0.01)));
+        assert!(!filtered.funding_allows(false, Some(0.0005)));
+        assert!(filtered.funding_allows(false, Some(0.0003)));
+        assert!(!filtered.funding_allows(true, Some(-0.0005)));
+        assert!(filtered.funding_allows(true, Some(0.0005)));
+        assert!(filtered.funding_allows(false, None));
+        // And it only ever removes trades.
+        let costs = CostModel::futures_from_env();
+        let params = StrategyParams::default();
+        let feed = walk_feed(7, 700);
+        let all = simulate(&feed, 0.02, &costs, &params, open, &StrategyKind::ALL);
+        let fewer = simulate(&feed, 0.02, &costs, &params, filtered, &StrategyKind::ALL);
+        assert!(fewer.len() < all.len(), "{} vs {}", fewer.len(), all.len());
     }
 }

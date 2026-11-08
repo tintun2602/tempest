@@ -243,10 +243,7 @@ impl Notifier {
             msg.push_str(&format!("{mark} {label}\n"));
         }
 
-        msg.push_str(&format!(
-            "\n*{}/4* conditions met",
-            conditions.met_count()
-        ));
+        msg.push_str(&format!("\n*{}/4* conditions met", conditions.met_count()));
         msg
     }
 
@@ -376,14 +373,20 @@ mod interval_tests {
         let flat = format_summary("USDC", 990.0, 990.0, 1_000.0, 0.0, &[]);
         assert!(flat.contains("`-10.00` USDC (`-1.00%`)"), "got: {flat}");
         assert!(flat.contains("Open positions: none"), "got: {flat}");
-        assert!(!flat.contains("Deposits"), "no line without a transfer: {flat}");
+        assert!(
+            !flat.contains("Deposits"),
+            "no line without a transfer: {flat}"
+        );
     }
 
     #[test]
     fn summary_leaves_deposits_and_withdrawals_out_of_day_pnl() {
         // 500 deposited and 20 made: today is +20, not +520.
         let msg = format_summary("USDC", 1_520.0, 1_520.0, 1_000.0, 500.0, &[]);
-        assert!(msg.contains("Today: `+20.00` USDC (`+1.33%`)"), "got: {msg}");
+        assert!(
+            msg.contains("Today: `+20.00` USDC (`+1.33%`)"),
+            "got: {msg}"
+        );
         assert!(
             msg.contains("Deposits/withdrawals today: `+500.00` USDC"),
             "got: {msg}"

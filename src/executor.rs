@@ -293,7 +293,10 @@ impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
         params: &StrategyParams,
         risk_manager: &mut RiskManager,
     ) -> Result<(), String> {
-        let Some(position) = risk_manager.positions.iter_mut().find(|p| p.symbol == symbol)
+        let Some(position) = risk_manager
+            .positions
+            .iter_mut()
+            .find(|p| p.symbol == symbol)
         else {
             return Ok(());
         };
@@ -310,8 +313,8 @@ impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
             position.stop_loss
         };
 
-        let ratchet = trailing
-            && desired > position.stop_loss + RATCHET_MIN_ATR * position.atr_at_entry;
+        let ratchet =
+            trailing && desired > position.stop_loss + RATCHET_MIN_ATR * position.atr_at_entry;
 
         if position.protected && !ratchet {
             return Ok(());
@@ -341,7 +344,11 @@ impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
             .await
         {
             Ok(stop) => {
-                if let Some(p) = risk_manager.positions.iter_mut().find(|p| p.symbol == symbol) {
+                if let Some(p) = risk_manager
+                    .positions
+                    .iter_mut()
+                    .find(|p| p.symbol == symbol)
+                {
                     p.stop_loss = stop.stop_price;
                     p.protected = true;
                 }
@@ -354,7 +361,11 @@ impl<'a, E: ExecutionProvider + InstrumentProvider> Executor<'a, E> {
             Err(e) => {
                 // The old order is already gone. Say so loudly and let the next
                 // cycle retry via job 1.
-                if let Some(p) = risk_manager.positions.iter_mut().find(|p| p.symbol == symbol) {
+                if let Some(p) = risk_manager
+                    .positions
+                    .iter_mut()
+                    .find(|p| p.symbol == symbol)
+                {
                     p.protected = false;
                 }
                 error!("{symbol}: stop placement FAILED — position is UNPROTECTED: {e}");
@@ -867,10 +878,7 @@ mod tests {
         assert_eq!(rm.positions[0].stop_loss, 53_000.0);
         assert_eq!(rm.positions[0].highest_high, 56_000.0);
         // The old order must go before the new one, since it reserves the asset.
-        assert_eq!(
-            venue.calls(),
-            vec!["cancel_open_orders", "place_stop_loss"]
-        );
+        assert_eq!(venue.calls(), vec!["cancel_open_orders", "place_stop_loss"]);
     }
 
     #[tokio::test]

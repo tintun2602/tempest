@@ -134,11 +134,7 @@ fn settle(pos: &SimPosition, exit_quote: f64, reason: ExitReason, costs: &CostMo
 }
 
 /// Run a backtest for a single symbol over its historical data.
-pub async fn run<M: MarketDataProvider>(
-    client: &M,
-    symbols: &[String],
-    risk_per_trade: f64,
-) {
+pub async fn run<M: MarketDataProvider>(client: &M, symbols: &[String], risk_per_trade: f64) {
     let params = StrategyParams::from_env();
     let params = &params;
     let costs = CostModel::from_env();
@@ -711,8 +707,22 @@ fn print_period_split(
         return;
     }
 
-    let in_sample = simulate(symbol, daily, &four_hour[first..mid], costs, risk_per_trade, params);
-    let out_sample = simulate(symbol, daily, &four_hour[mid..], costs, risk_per_trade, params);
+    let in_sample = simulate(
+        symbol,
+        daily,
+        &four_hour[first..mid],
+        costs,
+        risk_per_trade,
+        params,
+    );
+    let out_sample = simulate(
+        symbol,
+        daily,
+        &four_hour[mid..],
+        costs,
+        risk_per_trade,
+        params,
+    );
     let ret = |b: f64| (b - STARTING_BALANCE) / STARTING_BALANCE * 100.0;
 
     println!();
@@ -1301,10 +1311,7 @@ fn print_buffer_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_trad
     );
     println!("    {}", "-".repeat(62));
 
-    for (entry, exit) in [
-        (0.0, 0.0),
-        (0.5, 0.5),
-    ] {
+    for (entry, exit) in [(0.0, 0.0), (0.5, 0.5)] {
         let params = StrategyParams {
             entry_buffer_atr: entry,
             exit_buffer_atr: exit,
@@ -1387,11 +1394,7 @@ fn print_trailing_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_tr
 /// zero would credit the benchmark with the entire indicator warmup — a
 /// stretch the strategy sat out — and on this data that alone turned a losing
 /// benchmark into a +63% one.
-fn portfolio_buy_and_hold(
-    feeds: &[SymbolFeed],
-    costs: &CostModel,
-    first_bar: usize,
-) -> (f64, f64) {
+fn portfolio_buy_and_hold(feeds: &[SymbolFeed], costs: &CostModel, first_bar: usize) -> (f64, f64) {
     let per_symbol = STARTING_BALANCE / feeds.len() as f64;
     let bars = feeds.iter().map(|f| f.four_hour.len()).min().unwrap_or(0);
     if bars == 0 || first_bar >= bars {

@@ -310,7 +310,9 @@ impl EntryConditions {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ShortDecision {
     /// Open a short with its protective stop above price.
-    Enter { stop_loss: f64 },
+    Enter {
+        stop_loss: f64,
+    },
     /// Close an open short.
     Cover,
     Hold,
@@ -347,11 +349,7 @@ pub fn evaluate_short(snap: &IndicatorSnapshot, params: &StrategyParams) -> Shor
 }
 
 /// Evaluate the indicator snapshot against entry/exit rules and return a signal.
-pub fn evaluate(
-    symbol: &str,
-    snap: &IndicatorSnapshot,
-    params: &StrategyParams,
-) -> TradeSignal {
+pub fn evaluate(symbol: &str, snap: &IndicatorSnapshot, params: &StrategyParams) -> TradeSignal {
     let mut warnings: Vec<String> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
 

@@ -1000,7 +1000,8 @@ mod tests {
             min_notional: 50.0,
             ..eth("BTCUSDC")
         };
-        let err = plan_entry(false, 78_000.0, 76_000.0, 23.32, 23.32, 0.10, 3, 1, &btc).unwrap_err();
+        let err =
+            plan_entry(false, 78_000.0, 76_000.0, 23.32, 23.32, 0.10, 3, 1, &btc).unwrap_err();
         assert!(err.contains("smallest order 78.00"), "{err}");
     }
 
