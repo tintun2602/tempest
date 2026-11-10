@@ -63,11 +63,18 @@ block() { echo '```'; cat; echo '```'; }
     # Once a day, the latest summary becomes that day's line.
     today=$(date -u +%F)
     grep -q "^$today " "$meme/daily.txt" 2>/dev/null \
-      || echo "$today $(cat "$meme/summary.txt")" >> "$meme/daily.txt"
+      || echo "$today $(paste -sd'|' "$meme/summary.txt")" >> "$meme/daily.txt"
     mkdir -p meme
     cp -f "$meme"/daily.txt "$meme"/trades.csv "$meme"/filtered.csv meme/ 2>/dev/null
     git add meme 2>/dev/null
-    { cat "$meme/daily.txt"; echo "now: $(cat "$meme/summary.txt")"; } | scrub | block
+    cp -f "$meme"/trades_v2.csv "$meme"/filtered_v2.csv meme/ 2>/dev/null
+    git add meme 2>/dev/null
+    {
+      cat "$meme/daily.txt"
+      echo "now:"; cat "$meme/summary.txt"; cat "$meme/round.txt" 2>/dev/null
+      echo "resources (cpu, memory):"
+      docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' "$bot" tempest-meme-1 2>&1
+    } | scrub | block
   else
     echo "Not started."
   fi

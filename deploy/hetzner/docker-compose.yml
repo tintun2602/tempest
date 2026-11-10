@@ -32,6 +32,9 @@ services:
       MEME_DIR: /data
     volumes:
       - /var/lib/tempest/meme:/data
+    # Never more than one CPU and 1.5 GB, so it cannot slow the trading bot.
+    cpus: 1.0
+    mem_limit: 1536m
     restart: unless-stopped
     logging: *logging
 

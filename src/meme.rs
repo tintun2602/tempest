@@ -24,7 +24,6 @@ use tracing::{error, info, warn};
 const DEX: &str = "https://api.dexscreener.com";
 const RUGCHECK: &str = "https://api.rugcheck.xyz/v1/tokens";
 const CHAINS: [&str; 2] = ["solana", "base"];
-const ROUND: Duration = Duration::from_secs(300);
 /// DexScreener's `tokens/v1` takes at most 30 addresses per call.
 const BATCH: usize = 30;
 
@@ -76,6 +75,10 @@ pub struct Rug {
     pub lp_locked_pct: f64,
     /// Top ten holders' share, AMM pools left out.
     pub top10_pct: f64,
+    /// Creator wallet's share of supply, percent.
+    pub creator_pct: f64,
+    /// Wallets found to be funded together (an insider network).
+    pub insiders: bool,
 }
 
 /// The first rule a pair fails, or `None` when it passes. Solana needs a
@@ -291,31 +294,9 @@ impl State {
         }
         self.open = still_open;
 
-        let mut done = Vec::new();
-        let mut following = Vec::new();
-        for mut f in std::mem::take(&mut self.followed) {
-            let key = Self::key(&f.chain, &f.token);
-            let (price, liquidity) = pairs
-                .get(&key)
-                .map_or((0.0, 0.0), |p| (p.price, p.liquidity));
-            f.min_price = f.min_price.min(price);
-            f.min_liquidity = f.min_liquidity.min(liquidity);
-            for (slot, after) in FOLLOW_UPS_MS.iter().zip(f.after.iter_mut()) {
-                if after.is_none() && now_ms.saturating_sub(f.seen_ms) >= *slot {
-                    *after = Some(price);
-                }
-            }
-            if f.after[2].is_some() {
-                self.filtered_done += 1;
-                if is_rug(f.price0, f.liquidity0, f.min_price, f.min_liquidity) {
-                    self.rugs_filtered += 1;
-                }
-                done.push(f);
-            } else {
-                following.push(f);
-            }
-        }
-        self.followed = following;
+        let (done, rugs_done) = advance_followed(&mut self.followed, pairs, now_ms);
+        self.filtered_done += done.len() as u32;
+        self.rugs_filtered += rugs_done;
 
         for (chain, token) in candidates {
             let key = Self::key(chain, token);
@@ -381,7 +362,7 @@ impl State {
             0.0
         };
         format!(
-            "Meme paper: day {days:.1} | {} open | {} closed, hit {hit:.0} %, mean {mean:+.1} %/trade after costs, \
+            "v1: day {days:.1} | {} open | {} closed, hit {hit:.0} %, mean {mean:+.1} %/trade after costs, \
              worst {:.1} %, rugs traded {} | filtered followed 24 h: {}, of which rugs {} | following {}",
             self.open.len(),
             self.closed,
@@ -474,6 +455,18 @@ pub fn parse_rug(body: &Value) -> Option<Rug> {
         freeze_authority: !body["freezeAuthority"].is_null(),
         lp_locked_pct,
         top10_pct,
+        creator_pct: {
+            let supply = num(&body["token"]["supply"]);
+            if supply > 0.0 {
+                100.0 * num(&body["creatorBalance"]) / supply
+            } else {
+                0.0
+            }
+        },
+        insiders: num(&body["graphInsidersDetected"]) > 0.0
+            || body["insiderNetworks"]
+                .as_array()
+                .is_some_and(|n| !n.is_empty()),
     })
 }
 
@@ -547,6 +540,426 @@ fn csv_safe(s: &str) -> String {
     s.replace([',', '\n', '"'], " ")
 }
 
+// ----- v2: safety checks, size by liquidity, staged exits -----
+
+/// v2 polls every minute; v1 keeps its 5-minute rounds as the reference.
+const V2_ROUND: Duration = Duration::from_secs(60);
+const V1_EVERY: u64 = 5;
+const V2_MAX_TAX: f64 = 0.05;
+/// Buy-then-sell quote losing more than this: too costly or not sellable.
+const V2_MAX_ROUND_TRIP: f64 = 0.10;
+const V2_MAX_CREATOR_PCT: f64 = 5.0;
+/// Priority fee and Jito tip (Solana) or gas (Base), per side.
+const V2_EXEC_COST: f64 = 0.005;
+const V2_MIN_COST_EACH_WAY: f64 = 0.01;
+const V2_TP1: f64 = 0.50;
+const V2_TP2: f64 = 2.00;
+const V2_TRAIL: f64 = 0.25;
+
+/// What the pre-trade safety checks found for a token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Safety {
+    /// A sell route exists and the sell simulation succeeded.
+    pub sellable: bool,
+    /// Share lost buying the paper size and selling it straight back.
+    pub round_trip_loss: f64,
+    pub buy_tax: f64,
+    pub sell_tax: f64,
+    /// Creator (dev) wallet's share of supply, percent; 0 when unknown.
+    pub creator_pct: f64,
+    /// RugCheck found an insider network (wallets funded together).
+    pub insiders: bool,
+}
+
+/// Paper size: half a percent of the pool, between 20 and 100 USD.
+pub fn v2_size(liquidity: f64) -> f64 {
+    (liquidity * 0.005).clamp(20.0, PAPER_SIZE_USD)
+}
+
+/// v1's rules, then v2's safety checks.
+pub fn v2_check(
+    pair: &Pair,
+    rug: Option<&Rug>,
+    safety: Option<&Safety>,
+    now_ms: u64,
+) -> Option<&'static str> {
+    if let Some(reason) = entry_check(pair, rug, now_ms) {
+        return Some(reason);
+    }
+    let Some(s) = safety else {
+        return Some("no safety check");
+    };
+    if !s.sellable {
+        return Some("honeypot");
+    }
+    if s.buy_tax > V2_MAX_TAX || s.sell_tax > V2_MAX_TAX {
+        return Some("tax");
+    }
+    if s.round_trip_loss > V2_MAX_ROUND_TRIP {
+        return Some("round trip cost");
+    }
+    if s.creator_pct > V2_MAX_CREATOR_PCT {
+        return Some("dev holds too much");
+    }
+    if s.insiders {
+        return Some("insider cluster");
+    }
+    None
+}
+
+/// Cost per side: half the quoted round trip plus execution, never under 1 %,
+/// plus that side's token tax.
+pub fn v2_costs(s: &Safety) -> (f64, f64) {
+    let base = (s.round_trip_loss / 2.0 + V2_EXEC_COST).max(V2_MIN_COST_EACH_WAY);
+    (base + s.buy_tax, base + s.sell_tax)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Position2 {
+    pub chain: String,
+    pub token: String,
+    pub symbol: String,
+    pub entry_ms: u64,
+    pub quote: f64,
+    pub size_usd: f64,
+    pub tokens: f64,
+    pub cost_out: f64,
+    /// Share of the tokens still held.
+    pub left: f64,
+    pub proceeds: f64,
+    pub peak: f64,
+    pub liquidity0: f64,
+    pub min_liquidity: f64,
+    pub min_price: f64,
+}
+
+impl Position2 {
+    fn sell(&mut self, share: f64, price: f64) {
+        let share = share.min(self.left);
+        self.proceeds += self.tokens * share * price * (1.0 - self.cost_out);
+        self.left -= share;
+    }
+
+    /// Staged exits: half at +50 %, then the rest at +200 %, on a 25 % drop
+    /// from the peak, or back at the entry; the whole at -30 % or after 24 h.
+    /// Returns the reason when the position is fully closed.
+    pub fn update(&mut self, price: f64, now_ms: u64) -> Option<&'static str> {
+        self.peak = self.peak.max(price);
+        let change = price / self.quote - 1.0;
+        let full = self.left >= 1.0;
+        let reason = if change <= STOP {
+            Some("stop")
+        } else if full && change >= V2_TP1 {
+            self.sell(0.5, price);
+            None
+        } else if !full && change >= V2_TP2 {
+            Some("tp2")
+        } else if !full && price <= self.peak * (1.0 - V2_TRAIL) {
+            Some("trail")
+        } else if !full && change <= 0.0 {
+            Some("breakeven")
+        } else {
+            None
+        };
+        let reason = reason
+            .or_else(|| (now_ms.saturating_sub(self.entry_ms) >= MAX_HOLD_MS).then_some("time"));
+        if reason.is_some() {
+            let left = self.left;
+            self.sell(left, price);
+        }
+        reason
+    }
+
+    pub fn net_pct(&self) -> f64 {
+        (self.proceeds / self.size_usd - 1.0) * 100.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Closed2 {
+    pub pos: Position2,
+    pub exit_ms: u64,
+    pub reason: &'static str,
+    pub rug: bool,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Book2 {
+    pub started_ms: u64,
+    pub open: Vec<Position2>,
+    pub followed: Vec<Followed>,
+    pub judged: HashSet<String>,
+    pub closed: u32,
+    pub wins: u32,
+    pub pnl_usd: f64,
+    pub staked_usd: f64,
+    pub worst_pct: f64,
+    pub rugs_traded: u32,
+    pub filtered_done: u32,
+    pub rugs_filtered: u32,
+}
+
+/// Move followed tokens on by one round; returns those whose 24 h are up and
+/// the number of rugs among them.
+fn advance_followed(
+    followed: &mut Vec<Followed>,
+    pairs: &HashMap<String, Pair>,
+    now_ms: u64,
+) -> (Vec<Followed>, u32) {
+    let mut done = Vec::new();
+    let mut rugs = 0;
+    let mut following = Vec::new();
+    for mut f in std::mem::take(followed) {
+        let key = State::key(&f.chain, &f.token);
+        let (price, liquidity) = pairs
+            .get(&key)
+            .map_or((0.0, 0.0), |p| (p.price, p.liquidity));
+        f.min_price = f.min_price.min(price);
+        f.min_liquidity = f.min_liquidity.min(liquidity);
+        for (slot, after) in FOLLOW_UPS_MS.iter().zip(f.after.iter_mut()) {
+            if after.is_none() && now_ms.saturating_sub(f.seen_ms) >= *slot {
+                *after = Some(price);
+            }
+        }
+        if f.after[2].is_some() {
+            if is_rug(f.price0, f.liquidity0, f.min_price, f.min_liquidity) {
+                rugs += 1;
+            }
+            done.push(f);
+        } else {
+            following.push(f);
+        }
+    }
+    *followed = following;
+    (done, rugs)
+}
+
+fn followed_from(pair: &Pair, reason: &str, now_ms: u64) -> Followed {
+    Followed {
+        chain: pair.chain.clone(),
+        token: pair.token.clone(),
+        symbol: pair.symbol.clone(),
+        reason: reason.to_string(),
+        seen_ms: now_ms,
+        price0: pair.price,
+        liquidity0: pair.liquidity,
+        min_price: pair.price,
+        min_liquidity: pair.liquidity,
+        after: [None; 3],
+    }
+}
+
+impl Book2 {
+    pub fn step(
+        &mut self,
+        candidates: &[(String, String)],
+        pairs: &HashMap<String, Pair>,
+        rugs: &HashMap<String, Rug>,
+        safety: &HashMap<String, Safety>,
+        now_ms: u64,
+    ) -> (Vec<Closed2>, Vec<Followed>) {
+        if self.started_ms == 0 {
+            self.started_ms = now_ms;
+        }
+        let mut closed = Vec::new();
+        let mut still_open = Vec::new();
+        for mut pos in std::mem::take(&mut self.open) {
+            let key = State::key(&pos.chain, &pos.token);
+            let (price, liquidity) = pairs
+                .get(&key)
+                .map_or((0.0, 0.0), |p| (p.price, p.liquidity));
+            pos.min_price = pos.min_price.min(price);
+            pos.min_liquidity = pos.min_liquidity.min(liquidity);
+            let reason = if pairs.contains_key(&key) {
+                pos.update(price, now_ms)
+            } else {
+                pos.left = 0.0;
+                Some("vanished")
+            };
+            match reason {
+                Some(reason) => {
+                    let rug = is_rug(pos.quote, pos.liquidity0, pos.min_price, pos.min_liquidity);
+                    let pct = pos.net_pct();
+                    self.closed += 1;
+                    if pct > 0.0 {
+                        self.wins += 1;
+                    }
+                    self.pnl_usd += pos.proceeds - pos.size_usd;
+                    self.staked_usd += pos.size_usd;
+                    self.worst_pct = self.worst_pct.min(pct);
+                    if rug {
+                        self.rugs_traded += 1;
+                    }
+                    closed.push(Closed2 {
+                        pos,
+                        exit_ms: now_ms,
+                        reason,
+                        rug,
+                    });
+                }
+                None => still_open.push(pos),
+            }
+        }
+        self.open = still_open;
+
+        let (done, rugs_done) = advance_followed(&mut self.followed, pairs, now_ms);
+        self.filtered_done += done.len() as u32;
+        self.rugs_filtered += rugs_done;
+
+        for (chain, token) in candidates {
+            let key = State::key(chain, token);
+            if self.judged.contains(&key) {
+                continue;
+            }
+            let Some(pair) = pairs.get(&key) else {
+                continue;
+            };
+            let rug = rugs.get(&key);
+            if pair.chain == "solana" && rug.is_none() {
+                continue;
+            }
+            let base = entry_check(pair, rug, now_ms);
+            let s = safety.get(&key);
+            // A pair that passes v1's rules waits for its safety check.
+            if base.is_none() && s.is_none() {
+                continue;
+            }
+            match v2_check(pair, rug, s, now_ms) {
+                Some("too new") => {}
+                Some(reason) => {
+                    self.judged.insert(key);
+                    self.followed.push(followed_from(pair, reason, now_ms));
+                }
+                None => {
+                    let s = s.expect("checked above");
+                    let (cost_in, cost_out) = v2_costs(s);
+                    let size = v2_size(pair.liquidity);
+                    self.judged.insert(key);
+                    self.open.push(Position2 {
+                        chain: pair.chain.clone(),
+                        token: pair.token.clone(),
+                        symbol: pair.symbol.clone(),
+                        entry_ms: now_ms,
+                        quote: pair.price,
+                        size_usd: size,
+                        tokens: size * (1.0 - cost_in) / pair.price,
+                        cost_out,
+                        left: 1.0,
+                        proceeds: 0.0,
+                        peak: pair.price,
+                        liquidity0: pair.liquidity,
+                        min_liquidity: pair.liquidity,
+                        min_price: pair.price,
+                    });
+                }
+            }
+        }
+        (closed, done)
+    }
+
+    pub fn summary(&self, now_ms: u64) -> String {
+        let days = now_ms.saturating_sub(self.started_ms) as f64 / 86_400_000.0;
+        let hit = if self.closed > 0 {
+            100.0 * f64::from(self.wins) / f64::from(self.closed)
+        } else {
+            0.0
+        };
+        let ret = if self.staked_usd > 0.0 {
+            100.0 * self.pnl_usd / self.staked_usd
+        } else {
+            0.0
+        };
+        format!(
+            "v2: day {days:.1} | {} open | {} closed, hit {hit:.0} %, P&L {:+.2} USD ({ret:+.1} % of stakes) after costs, \
+             worst {:.1} %, rugs traded {} | filtered followed 24 h: {}, of which rugs {} | following {}",
+            self.open.len(),
+            self.closed,
+            self.pnl_usd,
+            self.worst_pct,
+            self.rugs_traded,
+            self.filtered_done,
+            self.rugs_filtered,
+            self.followed.len()
+        )
+    }
+}
+
+const JUPITER: &str = "https://lite-api.jup.ag/swap/v1/quote";
+const USDC_SOL: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const HONEYPOT: &str = "https://api.honeypot.is/v2/IsHoneypot";
+
+/// Solana: quote the paper size in through Jupiter and straight back out.
+/// No sell route is a honeypot.
+async fn solana_safety(http: &reqwest::Client, mint: &str, size: f64, rug: &Rug) -> Option<Safety> {
+    let amount = (size * 1e6) as u64;
+    let buy = get(
+        http,
+        &format!(
+            "{JUPITER}?inputMint={USDC_SOL}&outputMint={mint}&amount={amount}&slippageBps=300"
+        ),
+    )
+    .await
+    .ok()?;
+    let got = buy["outAmount"].as_str()?.to_string();
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let sell = get(
+        http,
+        &format!("{JUPITER}?inputMint={mint}&outputMint={USDC_SOL}&amount={got}&slippageBps=300"),
+    )
+    .await;
+    let (sellable, back) = match sell {
+        Ok(q) => (
+            q["routePlan"].as_array().is_some_and(|r| !r.is_empty()),
+            num(&q["outAmount"]) / 1e6,
+        ),
+        // Jupiter answers 400 when no route sells the token.
+        Err(e) if e.contains("HTTP 400") => (false, 0.0),
+        Err(_) => return None,
+    };
+    Some(Safety {
+        sellable,
+        round_trip_loss: (1.0 - back / size).clamp(0.0, 1.0),
+        buy_tax: 0.0,
+        sell_tax: 0.0,
+        creator_pct: rug.creator_pct,
+        insiders: rug.insiders,
+    })
+}
+
+/// Base: honeypot.is simulates a buy and a sell and reports the taxes.
+async fn base_safety(
+    http: &reqwest::Client,
+    token: &str,
+    size: f64,
+    liquidity: f64,
+) -> Option<Safety> {
+    let r = get(http, &format!("{HONEYPOT}?address={token}&chainID=8453"))
+        .await
+        .ok()?;
+    let simulated = r["simulationSuccess"].as_bool().unwrap_or(false);
+    let honeypot = r["honeypotResult"]["isHoneypot"].as_bool().unwrap_or(true);
+    let impact = if liquidity > 0.0 {
+        size / liquidity
+    } else {
+        1.0
+    };
+    Some(Safety {
+        sellable: simulated && !honeypot,
+        // A 0.3 % pool fee and the size's share of the pool, both ways.
+        round_trip_loss: 2.0 * (0.003 + impact),
+        buy_tax: num(&r["simulationResult"]["buyTax"]) / 100.0,
+        sell_tax: num(&r["simulationResult"]["sellTax"]) / 100.0,
+        creator_pct: 0.0,
+        insiders: false,
+    })
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Saved {
+    v1: State,
+    v2: Book2,
+}
+
 pub async fn run() {
     let dir = dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -554,7 +967,7 @@ pub async fn run() {
         return;
     }
     let state_path = dir.join("state.json");
-    let mut state: State = std::fs::read(&state_path)
+    let mut saved: Saved = std::fs::read(&state_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
@@ -564,23 +977,36 @@ pub async fn run() {
         .build()
         .expect("http client");
     let mut rug_cache: HashMap<String, (u64, Rug)> = HashMap::new();
-    info!("meme paper test starting, files in {}", dir.display());
+    let mut safety_cache: HashMap<String, (u64, Safety)> = HashMap::new();
+    info!(
+        "meme paper test (v1 + v2) starting, files in {}",
+        dir.display()
+    );
 
+    let mut round: u64 = 0;
     loop {
+        let started = std::time::Instant::now();
         let now = now_ms();
+        let v1_round = round.is_multiple_of(V1_EVERY);
+        round += 1;
         let fresh = candidates(&http).await;
         let mut wanted: Vec<(String, String)> = fresh.clone();
+        let tracked = |c: &String, t: &String| (c.clone(), t.clone());
+        wanted.extend(saved.v1.open.iter().map(|p| tracked(&p.chain, &p.token)));
         wanted.extend(
-            state
-                .open
-                .iter()
-                .map(|p| (p.chain.clone(), p.token.clone())),
-        );
-        wanted.extend(
-            state
+            saved
+                .v1
                 .followed
                 .iter()
-                .map(|f| (f.chain.clone(), f.token.clone())),
+                .map(|f| tracked(&f.chain, &f.token)),
+        );
+        wanted.extend(saved.v2.open.iter().map(|p| tracked(&p.chain, &p.token)));
+        wanted.extend(
+            saved
+                .v2
+                .followed
+                .iter()
+                .map(|f| tracked(&f.chain, &f.token)),
         );
         let mut uniq = HashSet::new();
         wanted.retain(|(c, t)| uniq.insert(State::key(c, t)));
@@ -618,14 +1044,15 @@ pub async fn run() {
         }
         // A failed fetch would read as every token vanishing: skip the round.
         if failed_fetch {
-            tokio::time::sleep(ROUND).await;
+            tokio::time::sleep(V2_ROUND).await;
             continue;
         }
 
         let mut rugs = HashMap::new();
         for (chain, token) in &fresh {
             let key = State::key(chain, token);
-            if chain != "solana" || state.judged.contains(&key) || !pairs.contains_key(&key) {
+            let judged = saved.v1.judged.contains(&key) && saved.v2.judged.contains(&key);
+            if chain != "solana" || judged || !pairs.contains_key(&key) {
                 continue;
             }
             if let Some((at, rug)) = rug_cache.get(&key) {
@@ -647,63 +1074,47 @@ pub async fn run() {
         }
         rug_cache.retain(|_, (at, _)| now.saturating_sub(*at) < 3_600_000);
 
-        let (closed, done) = state.step(&fresh, &pairs, &rugs, now);
-        for c in &closed {
-            info!(
-                "meme: closed {} {} ({}) {:+.1} %{}",
-                c.pos.chain,
-                c.pos.symbol,
-                c.reason,
-                c.net_pct,
-                if c.rug { " RUG" } else { "" }
-            );
-            append(
-                &dir.join("trades.csv"),
-                "chain,token,symbol,entry_ms,exit_ms,entry_quote,exit_quote,paid,received,reason,net_pct,rug,liquidity0",
-                &format!(
-                    "{},{},{},{},{},{},{},{},{},{},{:.2},{},{:.0}",
-                    c.pos.chain,
-                    c.pos.token,
-                    csv_safe(&c.pos.symbol),
-                    c.pos.entry_ms,
-                    c.exit_ms,
-                    c.pos.quote,
-                    c.exit_quote,
-                    c.pos.paid,
-                    c.received,
-                    c.reason,
-                    c.net_pct,
-                    c.rug,
-                    c.pos.liquidity0
-                ),
-            );
-        }
-        for f in &done {
-            let pct = |p: Option<f64>| {
-                p.filter(|_| f.price0 > 0.0).map_or(String::new(), |p| {
-                    format!("{:.1}", (p / f.price0 - 1.0) * 100.0)
-                })
+        // v2 safety checks, only for pairs that pass v1's rules.
+        let mut safety = HashMap::new();
+        for (chain, token) in &fresh {
+            let key = State::key(chain, token);
+            if saved.v2.judged.contains(&key) {
+                continue;
+            }
+            let Some(pair) = pairs.get(&key) else {
+                continue;
             };
-            append(
-                &dir.join("filtered.csv"),
-                "chain,token,symbol,seen_ms,reason,price0,liquidity0,chg_1h_pct,chg_6h_pct,chg_24h_pct,rug",
-                &format!(
-                    "{},{},{},{},{},{},{:.0},{},{},{},{}",
-                    f.chain,
-                    f.token,
-                    csv_safe(&f.symbol),
-                    f.seen_ms,
-                    f.reason,
-                    f.price0,
-                    f.liquidity0,
-                    pct(f.after[0]),
-                    pct(f.after[1]),
-                    pct(f.after[2]),
-                    is_rug(f.price0, f.liquidity0, f.min_price, f.min_liquidity)
-                ),
-            );
+            if entry_check(pair, rugs.get(&key), now).is_some() {
+                continue;
+            }
+            if let Some((at, s)) = safety_cache.get(&key) {
+                if now.saturating_sub(*at) < 10 * 60_000 {
+                    safety.insert(key, s.clone());
+                    continue;
+                }
+            }
+            let size = v2_size(pair.liquidity);
+            let found = match (chain.as_str(), rugs.get(&key)) {
+                ("solana", Some(rug)) => solana_safety(&http, token, size, rug).await,
+                ("base", _) => base_safety(&http, token, size, pair.liquidity).await,
+                _ => None,
+            };
+            if let Some(s) = found {
+                safety_cache.insert(key.clone(), (now, s.clone()));
+                safety.insert(key, s);
+            }
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
         }
-        match serde_json::to_vec(&state) {
+        safety_cache.retain(|_, (at, _)| now.saturating_sub(*at) < 3_600_000);
+
+        if v1_round {
+            let (closed, done) = saved.v1.step(&fresh, &pairs, &rugs, now);
+            write_v1(&dir, &closed, &done);
+        }
+        let (closed2, done2) = saved.v2.step(&fresh, &pairs, &rugs, &safety, now);
+        write_v2(&dir, &closed2, &done2);
+
+        match serde_json::to_vec(&saved) {
             Ok(bytes) => {
                 let tmp = dir.join("state.json.tmp");
                 if std::fs::write(&tmp, bytes)
@@ -715,14 +1126,124 @@ pub async fn run() {
             }
             Err(e) => error!("meme: {e}"),
         }
-        let summary = state.summary(now);
+        let summary = format!("{}\n{}", saved.v1.summary(now), saved.v2.summary(now));
         let _ = std::fs::write(dir.join("summary.txt"), format!("{summary}\n"));
-        info!(
-            "{summary} | this round: {} candidates, {} pairs",
-            fresh.len(),
-            pairs.len()
+        let took = started.elapsed();
+        // How far behind the stream the bot runs: a round that takes longer
+        // than its interval is lagging.
+        let lag = if took > V2_ROUND { " LAGGING" } else { "" };
+        let _ = std::fs::write(
+            dir.join("round.txt"),
+            format!(
+                "last round {:.1} s of {} s{lag}\n",
+                took.as_secs_f64(),
+                V2_ROUND.as_secs()
+            ),
         );
-        tokio::time::sleep(ROUND).await;
+        info!(
+            "{summary} | round: {} candidates, {} pairs, {:.1} s{lag}",
+            fresh.len(),
+            pairs.len(),
+            took.as_secs_f64()
+        );
+        tokio::time::sleep(V2_ROUND.saturating_sub(took)).await;
+    }
+}
+
+fn write_v1(dir: &Path, closed: &[Closed], done: &[Followed]) {
+    for c in closed {
+        info!(
+            "meme v1: closed {} {} ({}) {:+.1} %{}",
+            c.pos.chain,
+            c.pos.symbol,
+            c.reason,
+            c.net_pct,
+            if c.rug { " RUG" } else { "" }
+        );
+        append(
+            &dir.join("trades.csv"),
+            "chain,token,symbol,entry_ms,exit_ms,entry_quote,exit_quote,paid,received,reason,net_pct,rug,liquidity0",
+            &format!(
+                "{},{},{},{},{},{},{},{},{},{},{:.2},{},{:.0}",
+                c.pos.chain,
+                c.pos.token,
+                csv_safe(&c.pos.symbol),
+                c.pos.entry_ms,
+                c.exit_ms,
+                c.pos.quote,
+                c.exit_quote,
+                c.pos.paid,
+                c.received,
+                c.reason,
+                c.net_pct,
+                c.rug,
+                c.pos.liquidity0
+            ),
+        );
+    }
+    write_followed(&dir.join("filtered.csv"), done);
+}
+
+fn write_v2(dir: &Path, closed: &[Closed2], done: &[Followed]) {
+    for c in closed {
+        let p = &c.pos;
+        info!(
+            "meme v2: closed {} {} ({}) {:+.1} %{}",
+            p.chain,
+            p.symbol,
+            c.reason,
+            p.net_pct(),
+            if c.rug { " RUG" } else { "" }
+        );
+        append(
+            &dir.join("trades_v2.csv"),
+            "chain,token,symbol,entry_ms,exit_ms,entry_quote,peak,size_usd,proceeds_usd,reason,net_pct,rug,liquidity0",
+            &format!(
+                "{},{},{},{},{},{},{},{:.2},{:.2},{},{:.2},{},{:.0}",
+                p.chain,
+                p.token,
+                csv_safe(&p.symbol),
+                p.entry_ms,
+                c.exit_ms,
+                p.quote,
+                p.peak,
+                p.size_usd,
+                p.proceeds,
+                c.reason,
+                p.net_pct(),
+                c.rug,
+                p.liquidity0
+            ),
+        );
+    }
+    write_followed(&dir.join("filtered_v2.csv"), done);
+}
+
+fn write_followed(path: &Path, done: &[Followed]) {
+    for f in done {
+        let pct = |p: Option<f64>| {
+            p.filter(|_| f.price0 > 0.0).map_or(String::new(), |p| {
+                format!("{:.1}", (p / f.price0 - 1.0) * 100.0)
+            })
+        };
+        append(
+            path,
+            "chain,token,symbol,seen_ms,reason,price0,liquidity0,chg_1h_pct,chg_6h_pct,chg_24h_pct,rug",
+            &format!(
+                "{},{},{},{},{},{},{:.0},{},{},{},{}",
+                f.chain,
+                f.token,
+                csv_safe(&f.symbol),
+                f.seen_ms,
+                f.reason,
+                f.price0,
+                f.liquidity0,
+                pct(f.after[0]),
+                pct(f.after[1]),
+                pct(f.after[2]),
+                is_rug(f.price0, f.liquidity0, f.min_price, f.min_liquidity)
+            ),
+        );
     }
 }
 
@@ -755,6 +1276,8 @@ mod tests {
             freeze_authority: false,
             lp_locked_pct: 100.0,
             top10_pct: 20.0,
+            creator_pct: 0.0,
+            insiders: false,
         }
     }
 
@@ -989,5 +1512,165 @@ mod tests {
         assert!((r.top10_pct - 8.0).abs() < 1e-12);
         assert_eq!(r.lp_locked_pct, 100.0);
         assert!(parse_rug(&serde_json::json!({"error": "not found"})).is_none());
+    }
+
+    fn safe2() -> Safety {
+        Safety {
+            sellable: true,
+            round_trip_loss: 0.02,
+            buy_tax: 0.0,
+            sell_tax: 0.0,
+            creator_pct: 1.0,
+            insiders: false,
+        }
+    }
+
+    #[test]
+    fn v2_adds_safety_checks_on_top_of_v1() {
+        let now = 10 * HOUR;
+        let p = at(good("base"), now - 2 * HOUR);
+        assert_eq!(v2_check(&p, None, Some(&safe2()), now), None);
+        assert_eq!(v2_check(&p, None, None, now), Some("no safety check"));
+        let c = |s: Safety| v2_check(&p, None, Some(&s), now);
+        assert_eq!(
+            c(Safety {
+                sellable: false,
+                ..safe2()
+            }),
+            Some("honeypot")
+        );
+        assert_eq!(
+            c(Safety {
+                sell_tax: 0.10,
+                ..safe2()
+            }),
+            Some("tax")
+        );
+        assert_eq!(
+            c(Safety {
+                round_trip_loss: 0.2,
+                ..safe2()
+            }),
+            Some("round trip cost")
+        );
+        assert_eq!(
+            c(Safety {
+                creator_pct: 9.0,
+                ..safe2()
+            }),
+            Some("dev holds too much")
+        );
+        assert_eq!(
+            c(Safety {
+                insiders: true,
+                ..safe2()
+            }),
+            Some("insider cluster")
+        );
+        // v1's own rules still come first.
+        let thin = Pair {
+            liquidity: 1_000.0,
+            ..p
+        };
+        assert_eq!(
+            v2_check(&thin, None, Some(&safe2()), now),
+            Some("liquidity")
+        );
+    }
+
+    #[test]
+    fn v2_costs_and_size_follow_the_quote_and_the_pool() {
+        // 2 % round trip: 1 % + 0.5 % per side, above the 1 % floor.
+        let (i, o) = v2_costs(&safe2());
+        assert!((i - 0.015).abs() < 1e-12 && (o - 0.015).abs() < 1e-12);
+        let (i, o) = v2_costs(&Safety {
+            round_trip_loss: 0.0,
+            sell_tax: 0.03,
+            ..safe2()
+        });
+        assert!((i - 0.01).abs() < 1e-12 && (o - 0.04).abs() < 1e-12);
+        assert_eq!(v2_size(1_000_000.0), 100.0);
+        assert_eq!(v2_size(10_000.0), 50.0);
+        assert_eq!(v2_size(1_000.0), 20.0);
+    }
+
+    fn pos2() -> Position2 {
+        Position2 {
+            chain: "base".into(),
+            token: "T".into(),
+            symbol: "MEME".into(),
+            entry_ms: 0,
+            quote: 1.0,
+            size_usd: 100.0,
+            tokens: 100.0,
+            cost_out: 0.0,
+            left: 1.0,
+            proceeds: 0.0,
+            peak: 1.0,
+            liquidity0: 50_000.0,
+            min_liquidity: 50_000.0,
+            min_price: 1.0,
+        }
+    }
+
+    #[test]
+    fn v2_takes_half_at_50_then_trails_the_rest() {
+        let mut p = pos2();
+        assert_eq!(p.update(1.6, HOUR), None);
+        assert!((p.left - 0.5).abs() < 1e-12 && (p.proceeds - 80.0).abs() < 1e-9);
+        assert_eq!(p.update(2.4, 2 * HOUR), None);
+        // 25 % off the 2.4 peak.
+        assert_eq!(p.update(1.75, 3 * HOUR), Some("trail"));
+        assert!((p.proceeds - 167.5).abs() < 1e-9);
+        assert!((p.net_pct() - 67.5).abs() < 1e-9);
+        let mut p = pos2();
+        p.update(1.6, HOUR);
+        assert_eq!(p.update(3.1, 2 * HOUR), Some("tp2"));
+        let mut p = pos2();
+        p.update(1.6, HOUR);
+        assert_eq!(p.update(1.0, 2 * HOUR), Some("trail"));
+        let mut p = pos2();
+        assert_eq!(p.update(0.69, HOUR), Some("stop"));
+        assert_eq!(p.left, 0.0);
+        let mut p = pos2();
+        assert_eq!(p.update(1.1, 25 * HOUR), Some("time"));
+    }
+
+    #[test]
+    fn v2_book_waits_for_the_safety_check_then_enters() {
+        let mut b = Book2::default();
+        let cands = vec![("base".to_string(), "T".to_string())];
+        let now = 10 * HOUR;
+        let mut pairs = feed(1.0, 50_000.0);
+        for p in pairs.values_mut() {
+            p.created_ms = now - 2 * HOUR;
+        }
+        b.step(&cands, &pairs, &HashMap::new(), &HashMap::new(), now);
+        assert!(b.open.is_empty() && b.followed.is_empty());
+        let safety = HashMap::from([(State::key("base", "T"), safe2())]);
+        b.step(&cands, &pairs, &HashMap::new(), &safety, now + 60_000);
+        assert_eq!(b.open.len(), 1);
+        assert_eq!(b.open[0].size_usd, 100.0);
+        let (c, _) = b.step(
+            &cands,
+            &HashMap::new(),
+            &HashMap::new(),
+            &safety,
+            now + HOUR,
+        );
+        assert_eq!(c[0].reason, "vanished");
+        assert!((b.pnl_usd + 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rugcheck_creator_share_and_insiders() {
+        let rug: Value = serde_json::json!({
+            "risks": [], "mintAuthority": null, "freezeAuthority": null,
+            "token": {"supply": 1000.0}, "creatorBalance": 80.0,
+            "graphInsidersDetected": 2, "topHolders": [], "markets": []
+        });
+        let r = parse_rug(&rug).unwrap();
+        assert!((r.creator_pct - 8.0).abs() < 1e-12);
+        assert!(r.insiders);
     }
 }
