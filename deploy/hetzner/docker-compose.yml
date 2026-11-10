@@ -27,6 +27,9 @@ services:
   # and writes to /var/lib/tempest/meme. Started by deploy.sh.
   meme:
     image: tempest:latest
+    # Only TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, copied from bot.env by
+    # deploy.sh: this container never sees the exchange keys.
+    env_file: /etc/tempest/meme.env
     environment:
       MODE: memepaper
       MEME_DIR: /data

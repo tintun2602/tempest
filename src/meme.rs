@@ -958,6 +958,51 @@ async fn base_safety(
 struct Saved {
     v1: State,
     v2: Book2,
+    /// UTC day (days since 1970) of the last daily Telegram summary.
+    #[serde(default)]
+    last_daily: u64,
+    #[serde(default)]
+    report_sent: bool,
+}
+
+const RUN_DAYS: u64 = 14;
+/// Failed rounds in a row before Telegram hears about it, and how often after.
+const ALERT_AFTER_FAILURES: u32 = 3;
+const ALERT_EVERY_MS: u64 = 3_600_000;
+
+/// The short daily Telegram line: trades and result for v1 and v2.
+fn daily_text(saved: &Saved, now_ms: u64) -> String {
+    let v1 = &saved.v1;
+    let v2 = &saved.v2;
+    let v1_mean = if v1.closed > 0 {
+        v1.net_pct_sum / f64::from(v1.closed)
+    } else {
+        0.0
+    };
+    let rug_rate = |rugs: u32, n: u32| {
+        if n > 0 {
+            100.0 * f64::from(rugs) / f64::from(n)
+        } else {
+            0.0
+        }
+    };
+    format!(
+        "\u{1f438} *Meme paper*, day {:.0} of {RUN_DAYS}\n\
+         v1: {} trades, {:+.1} %/trade after costs, rugs {:.0} %\n\
+         v2: {} trades, {:+.2} USD after costs, rugs {:.0} %\n\
+         Filtered tokens that rugged: v1 {}/{}, v2 {}/{}",
+        now_ms.saturating_sub(v1.started_ms.min(v2.started_ms).max(1)) as f64 / 86_400_000.0,
+        v1.closed,
+        v1_mean,
+        rug_rate(v1.rugs_traded, v1.closed),
+        v2.closed,
+        v2.pnl_usd,
+        rug_rate(v2.rugs_traded, v2.closed),
+        v1.rugs_filtered,
+        v1.filtered_done,
+        v2.rugs_filtered,
+        v2.filtered_done,
+    )
 }
 
 pub async fn run() {
@@ -982,6 +1027,12 @@ pub async fn run() {
         "meme paper test (v1 + v2) starting, files in {}",
         dir.display()
     );
+    let notifier = crate::notify::Notifier::from_env();
+    notifier
+        .send("\u{1f438} *Meme paper test started* (v1 + v2, no money). Daily summary once a day.")
+        .await;
+    let mut failures: u32 = 0;
+    let mut last_alert: u64 = 0;
 
     let mut round: u64 = 0;
     loop {
@@ -1044,9 +1095,20 @@ pub async fn run() {
         }
         // A failed fetch would read as every token vanishing: skip the round.
         if failed_fetch {
+            failures += 1;
+            if failures >= ALERT_AFTER_FAILURES && now.saturating_sub(last_alert) >= ALERT_EVERY_MS
+            {
+                last_alert = now;
+                notifier
+                    .send(&format!(
+                        "\u{26a0}\u{fe0f} *Meme paper*: DexScreener has failed {failures} rounds in a row"
+                    ))
+                    .await;
+            }
             tokio::time::sleep(V2_ROUND).await;
             continue;
         }
+        failures = 0;
 
         let mut rugs = HashMap::new();
         for (chain, token) in &fresh {
@@ -1114,6 +1176,22 @@ pub async fn run() {
         let (closed2, done2) = saved.v2.step(&fresh, &pairs, &rugs, &safety, now);
         write_v2(&dir, &closed2, &done2);
 
+        let day = now / 86_400_000;
+        if saved.last_daily == 0 {
+            saved.last_daily = day;
+        } else if day > saved.last_daily {
+            saved.last_daily = day;
+            notifier.send(&daily_text(&saved, now)).await;
+        }
+        if !saved.report_sent && now.saturating_sub(saved.v1.started_ms) >= RUN_DAYS * 86_400_000 {
+            saved.report_sent = true;
+            notifier
+                .send(&format!(
+                    "\u{1f4cb} *Meme paper: {RUN_DAYS} days done.* The report goes to HQ.\n{}",
+                    daily_text(&saved, now)
+                ))
+                .await;
+        }
         match serde_json::to_vec(&saved) {
             Ok(bytes) => {
                 let tmp = dir.join("state.json.tmp");
@@ -1672,5 +1750,24 @@ mod tests {
         let r = parse_rug(&rug).unwrap();
         assert!((r.creator_pct - 8.0).abs() < 1e-12);
         assert!(r.insiders);
+    }
+
+    #[test]
+    fn the_daily_telegram_line_has_both_versions() {
+        let mut saved = Saved::default();
+        saved.v1.started_ms = 1;
+        saved.v2.started_ms = 1;
+        saved.v1.closed = 4;
+        saved.v1.net_pct_sum = -20.0;
+        saved.v1.rugs_traded = 1;
+        saved.v2.closed = 2;
+        saved.v2.pnl_usd = 12.5;
+        let t = daily_text(&saved, 3 * 86_400_000);
+        assert!(t.contains("day 3 of 14"), "{t}");
+        assert!(
+            t.contains("v1: 4 trades, -5.0 %/trade after costs, rugs 25 %"),
+            "{t}"
+        );
+        assert!(t.contains("v2: 2 trades, +12.50 USD"), "{t}");
     }
 }

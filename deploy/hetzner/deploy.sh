@@ -38,6 +38,9 @@ fi
 # Build first: a failed build leaves the running bot as it was, and the next
 # run tries again because the stamp still names the old commit.
 $compose build bot
+# The meme paper test gets only the Telegram settings, never the exchange keys.
+grep -E '^TELEGRAM_(BOT_TOKEN|CHAT_ID)=' /etc/tempest/bot.env > /etc/tempest/meme.env || true
+chmod 600 /etc/tempest/meme.env
 $compose up -d bot meme
 if [[ -f /etc/tempest/freqai-secrets.json ]]; then
   # Restart FreqAI only when its own files changed: a restart costs it the
