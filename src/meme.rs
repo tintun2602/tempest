@@ -1038,7 +1038,9 @@ pub async fn run() {
     loop {
         let started = std::time::Instant::now();
         let now = now_ms();
-        let v1_round = round.is_multiple_of(V1_EVERY);
+        // `u64::is_multiple_of` needs Rust 1.87; the Dockerfile builds on 1.85.
+        #[allow(clippy::manual_is_multiple_of)]
+        let v1_round = round % V1_EVERY == 0;
         round += 1;
         let fresh = candidates(&http).await;
         let mut wanted: Vec<(String, String)> = fresh.clone();
