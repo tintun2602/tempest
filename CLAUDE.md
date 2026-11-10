@@ -35,9 +35,9 @@ asks.
 ## Live settings
 
 In git, `deploy/hetzner/settings.env` (wins over bot.env; change by pushing):
-`TRADING_PAIRS=BTCUSDC,ETHUSDC,SOLUSDC`, `MAX_OPEN_POSITIONS=3`,
+`TRADING_PAIRS=BTCUSDC,ETHUSDC,SOLUSDC`, `MAX_OPEN_POSITIONS=2`,
 `TREND_INTERVAL=1d`, `SIGNAL_INTERVAL=4h` (owner, 2026-11-07). Each position
-gets at most a third of the margin (equity / MAX_OPEN_POSITIONS).
+gets at most half of the margin (equity / MAX_OPEN_POSITIONS).
 
 In `/etc/tempest/bot.env` on the server: `MARKET=futures`,
 `STRATEGY=breakout`, `POLL_INTERVAL_SECONDS=300`, `LEVERAGE=20`,
