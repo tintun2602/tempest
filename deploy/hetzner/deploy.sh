@@ -38,7 +38,7 @@ fi
 # Build first: a failed build leaves the running bot as it was, and the next
 # run tries again because the stamp still names the old commit.
 $compose build bot
-$compose up -d bot
+$compose up -d bot meme
 if [[ -f /etc/tempest/freqai-secrets.json ]]; then
   # Restart FreqAI only when its own files changed: a restart costs it the
   # current candle's predictions, and Tempest commits do not concern it.

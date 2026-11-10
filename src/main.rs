@@ -7,6 +7,7 @@ mod executor;
 mod futures;
 mod indicators;
 mod lab;
+mod meme;
 mod notify;
 mod risk;
 mod strategies;
@@ -112,6 +113,18 @@ const EMERGENCY_TARGET_PCT: f64 = 1.06;
 
 #[tokio::main]
 async fn main() {
+    // The meme-coin paper test needs no exchange keys, so it starts before
+    // the config (which requires them) is read.
+    if env::var("MODE").unwrap_or_default() == "memepaper" {
+        if env::var("RUST_LOG").is_err() {
+            env::set_var("RUST_LOG", "info");
+        }
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .init();
+        meme::run().await;
+        return;
+    }
     let config = Config::from_env();
 
     tracing_subscriber::fmt()

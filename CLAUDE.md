@@ -55,6 +55,10 @@ off.
 - `src/strategies.rs`, `src/strategy.rs`: strategies and their short mirrors.
 - `src/lab.rs`, `src/archive.rs`: backtest lab (`MODE=lab LAB_MARKET=futures`,
   data from data.binance.vision; `LAB_END_DAYS_AGO` for older periods).
+- `src/meme.rs`: meme-coin paper test (`MODE=memepaper`, container `meme`,
+  2026-11-10 for 14 days): DexScreener + RugCheck every 5 min, fixed rules,
+  no money. Output in `/var/lib/tempest/meme`, copied to diablo `meme/`.
+  Plan: playbook `agents/trading/meme-paper-plan.md`.
 - Spot mode (`src/main.rs`, `executor.rs`) is the original bot, unused now.
 
 ## What the lab showed

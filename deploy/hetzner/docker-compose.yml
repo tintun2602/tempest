@@ -23,6 +23,18 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  # Meme-coin paper test: no keys, no money; reads DexScreener and RugCheck
+  # and writes to /var/lib/tempest/meme. Started by deploy.sh.
+  meme:
+    image: tempest:latest
+    environment:
+      MODE: memepaper
+      MEME_DIR: /data
+    volumes:
+      - /var/lib/tempest/meme:/data
+    restart: unless-stopped
+    logging: *logging
+
   # Not started by `up`; cron runs it with `docker compose run --rm lab`.
   lab:
     image: tempest:latest

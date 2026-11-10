@@ -57,6 +57,21 @@ block() { echo '```'; cat; echo '```'; }
     echo "No lab log yet."
   fi
   echo
+  echo "## Meme paper test (one line per day; CSVs in meme/)"
+  meme=/var/lib/tempest/meme
+  if [[ -f "$meme/summary.txt" ]]; then
+    # Once a day, the latest summary becomes that day's line.
+    today=$(date -u +%F)
+    grep -q "^$today " "$meme/daily.txt" 2>/dev/null \
+      || echo "$today $(cat "$meme/summary.txt")" >> "$meme/daily.txt"
+    mkdir -p meme
+    cp -f "$meme"/daily.txt "$meme"/trades.csv "$meme"/filtered.csv meme/ 2>/dev/null
+    git add meme 2>/dev/null
+    { cat "$meme/daily.txt"; echo "now: $(cat "$meme/summary.txt")"; } | scrub | block
+  else
+    echo "Not started."
+  fi
+  echo
   echo "## Last 30 log lines"
   docker logs --tail 30 "$bot" 2>&1 | scrub | block
 } > status.md
