@@ -16,7 +16,9 @@
 
 use crate::config::Config;
 use crate::exchange::binance_futures::{BinanceFuturesClient, PRODUCTION_URL};
-use crate::exchange::{Candle, FuturesExchange, FuturesPosition, Side, SymbolFilters, TriggerKind};
+use crate::exchange::{
+    Candle, FuturesExchange, FuturesPosition, Side, SymbolFilters, TriggerKind, TriggerOrder,
+};
 use crate::notify::Notifier;
 use crate::risk::{CashFlow, RiskManager};
 use crate::strategies::{StrategyKind, REWARD_RISK};
@@ -389,6 +391,14 @@ async fn manage_symbol<E: FuturesExchange>(
     if let Some(pos) = pos {
         // Protection first: it must not depend on candles being available.
         ensure_stop(ex, &filters, pos, snap.as_ref().map(|s| s.atr_14), notifier).await?;
+        if params.breakeven_reached(
+            pos.is_short(),
+            pos.entry_price,
+            pos.mark_price,
+            f64::from(leverage),
+        ) {
+            move_stop_to_entry(ex, &filters, pos, notifier).await?;
+        }
         let (Some(snap), Ok((_, signal))) = (snap.as_ref(), candles.as_ref()) else {
             return Ok(Traded::Nothing);
         };
@@ -747,6 +757,53 @@ async fn ensure_stop<E: FuturesExchange>(
     Ok(())
 }
 
+/// The break-even rule: replace a stop that would still lose money with one
+/// at the entry price. The new stop goes in before the old one is cancelled,
+/// so the position is never without one. A stop already at or past the
+/// entry (one the owner moved by hand, say) is left alone.
+async fn move_stop_to_entry<E: FuturesExchange>(
+    ex: &E,
+    filters: &SymbolFilters,
+    pos: &FuturesPosition,
+    notifier: &Notifier,
+) -> Result<(), String> {
+    let short = pos.is_short();
+    let close_side = if short { Side::Buy } else { Side::Sell };
+    let stops: Vec<TriggerOrder> = ex
+        .trigger_orders(&pos.symbol)
+        .await?
+        .into_iter()
+        .filter(|o| o.kind == Some(TriggerKind::Stop) && o.side == close_side)
+        .collect();
+    let locked = |p: f64| {
+        if short {
+            p <= pos.entry_price
+        } else {
+            p >= pos.entry_price
+        }
+    };
+    if stops.iter().any(|o| locked(o.trigger_price)) {
+        return Ok(());
+    }
+    // Rounded toward profit: down for a short, up for a long.
+    let stop = round_away(filters, pos.entry_price, !short);
+    ex.place_trigger(&pos.symbol, close_side, TriggerKind::Stop, stop)
+        .await
+        .map_err(|e| format!("break-even stop not placed: {e}"))?;
+    for old in &stops {
+        if let Err(e) = ex.cancel_trigger(&pos.symbol, old.id).await {
+            warn!("{}: old stop {} not cancelled: {e}", pos.symbol, old.id);
+        }
+    }
+    let msg = format!(
+        "\u{1f512} *{}* stop moved to entry `{stop}` (mark `{:.2}`)",
+        pos.symbol, pos.mark_price
+    );
+    info!("{msg}");
+    notifier.send(&msg).await;
+    Ok(())
+}
+
 /// Round `price` to the tick, up when `up` (a short's stop, a long's target:
 /// never closer to the market than asked) and down otherwise.
 fn round_away(filters: &SymbolFilters, price: f64, up: bool) -> f64 {
@@ -894,6 +951,10 @@ mod tests {
                 }
             }
             Ok(1)
+        }
+        async fn cancel_trigger(&self, _: &str, id: u64) -> Result<(), String> {
+            self.push(format!("cancel {id}"));
+            Ok(())
         }
         async fn cancel_all(&self, _: &str) -> Result<(), String> {
             self.push("cancel_all".into());
@@ -1256,6 +1317,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ex.log(), vec!["trigger Stop BUY 2060"]);
+    }
+
+    #[tokio::test]
+    async fn the_break_even_rule_moves_a_losing_stop_to_the_entry() {
+        let ex = Fake::default();
+        ex.triggers.lock().unwrap().push(TriggerOrder {
+            id: 7,
+            kind: Some(TriggerKind::Stop),
+            side: Side::Buy,
+            trigger_price: 2_100.0,
+        });
+        let short = FuturesPosition {
+            mark_price: 1_900.0,
+            ..position(-0.02)
+        };
+        move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet())
+            .await
+            .unwrap();
+        // The new stop first, then the old one goes.
+        assert_eq!(ex.log(), vec!["trigger Stop BUY 2000", "cancel 7"]);
+    }
+
+    #[tokio::test]
+    async fn a_stop_already_at_the_entry_is_left_alone() {
+        let ex = Fake::default();
+        ex.triggers.lock().unwrap().push(TriggerOrder {
+            id: 8,
+            kind: Some(TriggerKind::Stop),
+            side: Side::Buy,
+            trigger_price: 1_999.9,
+        });
+        let short = FuturesPosition {
+            mark_price: 1_900.0,
+            ..position(-0.02)
+        };
+        move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet())
+            .await
+            .unwrap();
+        assert!(ex.log().is_empty());
     }
 
     #[tokio::test]

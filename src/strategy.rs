@@ -73,6 +73,9 @@ pub struct StrategyParams {
     /// deletes the fat right tail trend-following depends on — measured here,
     /// *every* winning trade exited at the target and none ran further.
     pub trailing_stop_atr: f64,
+    /// Move the stop to the entry price once the position's return on margin
+    /// (price move x leverage) reaches this many percent. Zero disables it.
+    pub breakeven_roi_pct: f64,
 }
 
 /// Buffers used when `ENTRY_BUFFER_ATR` / `EXIT_BUFFER_ATR` are unset. Change
@@ -86,6 +89,7 @@ impl Default for StrategyParams {
             entry_buffer_atr: DEFAULT_ENTRY_BUFFER_ATR,
             exit_buffer_atr: DEFAULT_EXIT_BUFFER_ATR,
             trailing_stop_atr: 0.0,
+            breakeven_roi_pct: 0.0,
         }
     }
 }
@@ -104,7 +108,19 @@ impl StrategyParams {
             entry_buffer_atr: read("ENTRY_BUFFER_ATR", defaults.entry_buffer_atr),
             exit_buffer_atr: read("EXIT_BUFFER_ATR", defaults.exit_buffer_atr),
             trailing_stop_atr: read("TRAILING_STOP_ATR", defaults.trailing_stop_atr),
+            breakeven_roi_pct: read("BREAKEVEN_ROI_PCT", defaults.breakeven_roi_pct),
         }
+    }
+
+    /// Whether a position entered at `entry` has earned a break-even stop at
+    /// `price`: its move in its own favour, times `leverage`, is at least
+    /// `breakeven_roi_pct` percent of margin.
+    pub fn breakeven_reached(&self, short: bool, entry: f64, price: f64, leverage: f64) -> bool {
+        if self.breakeven_roi_pct <= 0.0 || entry <= 0.0 || !price.is_finite() {
+            return false;
+        }
+        let gain = if short { entry - price } else { price - entry } / entry;
+        gain * leverage * 100.0 >= self.breakeven_roi_pct
     }
 
     /// Price must clear this to enter.
@@ -587,6 +603,21 @@ mod tests {
     }
 
     /// The original behaviour: entry and exit both sit exactly on EMA50.
+    #[test]
+    fn break_even_triggers_at_the_return_on_margin() {
+        let p = StrategyParams {
+            breakeven_roi_pct: 100.0,
+            ..bare()
+        };
+        // 20x: a 5 % move is 100 % on margin.
+        assert!(p.breakeven_reached(true, 2_000.0, 1_900.0, 20.0));
+        assert!(!p.breakeven_reached(true, 2_000.0, 1_910.0, 20.0));
+        assert!(p.breakeven_reached(false, 100.0, 105.0, 20.0));
+        assert!(!p.breakeven_reached(false, 100.0, 95.0, 20.0));
+        // Off by default.
+        assert!(!bare().breakeven_reached(true, 2_000.0, 1_000.0, 20.0));
+    }
+
     fn bare() -> StrategyParams {
         StrategyParams::default()
     }

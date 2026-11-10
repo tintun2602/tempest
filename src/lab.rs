@@ -404,11 +404,21 @@ fn simulate(
                 let (price, resting) = venue_fill(pos, price, resting, venue, costs);
                 trades.push(close(kinds[k], pos, price, resting, bar, split_time, costs));
                 *slot = None;
-            } else if pos.short {
-                // Ratchet after the exit test, never before it.
-                pos.extreme = pos.extreme.min(bar.low);
             } else {
-                pos.extreme = pos.extreme.max(bar.high);
+                // Ratchet after the exit test, never before it.
+                if pos.short {
+                    pos.extreme = pos.extreme.min(bar.low);
+                } else {
+                    pos.extreme = pos.extreme.max(bar.high);
+                }
+                if params.breakeven_reached(pos.short, pos.entry_price, pos.extreme, venue.leverage)
+                {
+                    pos.stop = if pos.short {
+                        pos.stop.min(pos.entry_price)
+                    } else {
+                        pos.stop.max(pos.entry_price)
+                    };
+                }
             }
         }
 

@@ -206,6 +206,13 @@ impl FuturesExchange for BinanceFuturesClient {
             .ok_or_else(|| format!("no algoId in conditional order response: {resp}"))
     }
 
+    async fn cancel_trigger(&self, symbol: &str, id: u64) -> Result<(), String> {
+        let params = format!("symbol={symbol}&algoId={id}");
+        self.signed(reqwest::Method::DELETE, "/fapi/v1/algoOrder", &params)
+            .await?;
+        Ok(())
+    }
+
     async fn cancel_all(&self, symbol: &str) -> Result<(), String> {
         let params = format!("symbol={symbol}");
         self.signed(reqwest::Method::DELETE, "/fapi/v1/algoOpenOrders", &params)

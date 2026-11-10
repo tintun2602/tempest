@@ -541,6 +541,13 @@ pub trait FuturesExchange {
     /// Cancel every open order on `symbol`, conditional ones included.
     fn cancel_all(&self, symbol: &str) -> impl Future<Output = Result<(), String>> + Send;
 
+    /// Cancel one conditional order by the id `trigger_orders` reported.
+    fn cancel_trigger(
+        &self,
+        symbol: &str,
+        id: u64,
+    ) -> impl Future<Output = Result<(), String>> + Send;
+
     fn set_leverage(
         &self,
         symbol: &str,
