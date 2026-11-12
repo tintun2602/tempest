@@ -148,6 +148,32 @@ impl Venue {
     }
 }
 
+/// Research only (`LAB_BTC_REGIME=1`): per closed BTC trend candle, whether
+/// BTC closed above its own EMA200. With it set, longs open only while BTC is
+/// above and shorts only while it is below. Empty or unset: no filter.
+static BTC_REGIME: std::sync::OnceLock<Vec<(u64, bool)>> = std::sync::OnceLock::new();
+
+/// Research only (`LAB_SIDE=long|short`): take entries on one side only.
+fn side_allows(short: bool) -> bool {
+    match std::env::var("LAB_SIDE").unwrap_or_default().trim() {
+        "long" => !short,
+        "short" => short,
+        _ => true,
+    }
+}
+
+/// Whether the BTC regime filter lets an entry on this side through at `time_ms`.
+fn regime_allows(short: bool, time_ms: u64) -> bool {
+    let Some(regime) = BTC_REGIME.get() else {
+        return true;
+    };
+    let closed = regime.partition_point(|(t, _)| *t <= time_ms);
+    match closed.checked_sub(1).map(|i| regime[i].1) {
+        Some(above) => above != short,
+        None => false,
+    }
+}
+
 /// One pair's history: trend and signal candles, and funding events
 /// `(time_ms, rate)` (empty on spot).
 struct Feed {
@@ -224,6 +250,29 @@ pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
     let signal_bars = (days * 86_400_000 / signal_ms) as usize;
     let trend_bars = (signal_bars as u64 * signal_ms / trend_ms) as usize + TREND_WINDOW + 10;
     let http = reqwest::Client::new();
+
+    if venue.futures && std::env::var("LAB_BTC_REGIME").is_ok_and(|v| v.trim() == "1") {
+        let end = lab_end_ms(now_ms());
+        let start = end.saturating_sub(trend_bars as u64 * trend_ms);
+        match archive::futures_klines(&http, "BTCUSDT", &config.trend_interval, start, end).await {
+            Ok(btc) => {
+                let closes: Vec<f64> = btc.iter().map(|c| c.close).collect();
+                let ema = crate::indicators::ema(&closes, 200);
+                let regime: Vec<(u64, bool)> = btc
+                    .iter()
+                    .zip(&ema)
+                    .filter(|(_, e)| e.is_finite())
+                    .map(|(c, e)| (c.close_time, c.close > *e))
+                    .collect();
+                info!("lab: BTC regime filter on, {} trend candles", regime.len());
+                let _ = BTC_REGIME.set(regime);
+            }
+            Err(e) => {
+                error!("lab: BTC regime data failed: {e}");
+                return;
+            }
+        }
+    }
 
     let mut trades: Vec<LabTrade> = Vec::new();
     let mut feeds: Vec<Feed> = Vec::new();
@@ -470,7 +519,10 @@ fn simulate(
                     let decision = kind.evaluate("LAB", &snap, signal_view, params);
                     let last_rate = next_funding.checked_sub(1).map(|i| feed.funding[i].1);
                     open[k] = if decision.signal == Signal::Buy {
-                        if !venue.funding_allows(false, last_rate) {
+                        if !venue.funding_allows(false, last_rate)
+                            || !side_allows(false)
+                            || !regime_allows(false, bar.close_time)
+                        {
                             continue;
                         }
                         let entry_price = costs.buy_fill(decision.entry_price);
@@ -486,7 +538,9 @@ fn simulate(
                     } else if venue.futures {
                         match kind.evaluate_short(&snap, signal_view, params) {
                             ShortDecision::Enter { stop_loss }
-                                if venue.funding_allows(true, last_rate) =>
+                                if venue.funding_allows(true, last_rate)
+                                    && side_allows(true)
+                                    && regime_allows(true, bar.close_time) =>
                             {
                                 open_position(
                                     true,
