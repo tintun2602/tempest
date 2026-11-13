@@ -6,6 +6,10 @@
 set -euo pipefail
 here=/opt/tempest/deploy/hetzner
 
+# The bot's state directory (mounted into the container; holds the day's
+# drawdown baseline and halt across restarts).
+install -d /var/lib/tempest/bot
+
 # The uptime monitor was tried and dropped; remove its cron job if an
 # earlier deploy installed it.
 rm -f /etc/cron.d/tempest-monitor

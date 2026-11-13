@@ -155,8 +155,20 @@ pub async fn run(config: &Config) {
     };
     last_error.clear();
 
+    // The day's baseline and halt come back from disk: a deploy restarts the
+    // bot, and must not re-enable entries on a day already halted.
     let mut risk = RiskManager::with_risk_per_trade(equity, config.risk_per_trade)
-        .with_limits(config.max_open_positions, config.daily_drawdown_limit);
+        .with_limits(config.max_open_positions, config.daily_drawdown_limit)
+        .with_state_file(crate::risk::state_file_from_env());
+    if risk.halted {
+        let msg = format!(
+            "\u{1f6d1} *Still halted* after the restart: today's drawdown limit was hit earlier \
+             (day open `{:.2}`). No new entries until the next UTC day.",
+            risk.day_open_equity
+        );
+        warn!("{msg}");
+        notifier.send(&msg).await;
+    }
     let mut rate_limited_cycles = 0u32;
     loop {
         let mut wait = poll;

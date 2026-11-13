@@ -20,6 +20,10 @@ services:
     env_file:
       - /etc/tempest/bot.env
       - settings.env
+    # The day's drawdown baseline and halt (risk-state.json), so a deploy
+    # does not lift a halt. STATE_DIR defaults to this path.
+    volumes:
+      - /var/lib/tempest/bot:/var/lib/tempest
     restart: unless-stopped
     logging: *logging
 

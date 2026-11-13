@@ -32,7 +32,7 @@ if [[ ! -d /opt/tempest/.git ]]; then
   git clone --quiet "$REPO" /opt/tempest
 fi
 install -d -m 700 /etc/tempest
-install -d /var/lib/tempest /var/log/tempest
+install -d /var/lib/tempest /var/lib/tempest/bot /var/log/tempest
 # FreqAI's data, models and trade database; the Freqtrade image runs as uid 1000.
 install -d -o 1000 -g 1000 /var/lib/tempest/freqai /var/lib/tempest/freqai/logs
 for f in bot lab; do

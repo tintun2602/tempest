@@ -1,4 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
@@ -51,6 +53,73 @@ pub struct RiskManager {
     cash_flows: HashMap<String, f64>,
     current_utc_day: u32,
     pub halted: bool,
+    /// Where the day's state is kept across restarts; `None` keeps it in
+    /// memory only.
+    state_path: Option<PathBuf>,
+}
+
+/// The part of [`RiskManager`] that must outlive a restart: without it every
+/// deploy would lift the day's drawdown halt and measure the rest of the day
+/// from a fresh baseline.
+#[derive(Debug, Serialize, Deserialize)]
+struct DayState {
+    utc_day: u32,
+    day_open_equity: f64,
+    day_open_at_ms: u64,
+    cash_flows: HashMap<String, f64>,
+    halted: bool,
+}
+
+const STATE_FILE: &str = "risk-state.json";
+
+/// The day-state file: `risk-state.json` in `STATE_DIR` (default
+/// `/var/lib/tempest`).
+pub fn state_file_from_env() -> PathBuf {
+    let dir = std::env::var("STATE_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "/var/lib/tempest".into());
+    PathBuf::from(dir).join(STATE_FILE)
+}
+
+/// Today's saved state, or `None` (with a warning unless the file is simply
+/// not there) when it is missing, unreadable, corrupt or from another day.
+fn load_day_state(path: &Path, today: u32) -> Option<DayState> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(
+                "Day state {} not readable ({e}); starting fresh",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let state: DayState = match serde_json::from_slice(&bytes) {
+        Ok(state) => state,
+        Err(e) => {
+            warn!(
+                "Day state {} is corrupt ({e}); starting fresh",
+                path.display()
+            );
+            return None;
+        }
+    };
+    if state.utc_day != today {
+        return None;
+    }
+    let sane = state.day_open_equity.is_finite()
+        && state.day_open_equity > 0.0
+        && state.cash_flows.values().all(|v| v.is_finite());
+    if !sane {
+        warn!(
+            "Day state {} holds impossible numbers; starting fresh",
+            path.display()
+        );
+        return None;
+    }
+    Some(state)
 }
 
 /// A deposit or withdrawal, valued in the quote currency.
@@ -81,6 +150,57 @@ impl RiskManager {
             cash_flows: HashMap::new(),
             current_utc_day: utc_day_number(),
             halted: false,
+            state_path: None,
+        }
+    }
+
+    /// Keep the day's baseline, cash flows and halt in the file at `path`,
+    /// and take them from it now if it was written earlier this UTC day. A
+    /// file that is missing, unreadable, corrupt or from another day is
+    /// ignored: the bot starts fresh and overwrites it.
+    pub fn with_state_file(mut self, path: PathBuf) -> Self {
+        if let Some(state) = load_day_state(&path, self.current_utc_day) {
+            info!(
+                "Resuming today's risk state from {}: day open {:.2}, halted {}",
+                path.display(),
+                state.day_open_equity,
+                state.halted
+            );
+            self.day_open_equity = state.day_open_equity;
+            self.day_open_at_ms = state.day_open_at_ms;
+            self.cash_flows = state.cash_flows;
+            self.halted = state.halted;
+        }
+        self.state_path = Some(path);
+        self.persist();
+        self
+    }
+
+    /// Write the day's state, atomically (temp file, then rename). Failing
+    /// to is logged and nothing more: the bot must run without the file.
+    fn persist(&self) {
+        let Some(path) = &self.state_path else {
+            return;
+        };
+        let state = DayState {
+            utc_day: self.current_utc_day,
+            day_open_equity: self.day_open_equity,
+            day_open_at_ms: self.day_open_at_ms,
+            cash_flows: self.cash_flows.clone(),
+            halted: self.halted,
+        };
+        let tmp = path.with_extension("json.tmp");
+        let written = serde_json::to_vec(&state)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| {
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                std::fs::write(&tmp, bytes)?;
+                std::fs::rename(&tmp, path)
+            });
+        if let Err(e) = written {
+            warn!("Day state not saved to {}: {e}", path.display());
         }
     }
 
@@ -104,6 +224,7 @@ impl RiskManager {
             self.cash_flows.clear();
             self.current_utc_day = today;
             self.halted = false;
+            self.persist();
         }
     }
 
@@ -128,6 +249,9 @@ impl RiskManager {
             }
             let value = previous.get(&flow.id).copied().unwrap_or(flow.value);
             self.cash_flows.insert(flow.id.clone(), value);
+        }
+        if self.cash_flows != previous {
+            self.persist();
         }
     }
 
@@ -174,6 +298,7 @@ impl RiskManager {
                 current_equity
             );
             self.halted = true;
+            self.persist();
             return true;
         }
         false
@@ -557,5 +682,119 @@ mod tests {
         rm.set_cash_flows(&[earlier]);
         assert_eq!(rm.net_cash_flow(), 0.0);
         assert_eq!(rm.day_baseline(), 10_000.0);
+    }
+
+    // ----- day state across restarts -----
+
+    /// A state file of its own for one test, in a fresh directory.
+    fn state_file(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tempest-risk-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("nested").join(STATE_FILE)
+    }
+
+    fn started(equity: f64, path: &Path) -> RiskManager {
+        RiskManager::new(equity)
+            .with_limits(2, 0.5)
+            .with_state_file(path.to_path_buf())
+    }
+
+    #[test]
+    fn a_halt_and_the_day_baseline_survive_a_restart_the_same_day() {
+        let path = state_file("halt");
+        let mut rm = started(100.0, &path);
+        rm.set_cash_flows(&[CashFlow {
+            id: "dep-1".into(),
+            time_ms: u64::MAX,
+            value: 20.0,
+        }]);
+        // Baseline 120; 55 is down 54%, past the 50% limit.
+        assert!(rm.check_drawdown(55.0));
+        drop(rm);
+
+        // The restart reads equity 55, which must not become the baseline.
+        let mut rm = started(55.0, &path);
+        assert!(rm.halted);
+        assert!(!rm.can_open_position());
+        assert_eq!(rm.day_open_equity, 100.0);
+        assert_eq!(rm.net_cash_flow(), 20.0);
+        // Still the same day: nothing resets it.
+        rm.check_day_reset(55.0);
+        assert!(rm.halted);
+    }
+
+    #[test]
+    fn the_baseline_survives_a_restart_before_any_halt() {
+        let path = state_file("baseline");
+        drop(started(100.0, &path));
+        // Down 40% at the restart: not yet halted, and 10 more must do it.
+        let mut rm = started(60.0, &path);
+        assert!(!rm.halted);
+        assert_eq!(rm.day_open_equity, 100.0);
+        assert!(rm.check_drawdown(50.0));
+    }
+
+    #[test]
+    fn a_state_file_from_another_day_is_ignored() {
+        let path = state_file("old-day");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let yesterday = DayState {
+            utc_day: utc_day_number() - 1,
+            day_open_equity: 100.0,
+            day_open_at_ms: 1,
+            cash_flows: HashMap::from([("dep-1".to_string(), 20.0)]),
+            halted: true,
+        };
+        std::fs::write(&path, serde_json::to_vec(&yesterday).unwrap()).unwrap();
+
+        let rm = started(55.0, &path);
+        assert!(!rm.halted);
+        assert_eq!(rm.day_open_equity, 55.0);
+        assert_eq!(rm.net_cash_flow(), 0.0);
+        // And it has been replaced by today's.
+        let saved = load_day_state(&path, utc_day_number()).unwrap();
+        assert_eq!(saved.day_open_equity, 55.0);
+        assert!(!saved.halted);
+    }
+
+    #[test]
+    fn a_corrupt_state_file_starts_fresh() {
+        let path = state_file("corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for junk in [
+            &b"{\"utc_day\": 12, \"halted\": tr"[..],
+            b"",
+            b"\xff\xfe not json",
+            br#"{"utc_day":0,"day_open_equity":null,"day_open_at_ms":0,"cash_flows":{},"halted":true}"#,
+        ] {
+            std::fs::write(&path, junk).unwrap();
+            let rm = started(80.0, &path);
+            assert!(!rm.halted);
+            assert_eq!(rm.day_open_equity, 80.0);
+        }
+        // Today's day number with numbers that cannot be: also fresh.
+        let impossible = DayState {
+            utc_day: utc_day_number(),
+            day_open_equity: -5.0,
+            day_open_at_ms: 1,
+            cash_flows: HashMap::new(),
+            halted: true,
+        };
+        std::fs::write(&path, serde_json::to_vec(&impossible).unwrap()).unwrap();
+        let rm = started(80.0, &path);
+        assert!(!rm.halted);
+        assert_eq!(rm.day_open_equity, 80.0);
+    }
+
+    #[test]
+    fn a_state_file_that_cannot_be_written_does_not_stop_the_bot() {
+        // The parent "directory" is a file: nothing can be created under it.
+        let path = state_file("unwritable");
+        let blocker = path.parent().unwrap().parent().unwrap().join("blocker");
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"").unwrap();
+        let mut rm = started(100.0, &blocker.join(STATE_FILE));
+        assert!(rm.check_drawdown(40.0));
+        assert!(rm.halted);
     }
 }
