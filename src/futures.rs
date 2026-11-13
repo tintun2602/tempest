@@ -758,8 +758,9 @@ async fn ensure_stop<E: FuturesExchange>(
 }
 
 /// The break-even rule: replace a stop that would still lose money with one
-/// at the entry price. The new stop goes in before the old one is cancelled,
-/// so the position is never without one. A stop already at or past the
+/// at the entry price. The old stop is cancelled first, because the venue
+/// refuses a second close-position stop; `ensure_stop` covers a crash in
+/// between on the next cycle. A stop already at or past the
 /// entry (one the owner moved by hand, say) is left alone.
 async fn move_stop_to_entry<E: FuturesExchange>(
     ex: &E,
@@ -787,13 +788,27 @@ async fn move_stop_to_entry<E: FuturesExchange>(
     }
     // Rounded toward profit: down for a short, up for a long.
     let stop = round_away(filters, pos.entry_price, !short);
-    ex.place_trigger(&pos.symbol, close_side, TriggerKind::Stop, stop)
-        .await
-        .map_err(|e| format!("break-even stop not placed: {e}"))?;
+    // Binance allows one close-position stop per side (-4130 otherwise), so
+    // the old one goes first. If the new one is then refused, the old level
+    // is put back before the error is reported.
     for old in &stops {
-        if let Err(e) = ex.cancel_trigger(&pos.symbol, old.id).await {
-            warn!("{}: old stop {} not cancelled: {e}", pos.symbol, old.id);
-        }
+        ex.cancel_trigger(&pos.symbol, old.id)
+            .await
+            .map_err(|e| format!("break-even: old stop {} not cancelled: {e}", old.id))?;
+    }
+    if let Err(e) = ex
+        .place_trigger(&pos.symbol, close_side, TriggerKind::Stop, stop)
+        .await
+    {
+        let restored = match stops.first() {
+            Some(old) => ex
+                .place_trigger(&pos.symbol, close_side, TriggerKind::Stop, old.trigger_price)
+                .await
+                .map(|_| format!("old stop {} restored", old.trigger_price))
+                .unwrap_or_else(|r| format!("OLD STOP NOT RESTORED: {r}")),
+            None => "there was no old stop".to_string(),
+        };
+        return Err(format!("break-even stop not placed: {e}; {restored}"));
     }
     let msg = format!(
         "\u{1f512} *{}* stop moved to entry `{stop}` (mark `{:.2}`)",
@@ -1335,8 +1350,32 @@ mod tests {
         move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet())
             .await
             .unwrap();
-        // The new stop first, then the old one goes.
-        assert_eq!(ex.log(), vec!["trigger Stop BUY 2000", "cancel 7"]);
+        // The venue allows one close-position stop per side: old out, new in.
+        assert_eq!(ex.log(), vec!["cancel 7", "trigger Stop BUY 2000"]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_break_even_stop_puts_the_old_one_back() {
+        let ex = Fake::default();
+        *ex.stop_failures.lock().unwrap() = 1;
+        ex.triggers.lock().unwrap().push(TriggerOrder {
+            id: 7,
+            kind: Some(TriggerKind::Stop),
+            side: Side::Buy,
+            trigger_price: 2_100.0,
+        });
+        let short = FuturesPosition {
+            mark_price: 1_900.0,
+            ..position(-0.02)
+        };
+        let err = move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet())
+            .await
+            .unwrap_err();
+        assert!(err.contains("old stop 2100 restored"), "{err}");
+        assert_eq!(
+            ex.log(),
+            vec!["cancel 7", "trigger Stop BUY 2000", "trigger Stop BUY 2100"]
+        );
     }
 
     #[tokio::test]
