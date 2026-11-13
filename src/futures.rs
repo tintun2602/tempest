@@ -9,7 +9,8 @@
 //! and positions are sized from the stop, capped at `MAX_NOTIONAL_FRACTION` x
 //! `LEVERAGE` of available margin. Each entry gets a mark-price stop and a 2R
 //! target, both closing the whole position. A position found without a stop
-//! gets one at once.
+//! gets one at once; one found with its stop but no target gets the 2R target
+//! back, as long as the stop still shows the original risk.
 //!
 //! Not supported here, by design for a first version: the trailing stop,
 //! hedge mode (the bot refuses to start), and more than one position per pair.
@@ -23,6 +24,8 @@ use crate::notify::Notifier;
 use crate::risk::{CashFlow, RiskManager};
 use crate::strategies::{StrategyKind, REWARD_RISK};
 use crate::strategy::{self, IndicatorSnapshot, ShortDecision, Signal, StrategyParams};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -53,14 +56,28 @@ const DOLLAR_ASSETS: [&str; 4] = ["USDC", "USDT", "FDUSD", "BNFCR"];
 /// for a position just opened, and closing it again if that stop never goes
 /// in. Binance's IP limit resets each minute, so the last retry lands after
 /// it; the IP is shared with other Railway services, so their bursts count.
+#[cfg(not(test))]
 const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(10),
     Duration::from_secs(50),
 ];
+/// The same number of attempts with no waiting, so tests of a whole cycle
+/// do not sleep.
+#[cfg(test)]
+const RETRY_DELAYS: [Duration; 3] = [Duration::ZERO; 3];
+/// Starts the error for an open position that is left without a stop. The
+/// cycle alerts the owner on it and never treats it as a rate limit, whatever
+/// the venue said underneath: that pause is only safe while every stop holds.
+const NO_STOP: &str = "NO STOP";
 /// Rate-limited cycles in a row before Telegram hears about it. One is
 /// someone else on the shared IP; an hour of them is worth knowing.
 const RATE_LIMIT_ALERT_AFTER: u32 = 4;
+
+/// Pairs whose open position has no target and cannot be given one, already
+/// reported: said once, not every cycle. Cleared when the pair has a target
+/// again or is flat.
+static TARGET_GAP_REPORTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 const HEDGE_MODE_REFUSAL: &str =
     "the account is in hedge mode; switch USDⓈ-M futures to one-way mode";
@@ -146,8 +163,20 @@ pub async fn run(config: &Config) {
     };
     last_error.clear();
 
+    // The day's baseline and halt come back from disk: a deploy restarts the
+    // bot, and must not re-enable entries on a day already halted.
     let mut risk = RiskManager::with_risk_per_trade(equity, config.risk_per_trade)
-        .with_limits(config.max_open_positions, config.daily_drawdown_limit);
+        .with_limits(config.max_open_positions, config.daily_drawdown_limit)
+        .with_state_file(crate::risk::state_file_from_env());
+    if risk.halted {
+        let msg = format!(
+            "\u{1f6d1} *Still halted* after the restart: today's drawdown limit was hit earlier \
+             (day open `{:.2}`). No new entries until the next UTC day.",
+            risk.day_open_equity
+        );
+        warn!("{msg}");
+        notifier.send(&msg).await;
+    }
     let mut rate_limited_cycles = 0u32;
     loop {
         let mut wait = poll;
@@ -167,8 +196,10 @@ pub async fn run(config: &Config) {
             }
             Err(e) => {
                 if let Some(ms) = rate_limit_wait_ms(&e, now_ms(), poll.as_millis() as u64) {
-                    // The exchange still holds every stop; skipping a cycle
-                    // costs nothing, and hammering turns a limit into a ban.
+                    // The exchange still holds every stop (a position left
+                    // without one is reported by the cycle as NO_STOP, never
+                    // as this error); skipping a cycle costs nothing, and
+                    // hammering turns a limit into a ban.
                     rate_limited_cycles += 1;
                     wait = Duration::from_millis(ms);
                     warn!(
@@ -338,6 +369,17 @@ async fn run_cycle<E: FuturesExchange>(
             }
             Ok(Traded::Closed) => traded = true,
             Ok(Traded::Nothing) => {}
+            // Before the rate-limit arm: this error may carry a -1003 from
+            // the refused stop, and must reach the owner, not the back-off.
+            Err(e) if e.starts_with(NO_STOP) => {
+                error!("{symbol}: {e}");
+                notifier
+                    .send(&format!(
+                        "\u{1f6a8} *{symbol}* has NO STOP on the exchange. Place one by hand \
+                         or close the position; the bot tries again next cycle.\n`{e}`"
+                    ))
+                    .await;
+            }
             // A rate limit hits every pair alike: stop the cycle and let
             // the loop's back-off handle it, rather than spend more
             // requests and send one alert per pair.
@@ -390,14 +432,25 @@ async fn manage_symbol<E: FuturesExchange>(
 
     if let Some(pos) = pos {
         // Protection first: it must not depend on candles being available.
-        ensure_stop(ex, &filters, pos, snap.as_ref().map(|s| s.atr_14), notifier).await?;
+        ensure_stop(
+            ex,
+            &filters,
+            pos,
+            snap.as_ref().map(|s| s.atr_14),
+            notifier,
+            &RETRY_DELAYS,
+        )
+        .await?;
+        // Before the break-even rule: once that has moved the stop, the
+        // original risk can no longer be read from it.
+        ensure_target(ex, &filters, pos, notifier).await?;
         if params.breakeven_reached(
             pos.is_short(),
             pos.entry_price,
             pos.mark_price,
             f64::from(leverage),
         ) {
-            move_stop_to_entry(ex, &filters, pos, notifier).await?;
+            move_stop_to_entry(ex, &filters, pos, notifier, &RETRY_DELAYS).await?;
         }
         let (Some(snap), Ok((_, signal))) = (snap.as_ref(), candles.as_ref()) else {
             return Ok(Traded::Nothing);
@@ -409,6 +462,7 @@ async fn manage_symbol<E: FuturesExchange>(
         return Ok(Traded::Nothing);
     }
 
+    target_gap_cleared(symbol);
     // Flat: whatever is still resting belongs to a position that is gone.
     if !ex.trigger_orders(symbol).await?.is_empty() {
         info!("{symbol}: flat with leftover orders; cancelling them");
@@ -710,13 +764,15 @@ async fn close_position<E: FuturesExchange>(
     Ok(())
 }
 
-/// Give `pos` a stop if it has none on its closing side.
+/// Give `pos` a stop if it has none on its closing side. Retried like the
+/// stop of a new entry; if it still fails the error starts with `NO_STOP`.
 async fn ensure_stop<E: FuturesExchange>(
     ex: &E,
     filters: &SymbolFilters,
     pos: &FuturesPosition,
     atr: Option<f64>,
     notifier: &Notifier,
+    retry: &[Duration],
 ) -> Result<(), String> {
     let close_side = if pos.is_short() {
         Side::Buy
@@ -745,9 +801,11 @@ async fn ensure_stop<E: FuturesExchange>(
         mark - distance
     };
     let stop = round_away(filters, stop, pos.is_short());
-    ex.place_trigger(&pos.symbol, close_side, TriggerKind::Stop, stop)
-        .await
-        .map_err(|e| format!("position has no stop and placing one failed: {e}"))?;
+    with_retries(retry, &format!("{} emergency stop", pos.symbol), || {
+        ex.place_trigger(&pos.symbol, close_side, TriggerKind::Stop, stop)
+    })
+    .await
+    .map_err(|e| format!("{NO_STOP}: position has no stop and placing one failed: {e}"))?;
     let msg = format!(
         "\u{1f6e1}\u{fe0f} *{}* had no stop; placed one at `{stop}` (mark `{mark:.2}`)",
         pos.symbol
@@ -757,16 +815,151 @@ async fn ensure_stop<E: FuturesExchange>(
     Ok(())
 }
 
+/// Give `pos` its 2R target back if it has a stop but no target on its
+/// closing side: the placement failed at entry, or the order has gone.
+///
+/// The target is derived as at entry, from the entry price and the distance
+/// to the stop. That only holds while the stop still shows the original
+/// risk. A stop at or past the entry (the break-even rule, or the owner) says
+/// nothing about it, and nothing else recorded it, so the position is then
+/// left without a target rather than given a guessed one, and the owner is
+/// told once. Any order on the closing side that could be a target counts as
+/// one, so an order the owner placed by hand is never doubled or replaced.
+///
+/// Only a rate limit is returned as an error. Any other refusal is reported
+/// once and the cycle goes on: the stop still protects the position.
+async fn ensure_target<E: FuturesExchange>(
+    ex: &E,
+    filters: &SymbolFilters,
+    pos: &FuturesPosition,
+    notifier: &Notifier,
+) -> Result<(), String> {
+    let short = pos.is_short();
+    let close_side = if short { Side::Buy } else { Side::Sell };
+    let entry = pos.entry_price;
+    let in_profit = |p: f64| p > 0.0 && if short { p < entry } else { p > entry };
+    let orders: Vec<TriggerOrder> = ex
+        .trigger_orders(&pos.symbol)
+        .await?
+        .into_iter()
+        .filter(|o| o.side == close_side)
+        .collect();
+    let has_target = orders.iter().any(|o| match o.kind {
+        Some(TriggerKind::TakeProfit) => true,
+        Some(TriggerKind::Stop) => false,
+        // A type the bot never places (a limit take-profit, say): the
+        // owner's, and a target if it triggers in profit.
+        None => in_profit(o.trigger_price),
+    });
+    if has_target {
+        target_gap_cleared(&pos.symbol);
+        return Ok(());
+    }
+    let stops: Vec<f64> = orders
+        .iter()
+        .filter(|o| o.kind == Some(TriggerKind::Stop))
+        .map(|o| o.trigger_price)
+        .collect();
+    if stops.is_empty() {
+        // No stop to measure from; `ensure_stop` comes first and reports it.
+        return Ok(());
+    }
+    let unknown = |why: &str| {
+        format!(
+            "\u{26a0}\u{fe0f} *{}* has no target and none was placed: {why}. Place one by hand \
+             if you want one; the stop is in place.",
+            pos.symbol
+        )
+    };
+    let risk = stops
+        .iter()
+        .map(|stop| if short { stop - entry } else { entry - stop })
+        .fold(f64::INFINITY, f64::min);
+    if !(risk > 0.0 && risk.is_finite() && entry > 0.0) {
+        let why = "the stop is at or past the entry, so the original risk is not known";
+        return report_target_gap(&pos.symbol, &unknown(why), notifier).await;
+    }
+    let target = if short {
+        entry - REWARD_RISK * risk
+    } else {
+        entry + REWARD_RISK * risk
+    };
+    let target_price = round_away(filters, target, !short);
+    let passed = if short {
+        pos.mark_price <= target_price
+    } else {
+        pos.mark_price >= target_price
+    };
+    if target_price <= 0.0 || (pos.mark_price > 0.0 && passed) {
+        let why = format!(
+            "the 2R level `{target_price}` is not ahead of the mark price `{:.2}`",
+            pos.mark_price
+        );
+        return report_target_gap(&pos.symbol, &unknown(&why), notifier).await;
+    }
+    match ex
+        .place_trigger(
+            &pos.symbol,
+            close_side,
+            TriggerKind::TakeProfit,
+            target_price,
+        )
+        .await
+    {
+        Ok(_) => {
+            target_gap_cleared(&pos.symbol);
+            let msg = format!(
+                "\u{1f3af} *{}* had no target; placed one at `{target_price}` (2R from entry \
+                 `{entry:.2}`)",
+                pos.symbol
+            );
+            warn!("{msg}");
+            notifier.send(&msg).await;
+            Ok(())
+        }
+        Err(e) if is_rate_limited(&e) => Err(e),
+        Err(e) => {
+            let why = format!("the venue refused `{target_price}` (`{e}`)");
+            report_target_gap(&pos.symbol, &unknown(&why), notifier).await
+        }
+    }
+}
+
+/// Say that `symbol` is left without a target, the first time only.
+async fn report_target_gap(symbol: &str, msg: &str, notifier: &Notifier) -> Result<(), String> {
+    let first = TARGET_GAP_REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(symbol.to_string());
+    if first {
+        warn!("{msg}");
+        notifier.send(msg).await;
+    }
+    Ok(())
+}
+
+fn target_gap_cleared(symbol: &str) {
+    TARGET_GAP_REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(symbol);
+}
+
 /// The break-even rule: replace a stop that would still lose money with one
 /// at the entry price. The old stop is cancelled first, because the venue
 /// refuses a second close-position stop; `ensure_stop` covers a crash in
 /// between on the next cycle. A stop already at or past the
 /// entry (one the owner moved by hand, say) is left alone.
+///
+/// Both the new stop and, failing that, putting the old one back are retried
+/// like the stop of a new entry. If neither goes in, the position has no stop
+/// and the error starts with `NO_STOP`.
 async fn move_stop_to_entry<E: FuturesExchange>(
     ex: &E,
     filters: &SymbolFilters,
     pos: &FuturesPosition,
     notifier: &Notifier,
+    retry: &[Duration],
 ) -> Result<(), String> {
     let short = pos.is_short();
     let close_side = if short { Side::Buy } else { Side::Sell };
@@ -796,19 +989,35 @@ async fn move_stop_to_entry<E: FuturesExchange>(
             .await
             .map_err(|e| format!("break-even: old stop {} not cancelled: {e}", old.id))?;
     }
-    if let Err(e) = ex
-        .place_trigger(&pos.symbol, close_side, TriggerKind::Stop, stop)
-        .await
-    {
-        let restored = match stops.first() {
-            Some(old) => ex
-                .place_trigger(&pos.symbol, close_side, TriggerKind::Stop, old.trigger_price)
-                .await
-                .map(|_| format!("old stop {} restored", old.trigger_price))
-                .unwrap_or_else(|r| format!("OLD STOP NOT RESTORED: {r}")),
-            None => "there was no old stop".to_string(),
+    let placed = with_retries(retry, &format!("{} break-even stop", pos.symbol), || {
+        ex.place_trigger(&pos.symbol, close_side, TriggerKind::Stop, stop)
+    })
+    .await;
+    if let Err(e) = placed {
+        let Some(old) = stops.first() else {
+            return Err(format!(
+                "{NO_STOP}: break-even stop not placed: {e}; there was no old stop"
+            ));
         };
-        return Err(format!("break-even stop not placed: {e}; {restored}"));
+        let restored = with_retries(retry, &format!("{} old stop", pos.symbol), || {
+            ex.place_trigger(
+                &pos.symbol,
+                close_side,
+                TriggerKind::Stop,
+                old.trigger_price,
+            )
+        })
+        .await;
+        return Err(match restored {
+            Ok(_) => format!(
+                "break-even stop not placed: {e}; old stop {} restored",
+                old.trigger_price
+            ),
+            Err(r) => format!(
+                "{NO_STOP}: break-even stop not placed: {e}; old stop {} NOT RESTORED: {r}",
+                old.trigger_price
+            ),
+        });
     }
     let msg = format!(
         "\u{1f512} *{}* stop moved to entry `{stop}` (mark `{:.2}`)",
@@ -870,7 +1079,6 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::exchange::{FuturesAccount, OrderOutcome, Transfer, TriggerOrder};
-    use std::sync::Mutex;
 
     #[derive(Default)]
     struct Fake {
@@ -882,6 +1090,10 @@ mod tests {
         stop_rejects: bool,
         /// Stop attempts rejected before one goes through.
         stop_failures: Mutex<u32>,
+        /// A stop at exactly this price is always refused.
+        reject_stop_at: Option<f64>,
+        /// When set, every target is refused with this error.
+        target_error: Option<String>,
         /// When set, every klines request fails with this error.
         klines_error: Option<String>,
         hedge: bool,
@@ -959,16 +1171,34 @@ mod tests {
                 return Err("rejected".into());
             }
             if kind == TriggerKind::Stop {
+                if self.reject_stop_at == Some(price) {
+                    return Err("rejected".into());
+                }
                 let mut left = self.stop_failures.lock().unwrap();
                 if *left > 0 {
                     *left -= 1;
                     return Err("Binance API error -1003: Too many requests".into());
                 }
             }
-            Ok(1)
+            if kind == TriggerKind::TakeProfit {
+                if let Some(e) = &self.target_error {
+                    return Err(e.clone());
+                }
+            }
+            // The order now rests on the venue, as a later read will show.
+            let mut triggers = self.triggers.lock().unwrap();
+            let id = 100 + triggers.len() as u64;
+            triggers.push(TriggerOrder {
+                id,
+                kind: Some(kind),
+                side,
+                trigger_price: price,
+            });
+            Ok(id)
         }
         async fn cancel_trigger(&self, _: &str, id: u64) -> Result<(), String> {
             self.push(format!("cancel {id}"));
+            self.triggers.lock().unwrap().retain(|o| o.id != id);
             Ok(())
         }
         async fn cancel_all(&self, _: &str) -> Result<(), String> {
@@ -1302,10 +1532,10 @@ mod tests {
     async fn an_unprotected_position_gets_an_emergency_stop() {
         let ex = Fake::default();
         let f = eth("ETHUSDC");
-        ensure_stop(&ex, &f, &position(-0.02), Some(40.0), &quiet())
+        ensure_stop(&ex, &f, &position(-0.02), Some(40.0), &quiet(), &NO_WAIT)
             .await
             .unwrap();
-        ensure_stop(&ex, &f, &position(0.02), None, &quiet())
+        ensure_stop(&ex, &f, &position(0.02), None, &quiet(), &NO_WAIT)
             .await
             .unwrap();
         assert_eq!(
@@ -1323,14 +1553,28 @@ mod tests {
             side: Side::Sell,
             trigger_price: 1_950.0,
         });
-        ensure_stop(&ex, &eth("ETHUSDC"), &position(0.02), Some(40.0), &quiet())
-            .await
-            .unwrap();
+        ensure_stop(
+            &ex,
+            &eth("ETHUSDC"),
+            &position(0.02),
+            Some(40.0),
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
         assert!(ex.log().is_empty());
         // A stop on the wrong side does not protect a short.
-        ensure_stop(&ex, &eth("ETHUSDC"), &position(-0.02), Some(40.0), &quiet())
-            .await
-            .unwrap();
+        ensure_stop(
+            &ex,
+            &eth("ETHUSDC"),
+            &position(-0.02),
+            Some(40.0),
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
         assert_eq!(ex.log(), vec!["trigger Stop BUY 2060"]);
     }
 
@@ -1347,34 +1591,378 @@ mod tests {
             mark_price: 1_900.0,
             ..position(-0.02)
         };
-        move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet())
+        move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet(), &NO_WAIT)
             .await
             .unwrap();
         // The venue allows one close-position stop per side: old out, new in.
         assert_eq!(ex.log(), vec!["cancel 7", "trigger Stop BUY 2000"]);
     }
 
-    #[tokio::test]
-    async fn a_refused_break_even_stop_puts_the_old_one_back() {
-        let ex = Fake::default();
-        *ex.stop_failures.lock().unwrap() = 1;
+    /// A short from 2000 with its stop at 2100 (id 7), marked at 1900: far
+    /// enough in profit for the break-even rule at 20x.
+    fn short_due_for_break_even(ex: &Fake) -> FuturesPosition {
         ex.triggers.lock().unwrap().push(TriggerOrder {
             id: 7,
             kind: Some(TriggerKind::Stop),
             side: Side::Buy,
             trigger_price: 2_100.0,
         });
-        let short = FuturesPosition {
+        FuturesPosition {
             mark_price: 1_900.0,
             ..position(-0.02)
+        }
+    }
+
+    fn stops_on(ex: &Fake) -> Vec<f64> {
+        ex.triggers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| o.kind == Some(TriggerKind::Stop))
+            .map(|o| o.trigger_price)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_break_even_stop_is_retried_until_it_goes_in() {
+        let ex = Fake::default();
+        *ex.stop_failures.lock().unwrap() = 2;
+        let short = short_due_for_break_even(&ex);
+        move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet(), &NO_WAIT)
+            .await
+            .unwrap();
+        assert_eq!(
+            ex.log(),
+            vec![
+                "cancel 7",
+                "trigger Stop BUY 2000",
+                "trigger Stop BUY 2000",
+                "trigger Stop BUY 2000",
+            ]
+        );
+        assert_eq!(stops_on(&ex), vec![2_000.0]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_break_even_stop_puts_the_old_one_back() {
+        let ex = Fake {
+            reject_stop_at: Some(2_000.0),
+            ..Default::default()
         };
-        let err = move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet())
+        let short = short_due_for_break_even(&ex);
+        let err = move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet(), &NO_WAIT)
             .await
             .unwrap_err();
         assert!(err.contains("old stop 2100 restored"), "{err}");
+        assert!(!err.starts_with(NO_STOP), "{err}");
         assert_eq!(
             ex.log(),
-            vec!["cancel 7", "trigger Stop BUY 2000", "trigger Stop BUY 2100"]
+            vec![
+                "cancel 7",
+                "trigger Stop BUY 2000",
+                "trigger Stop BUY 2000",
+                "trigger Stop BUY 2000",
+                "trigger Stop BUY 2000",
+                "trigger Stop BUY 2100",
+            ]
+        );
+        assert_eq!(stops_on(&ex), vec![2_100.0]);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_restore_is_retried_too() {
+        // The new level is refused outright and the first two attempts at
+        // putting the old one back hit the rate limit.
+        let ex = Fake {
+            reject_stop_at: Some(2_000.0),
+            stop_failures: Mutex::new(2),
+            ..Default::default()
+        };
+        let short = short_due_for_break_even(&ex);
+        let err = move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet(), &NO_WAIT)
+            .await
+            .unwrap_err();
+        assert!(err.contains("old stop 2100 restored"), "{err}");
+        assert_eq!(stops_on(&ex), vec![2_100.0]);
+    }
+
+    #[tokio::test]
+    async fn a_position_left_without_a_stop_alerts_the_owner_and_gets_one_next_cycle() {
+        // Every attempt at the new stop and at restoring the old one is
+        // rate-limited: four of each.
+        let ex = Fake::default();
+        *ex.stop_failures.lock().unwrap() = 8;
+        let short = short_due_for_break_even(&ex);
+        ex.positions.lock().unwrap().push(short);
+        ex.triggers.lock().unwrap().push(order(
+            8,
+            Some(TriggerKind::TakeProfit),
+            Side::Buy,
+            1_800.0,
+        ));
+        let config = test_config();
+        let params = StrategyParams {
+            breakeven_roi_pct: 100.0,
+            ..StrategyParams::default()
+        };
+        let mut risk = RiskManager::with_risk_per_trade(100.0, 0.02);
+        let notifier = quiet();
+
+        // Not an Err: a rate-limit error here would pause the loop with the
+        // position unprotected.
+        run_cycle(&ex, &config, 20, &mut risk, &notifier, &params)
+            .await
+            .unwrap();
+        assert!(stops_on(&ex).is_empty(), "the failure under test");
+        let alerts = notifier.sent();
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(alerts[0].contains("*ETHUSDC* has NO STOP"), "{alerts:?}");
+        assert!(alerts[0].contains("NOT RESTORED"), "{alerts:?}");
+
+        // The next cycle finds the position bare and protects it first.
+        let before = ex.log().len();
+        run_cycle(&ex, &config, 20, &mut risk, &notifier, &params)
+            .await
+            .unwrap();
+        // No ATR from one candle: 2% above the 1900 mark.
+        assert_eq!(
+            ex.log()[before..],
+            ["klines ETHUSDC", "klines ETHUSDC", "trigger Stop BUY 1938"]
+        );
+        assert_eq!(stops_on(&ex), vec![1_938.0]);
+    }
+
+    #[tokio::test]
+    async fn an_emergency_stop_that_never_goes_in_is_not_a_rate_limit() {
+        let ex = Fake::default();
+        *ex.stop_failures.lock().unwrap() = 4;
+        let err = ensure_stop(
+            &ex,
+            &eth("ETHUSDC"),
+            &position(0.02),
+            None,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.starts_with(NO_STOP), "{err}");
+        assert!(err.contains("-1003"), "{err}");
+        assert_eq!(ex.log().len(), 4, "retried: {:?}", ex.log());
+    }
+
+    // ----- the target of an open position -----
+
+    fn order(id: u64, kind: Option<TriggerKind>, side: Side, trigger_price: f64) -> TriggerOrder {
+        TriggerOrder {
+            id,
+            kind,
+            side,
+            trigger_price,
+        }
+    }
+
+    /// The Fake with these orders resting.
+    fn resting(orders: Vec<TriggerOrder>) -> Fake {
+        let ex = Fake::default();
+        *ex.triggers.lock().unwrap() = orders;
+        ex
+    }
+
+    /// A position in a pair no other test uses: what has been reported once
+    /// is remembered per pair for the whole process.
+    fn position_in(symbol: &str, amount: f64) -> FuturesPosition {
+        FuturesPosition {
+            symbol: symbol.into(),
+            ..position(amount)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_target_is_placed_once_at_2r_from_the_entry() {
+        let f = eth("ETHUSDC");
+        // Long from 2000, stop 40 below: target 80 above.
+        let ex = resting(vec![order(7, Some(TriggerKind::Stop), Side::Sell, 1_960.0)]);
+        let notifier = quiet();
+        ensure_target(&ex, &f, &position(0.02), &notifier)
+            .await
+            .unwrap();
+        // The next cycle sees it resting and adds nothing.
+        ensure_target(&ex, &f, &position(0.02), &notifier)
+            .await
+            .unwrap();
+        assert_eq!(ex.log(), vec!["trigger TakeProfit SELL 2080"]);
+        let sent = notifier.sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("placed one at `2080`"), "{sent:?}");
+
+        // Short from 2000, stop 40 above: target 80 below.
+        let ex = resting(vec![order(7, Some(TriggerKind::Stop), Side::Buy, 2_040.0)]);
+        ensure_target(&ex, &f, &position(-0.02), &quiet())
+            .await
+            .unwrap();
+        assert_eq!(ex.log(), vec!["trigger TakeProfit BUY 1920"]);
+    }
+
+    #[tokio::test]
+    async fn the_target_is_the_one_the_entry_would_have_placed() {
+        // Same fill and stop as `a_long_gets_a_stop_below_and_a_2r_target_above`,
+        // but the target is refused at entry.
+        let ex = Fake {
+            fill_price: 2_000.0,
+            target_error: Some("Binance API error -1001: Internal error".into()),
+            ..Default::default()
+        };
+        let f = eth("ETHUSDC");
+        open_position(
+            &ex,
+            &f,
+            false,
+            EntryPlan { quantity: 0.025 },
+            1_960.0,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
+        let ex = Fake {
+            target_error: None,
+            ..ex
+        };
+        ensure_target(&ex, &f, &position(0.025), &quiet())
+            .await
+            .unwrap();
+        assert_eq!(
+            ex.log(),
+            vec![
+                "market BUY 0.025",
+                "trigger Stop SELL 1960",
+                "trigger TakeProfit SELL 2080",
+                "trigger TakeProfit SELL 2080",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_target_is_never_touched() {
+        let f = eth("ETHUSDC");
+        let stop = order(7, Some(TriggerKind::Stop), Side::Sell, 1_960.0);
+        // The owner's own target, nowhere near 2R.
+        let ex = resting(vec![
+            stop.clone(),
+            order(8, Some(TriggerKind::TakeProfit), Side::Sell, 2_500.0),
+        ]);
+        ensure_target(&ex, &f, &position(0.02), &quiet())
+            .await
+            .unwrap();
+        assert!(ex.log().is_empty(), "{:?}", ex.log());
+
+        // A type the bot never places, triggering in profit: also a target.
+        let ex = resting(vec![stop.clone(), order(9, None, Side::Sell, 2_300.0)]);
+        ensure_target(&ex, &f, &position(0.02), &quiet())
+            .await
+            .unwrap();
+        assert!(ex.log().is_empty(), "{:?}", ex.log());
+
+        // A target on the other side belongs to no long: one is placed.
+        let ex = resting(vec![
+            stop,
+            order(8, Some(TriggerKind::TakeProfit), Side::Buy, 1_900.0),
+        ]);
+        ensure_target(&ex, &f, &position(0.02), &quiet())
+            .await
+            .unwrap();
+        assert_eq!(ex.log(), vec!["trigger TakeProfit SELL 2080"]);
+    }
+
+    #[tokio::test]
+    async fn a_stop_at_or_past_the_entry_gets_no_guessed_target() {
+        let f = eth("BEUSDC");
+        let notifier = quiet();
+        for stop in [2_000.0, 1_990.0] {
+            // A short whose stop the break-even rule (or the owner) moved.
+            let ex = resting(vec![order(7, Some(TriggerKind::Stop), Side::Buy, stop)]);
+            let short = position_in("BEUSDC", -0.02);
+            ensure_target(&ex, &f, &short, &notifier).await.unwrap();
+            ensure_target(&ex, &f, &short, &notifier).await.unwrap();
+            assert!(ex.log().is_empty(), "{:?}", ex.log());
+        }
+        // Said once, not on each of the four cycles.
+        let sent = notifier.sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("*BEUSDC* has no target"), "{sent:?}");
+        assert!(sent[0].contains("original risk is not known"), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn a_position_without_a_stop_gets_no_target_from_here() {
+        let ex = Fake::default();
+        ensure_target(&ex, &eth("ETHUSDC"), &position(0.02), &quiet())
+            .await
+            .unwrap();
+        assert!(ex.log().is_empty(), "{:?}", ex.log());
+    }
+
+    #[tokio::test]
+    async fn a_target_the_price_has_already_passed_is_not_placed() {
+        let ex = resting(vec![order(7, Some(TriggerKind::Stop), Side::Sell, 1_960.0)]);
+        let long = FuturesPosition {
+            mark_price: 2_085.0,
+            ..position_in("PASTUSDC", 0.02)
+        };
+        ensure_target(&ex, &eth("PASTUSDC"), &long, &quiet())
+            .await
+            .unwrap();
+        assert!(ex.log().is_empty(), "{:?}", ex.log());
+    }
+
+    #[tokio::test]
+    async fn a_refused_target_is_reported_once_and_does_not_stop_the_cycle() {
+        let ex = Fake {
+            target_error: Some("Binance API error -4130: already exists".into()),
+            ..resting(vec![order(7, Some(TriggerKind::Stop), Side::Sell, 1_960.0)])
+        };
+        let f = eth("REFUSDC");
+        let long = position_in("REFUSDC", 0.02);
+        let notifier = quiet();
+        ensure_target(&ex, &f, &long, &notifier).await.unwrap();
+        ensure_target(&ex, &f, &long, &notifier).await.unwrap();
+        assert_eq!(ex.log().len(), 2, "tried each cycle: {:?}", ex.log());
+        assert_eq!(notifier.sent().len(), 1, "{:?}", notifier.sent());
+
+        // A rate limit is the cycle's to back off from.
+        let ex = Fake {
+            target_error: Some("Binance API error -1003: Too many requests".into()),
+            ..resting(vec![order(7, Some(TriggerKind::Stop), Side::Sell, 1_960.0)])
+        };
+        let err = ensure_target(&ex, &f, &long, &quiet()).await.unwrap_err();
+        assert!(is_rate_limited(&err), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_cycle_restores_the_target_before_the_break_even_rule_moves_the_stop() {
+        // A short from 2000, stop 2100, no target, and far enough in profit
+        // for break-even in this same cycle.
+        let ex = Fake::default();
+        let short = short_due_for_break_even(&ex);
+        ex.positions.lock().unwrap().push(short);
+        let params = StrategyParams {
+            breakeven_roi_pct: 100.0,
+            ..StrategyParams::default()
+        };
+        let mut risk = RiskManager::with_risk_per_trade(100.0, 0.02);
+        run_cycle(&ex, &test_config(), 20, &mut risk, &quiet(), &params)
+            .await
+            .unwrap();
+        assert_eq!(
+            ex.log(),
+            vec![
+                "klines ETHUSDC",
+                "klines ETHUSDC",
+                "trigger TakeProfit BUY 1800",
+                "cancel 7",
+                "trigger Stop BUY 2000",
+            ]
         );
     }
 
@@ -1391,7 +1979,7 @@ mod tests {
             mark_price: 1_900.0,
             ..position(-0.02)
         };
-        move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet())
+        move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet(), &NO_WAIT)
             .await
             .unwrap();
         assert!(ex.log().is_empty());

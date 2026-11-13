@@ -11,6 +11,7 @@ What is where on the server:
 |---|---|
 | `/opt/tempest` | This repo, kept at `origin/master` |
 | `/etc/tempest/bot.env`, `lab.env` | Settings and secrets (mode 600, never in git) |
+| `/var/lib/tempest/bot/risk-state.json` | Today's drawdown baseline and halt, kept across restarts. Delete it and run `deploy.sh --force` to lift a halt by hand |
 | `tempest-deploy.timer` | Every 5 min: if master moved, rebuild and restart the bot |
 | `/etc/cron.d/tempest-lab` | Nightly lab, output in `/var/log/tempest/lab-YYYY-MM-DD.log` |
 

@@ -9,6 +9,9 @@ pub struct Notifier {
     chat_id: Option<String>,
     quote_asset: String,
     http: reqwest::Client,
+    /// Every message handed to `send`, so a test can assert on an alert.
+    #[cfg(test)]
+    sent: std::sync::Mutex<Vec<String>>,
 }
 
 impl Notifier {
@@ -22,6 +25,8 @@ impl Notifier {
             chat_id,
             quote_asset,
             http: reqwest::Client::new(),
+            #[cfg(test)]
+            sent: std::sync::Mutex::new(Vec::new()),
         };
 
         if notifier.is_enabled() {
@@ -42,7 +47,14 @@ impl Notifier {
             chat_id: None,
             quote_asset: quote_asset.to_string(),
             http: reqwest::Client::new(),
+            sent: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// What `send` has been asked to deliver so far.
+    #[cfg(test)]
+    pub fn sent(&self) -> Vec<String> {
+        self.sent.lock().unwrap().clone()
     }
 
     pub fn quote_asset(&self) -> &str {
@@ -55,6 +67,8 @@ impl Notifier {
 
     /// Send a raw Markdown message. No-op if not configured.
     pub async fn send(&self, text: &str) {
+        #[cfg(test)]
+        self.sent.lock().unwrap().push(text.to_string());
         let (Some(token), Some(chat_id)) = (&self.token, &self.chat_id) else {
             return;
         };
@@ -359,7 +373,9 @@ pub fn redact_signatures(text: &str) -> String {
     while let Some(i) = rest.find(KEY) {
         out.push_str(&rest[..i + KEY.len()]);
         let tail = &rest[i + KEY.len()..];
-        let end = tail.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(tail.len());
+        let end = tail
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(tail.len());
         if end > 0 {
             out.push_str("[redacted]");
         }
@@ -431,6 +447,9 @@ mod interval_tests {
         let r = super::redact_signatures(e);
         assert!(r.contains("signature=[redacted])"), "{r}");
         assert!(!r.contains("cf66a3"));
-        assert_eq!(super::redact_signatures("no secrets here"), "no secrets here");
+        assert_eq!(
+            super::redact_signatures("no secrets here"),
+            "no secrets here"
+        );
     }
 }
