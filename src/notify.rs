@@ -59,6 +59,7 @@ impl Notifier {
             return;
         };
 
+        let text = &redact_signatures(text);
         let url = format!("https://api.telegram.org/bot{token}/sendMessage");
 
         let result = self
@@ -349,6 +350,25 @@ fn format_interval(secs: u64) -> String {
     }
 }
 
+/// Hide `signature=<hex>` in request URLs that end up in alerts. The value is a
+/// one-time HMAC, not the API key, but it has no business in a chat message.
+pub fn redact_signatures(text: &str) -> String {
+    const KEY: &str = "signature=";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(KEY) {
+        out.push_str(&rest[..i + KEY.len()]);
+        let tail = &rest[i + KEY.len()..];
+        let end = tail.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(tail.len());
+        if end > 0 {
+            out.push_str("[redacted]");
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod interval_tests {
     use super::{format_interval, format_summary, OpenPositionSummary};
@@ -403,5 +423,14 @@ mod interval_tests {
         assert_eq!(format_interval(900), "15m");
         assert_eq!(format_interval(300), "5m");
         assert_eq!(format_interval(5_400), "90m");
+    }
+
+    #[test]
+    fn signatures_are_redacted_in_alerts() {
+        let e = "error sending request for url (https://fapi.binance.com/fapi/v3/positionRisk?timestamp=1794477010605&signature=cf66a3adf14d101f2fc607bd726f5a26cf)";
+        let r = super::redact_signatures(e);
+        assert!(r.contains("signature=[redacted])"), "{r}");
+        assert!(!r.contains("cf66a3"));
+        assert_eq!(super::redact_signatures("no secrets here"), "no secrets here");
     }
 }
