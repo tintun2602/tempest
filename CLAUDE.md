@@ -41,7 +41,7 @@ LINK, AVAX, LTC; owner, 2026-11-13), `MAX_OPEN_POSITIONS=2`,
 gets at most half of the margin (equity / MAX_OPEN_POSITIONS).
 `BREAKEVEN_ROI_PCT=100`: at +100 % on margin the stop moves to the entry
 (owner, 2026-11-10; a stop already at or past the entry is left alone).
-`RISK_PER_TRADE_PCT=15` (owner, 2026-11-14; was 80, which the margin cap held
+`RISK_PER_TRADE_PCT=20` (owner, 2026-11-14; was 80, which the margin cap held
 at about 58 % of equity per stop).
 
 In `/etc/tempest/bot.env` on the server: `MARKET=futures`,
