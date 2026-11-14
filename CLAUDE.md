@@ -35,8 +35,8 @@ asks.
 ## Live settings
 
 In git, `deploy/hetzner/settings.env` (wins over bot.env; change by pushing):
-`TRADING_PAIRS` = the lab's ten pairs (BTC, ETH, SOL, BNB, XRP, DOGE, ADA,
-LINK, AVAX, LTC; owner, 2026-11-13), `MAX_OPEN_POSITIONS=2` (owner, 2026-11-14 evening; four for a few hours that day),
+`TRADING_PAIRS` = BTC, ETH, BNB, XRP (owner, 2026-11-14 evening; the lab's
+ten pairs before that, so its numbers are not confirmed for these four), `MAX_OPEN_POSITIONS=2` (owner, 2026-11-14 evening; four for a few hours that day),
 `TREND_INTERVAL=1d`, `SIGNAL_INTERVAL=4h` (owner, 2026-11-07). Each position
 gets at most half of the margin (equity / MAX_OPEN_POSITIONS).
 `BREAKEVEN_ROI_PCT=100`: at +100 % on margin the stop moves to the entry
