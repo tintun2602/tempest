@@ -36,12 +36,12 @@ asks.
 
 In git, `deploy/hetzner/settings.env` (wins over bot.env; change by pushing):
 `TRADING_PAIRS` = the lab's ten pairs (BTC, ETH, SOL, BNB, XRP, DOGE, ADA,
-LINK, AVAX, LTC; owner, 2026-11-13), `MAX_OPEN_POSITIONS=4` (owner, 2026-11-14; was 2),
+LINK, AVAX, LTC; owner, 2026-11-13), `MAX_OPEN_POSITIONS=2` (owner, 2026-11-14 evening; four for a few hours that day),
 `TREND_INTERVAL=1d`, `SIGNAL_INTERVAL=4h` (owner, 2026-11-07). Each position
-gets at most a quarter of the margin (equity / MAX_OPEN_POSITIONS).
+gets at most half of the margin (equity / MAX_OPEN_POSITIONS).
 `BREAKEVEN_ROI_PCT=100`: at +100 % on margin the stop moves to the entry
 (owner, 2026-11-10; a stop already at or past the entry is left alone).
-`RISK_PER_TRADE_PCT=20` (owner, 2026-11-14; was 80, which the margin cap held
+`RISK_PER_TRADE_PCT=30` (owner, 2026-11-14 evening; 20 earlier that day; was 80, which the margin cap held
 at about 58 % of equity per stop).
 
 In `/etc/tempest/bot.env` on the server: `MARKET=futures`,
