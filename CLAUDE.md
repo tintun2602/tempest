@@ -56,8 +56,9 @@ transferable, so the skim took BNB and sold it with `SKIM_TO=USDC`).
 out, 1-100). At equity >= base + step on a flat account, share % of
 `equity - base` goes to spot and the base becomes the equity left; it never falls
 and is kept in `wallet-state.json` (a new stake restarts it). It clashes with
-`SKIM_ABOVE_USDC`/`SKIM_KEEP_USDC` (skim off). The owner sets the numbers, not
-`settings.env` by default.
+`SKIM_ABOVE_USDC`/`SKIM_KEEP_USDC` (skim off). On since 2026-11-16 in
+`settings.env`: 210 / 150 / 50 (owner). A manual deposit counts as gain; do not
+combine with `TOPUP_*`.
 
 In `/etc/tempest/bot.env` on the server: `MARKET=futures`,
 `STRATEGY=breakout`, `POLL_INTERVAL_SECONDS=300`, `LEVERAGE=20`,
