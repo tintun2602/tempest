@@ -44,6 +44,13 @@ gets at most half of the margin (equity / MAX_OPEN_POSITIONS).
 `RISK_PER_TRADE_PCT=30` (owner, 2026-11-14 evening; 20 earlier that day; was 80, which the margin cap held
 at about 58 % of equity per stop).
 
+Profit withdrawal and top-up are code but off: `SKIM_ABOVE_USDC`,
+`SKIM_KEEP_USDC`, `SKIM_ASSET`, `SKIM_TO`, `SKIM_BUY`, `TOPUP_BELOW_USDC`, `TOPUP_TO_USDC` (`src/wallet.rs`;
+details in `deploy/hetzner/README.md`). They need "Enable Spot & Margin Trading"
+and "Permit Universal Transfer" on the key. The account is EEA credits mode: profit is BNFCR (not
+transferable), collateral is BNB, so the skim takes BNB (`SKIM_ASSET=BNB`) and sells it with `SKIM_TO=USDC`. The owner sets the numbers, not
+`settings.env` by default.
+
 In `/etc/tempest/bot.env` on the server: `MARKET=futures`,
 `STRATEGY=breakout`, `POLL_INTERVAL_SECONDS=300`, `LEVERAGE=20`,
 `DAILY_DRAWDOWN_PCT=50`, secrets. Account ~75 USDC.
@@ -55,6 +62,8 @@ off.
 - `src/futures.rs`: the live futures loop (positions and orders read from the
   exchange each cycle; stop + 2R target as Algo Orders; rate-limit back-off).
 - `src/exchange/binance_futures.rs`: Binance futures REST adapter.
+- `src/wallet.rs`, `src/exchange/binance_wallet.rs`: skim to spot and top-up
+  from spot (universal transfer), off by default.
 - `src/strategies.rs`, `src/strategy.rs`: strategies and their short mirrors.
 - `src/lab.rs`, `src/archive.rs`: backtest lab (`MODE=lab LAB_MARKET=futures`,
   data from data.binance.vision; `LAB_END_DAYS_AGO` for older periods).

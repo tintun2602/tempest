@@ -11,6 +11,7 @@
 
 pub mod binance;
 pub mod binance_futures;
+pub mod binance_wallet;
 
 use std::future::Future;
 
@@ -563,6 +564,74 @@ pub trait FuturesExchange {
         &self,
         since_ms: u64,
     ) -> impl Future<Output = Result<Vec<Transfer>, String>> + Send;
+
+    /// How many orders of any kind (regular and conditional) rest on the whole
+    /// account, whatever the symbol.
+    fn open_order_count(&self) -> impl Future<Output = Result<usize, String>> + Send;
+
+    /// Wallet balance of one margin asset (in units of that asset) in the
+    /// futures wallet; zero when the account holds none. On an account that
+    /// posts BNB as collateral, this is how much BNB can leave.
+    fn asset_wallet(&self, asset: &str) -> impl Future<Output = Result<f64, String>> + Send;
+}
+
+/// Which way a universal transfer moves money between the spot wallet and the
+/// USDⓈ-M futures wallet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    /// `UMFUTURE_MAIN`.
+    FuturesToSpot,
+    /// `MAIN_UMFUTURE`.
+    SpotToFutures,
+}
+
+impl TransferDirection {
+    /// The `type` parameter of `POST /sapi/v1/asset/transfer`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::FuturesToSpot => "UMFUTURE_MAIN",
+            Self::SpotToFutures => "MAIN_UMFUTURE",
+        }
+    }
+}
+
+/// The spot wallet and the transfers between it and futures: what profit
+/// withdrawals and top-ups need beyond [`FuturesExchange`]. Needs the key's
+/// "Permit Universal Transfer" and (to buy) "Enable Spot & Margin Trading".
+pub trait WalletExchange {
+    /// Free balance of `asset` in the spot wallet.
+    fn spot_free(&self, asset: &str) -> impl Future<Output = Result<f64, String>> + Send;
+
+    /// Move `amount` of `asset` between the wallets. Returns the transfer id.
+    fn universal_transfer(
+        &self,
+        direction: TransferDirection,
+        asset: &str,
+        amount: f64,
+    ) -> impl Future<Output = Result<u64, String>> + Send;
+
+    /// Last spot price of `symbol`.
+    fn spot_price(&self, symbol: &str) -> impl Future<Output = Result<f64, String>> + Send;
+
+    /// Market-sell `quantity` of the base asset of `symbol` for its quote asset.
+    fn sell_base(
+        &self,
+        symbol: &str,
+        quantity: f64,
+    ) -> impl Future<Output = Result<OrderOutcome, String>> + Send;
+
+    /// Spot trading rules for `symbol`.
+    fn spot_filters(
+        &self,
+        symbol: &str,
+    ) -> impl Future<Output = Result<SymbolFilters, String>> + Send;
+
+    /// Market-buy `symbol` for `quote_amount` of its quote asset.
+    fn buy_with_quote(
+        &self,
+        symbol: &str,
+        quote_amount: f64,
+    ) -> impl Future<Output = Result<OrderOutcome, String>> + Send;
 }
 
 /// Extract `(stop_loss, take_profit)` from a symbol's resting sell orders.
