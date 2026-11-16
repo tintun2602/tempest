@@ -183,6 +183,12 @@ still at `base + step`.
   `SKIM_ABOVE_USDC` / `SKIM_KEEP_USDC` switch the skim off with a warning.
   Top-up is separate and unchanged.
 - Start-up logs and tells the owner the base and the next withdrawal level.
+- The base only knows the bot's own withdrawals. A manual deposit looks like
+  gain (with equity 203, a deposit of 200 takes out 96.50 on the next flat
+  cycle); a manual withdrawal does not lower the base, so the next withdrawal
+  comes later. Changing `SKIM_STAKE_USDC` to another number restarts the base.
+- Do not combine with `TOPUP_*`: a top-up level above the base would refill
+  what the half-out just took out, once an hour.
 - The withdrawal message reads: `Took out 76.00 USDC (50 % of 152.00 earned
   above the 210.00 stake) to spot; stake is now 286.00, next withdrawal at
   436.00`.
