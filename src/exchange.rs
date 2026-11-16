@@ -564,6 +564,11 @@ pub trait FuturesExchange {
         &self,
         since_ms: u64,
     ) -> impl Future<Output = Result<Vec<Transfer>, String>> + Send;
+
+    /// Wallet balance of one margin asset (in units of that asset) in the
+    /// futures wallet; zero when the account holds none. On an account that
+    /// posts BNB as collateral, this is how much BNB can leave.
+    fn asset_wallet(&self, asset: &str) -> impl Future<Output = Result<f64, String>> + Send;
 }
 
 /// Which way a universal transfer moves money between the spot wallet and the
@@ -600,6 +605,16 @@ pub trait WalletExchange {
         asset: &str,
         amount: f64,
     ) -> impl Future<Output = Result<u64, String>> + Send;
+
+    /// Last spot price of `symbol`.
+    fn spot_price(&self, symbol: &str) -> impl Future<Output = Result<f64, String>> + Send;
+
+    /// Market-sell `quantity` of the base asset of `symbol` for its quote asset.
+    fn sell_base(
+        &self,
+        symbol: &str,
+        quantity: f64,
+    ) -> impl Future<Output = Result<OrderOutcome, String>> + Send;
 
     /// Spot trading rules for `symbol`.
     fn spot_filters(

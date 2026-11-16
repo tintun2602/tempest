@@ -45,9 +45,10 @@ gets at most half of the margin (equity / MAX_OPEN_POSITIONS).
 at about 58 % of equity per stop).
 
 Profit withdrawal and top-up are code but off: `SKIM_ABOVE_USDC`,
-`SKIM_KEEP_USDC`, `SKIM_BUY`, `TOPUP_BELOW_USDC`, `TOPUP_TO_USDC` (`src/wallet.rs`;
+`SKIM_KEEP_USDC`, `SKIM_ASSET`, `SKIM_TO`, `SKIM_BUY`, `TOPUP_BELOW_USDC`, `TOPUP_TO_USDC` (`src/wallet.rs`;
 details in `deploy/hetzner/README.md`). They need "Enable Spot & Margin Trading"
-and "Permit Universal Transfer" on the key. The owner sets the numbers, not
+and "Permit Universal Transfer" on the key. The account is EEA credits mode: profit is BNFCR (not
+transferable), collateral is BNB, so the skim takes BNB (`SKIM_ASSET=BNB`) and sells it with `SKIM_TO=USDC`. The owner sets the numbers, not
 `settings.env` by default.
 
 In `/etc/tempest/bot.env` on the server: `MARKET=futures`,

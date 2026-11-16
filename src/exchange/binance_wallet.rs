@@ -116,6 +116,36 @@ impl WalletExchange for BinanceWalletClient {
         parse_tran_id(&resp)
     }
 
+    async fn spot_price(&self, symbol: &str) -> Result<f64, String> {
+        let resp: serde_json::Value = self
+            .http
+            .get(format!(
+                "{}/api/v3/ticker/price?symbol={symbol}",
+                self.base_url
+            ))
+            .send()
+            .await
+            .map_err(|e| format!("HTTP error: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("JSON parse error: {e}"))?;
+        check_api_error(&resp)?;
+        parse_str_f64(&resp["price"])
+            .filter(|p| *p > 0.0)
+            .ok_or_else(|| format!("no price for {symbol}: {resp}"))
+    }
+
+    async fn sell_base(&self, symbol: &str, quantity: f64) -> Result<OrderOutcome, String> {
+        let params = format!(
+            "symbol={symbol}&side=SELL&type=MARKET&quantity={}&newOrderRespType=FULL",
+            format_decimal(quantity)
+        );
+        let resp = self
+            .signed(reqwest::Method::POST, "/api/v3/order", &params)
+            .await?;
+        Ok(parse_order_outcome(&resp, symbol, Side::Sell, quantity))
+    }
+
     async fn spot_filters(&self, symbol: &str) -> Result<SymbolFilters, String> {
         if let Some(cached) = self
             .filter_cache

@@ -138,6 +138,8 @@ key stays IP-restricted to this server).
 |---|---|
 | `SKIM_ABOVE_USDC` | Skim when futures equity is above this, and no position or resting order exists. |
 | `SKIM_KEEP_USDC` | What stays in futures after a skim (default 0). The bot moves `available - keep`, in whole cents, at least 5 USDC, never more than available. |
+| `SKIM_ASSET` | What leaves futures: `USDC` (default) or the collateral the account holds, `BNB`, `BTC` or `ETH` (the only ones Binance lets out of a credits-mode wallet besides USDC). For a non-USDC asset the bot prices it fresh against USDC, takes 98 % of the excess (so haircut and rounding never leave equity under the keep amount), never more than the wallet holds, and books the transfer at what equity actually fell by. |
+| `SKIM_TO` | `USDC`: sell a non-USDC skim in spot (`<ASSET>USDC` market sell, rounded to the step, held to the minimum order). A sale that cannot be made leaves the asset in spot. |
 | `SKIM_BUY` | Optional, e.g. `BNB:50,ETH:50`: percent of the skimmed amount spent on `<COIN>USDC` spot market buys (`quoteOrderQty`). Empty keeps USDC. A share under the symbol's minimum order, or a refused buy, stays as USDC; the withdrawal is not undone. |
 | `TOPUP_BELOW_USDC` | Top up when futures equity is below this. |
 | `TOPUP_TO_USDC` | Fill up to this equity from USDC already in spot. Never sells coins. |
@@ -151,6 +153,16 @@ A cycle that moves money ends there; entries resume next cycle. A key without
 the permission gives one Telegram message and the feature is off until the next
 UTC day; other failures retry after an hour. Moves are logged and sent to
 Telegram with amounts and the new balance.
+
+### EEA credits-mode account (BNB as collateral)
+
+Profit is booked in BNFCR, which cannot be transferred or withdrawn; only BTC,
+ETH, BNB and USDC can leave the futures wallet. So with BNB as collateral the
+bot takes the excess out as BNB, not as the BNFCR profit: the profit stays as
+BNFCR margin and equity falls back towards `SKIM_KEEP_USDC`. Example for a
+200 stake: `SKIM_ABOVE_USDC=205 SKIM_KEEP_USDC=200 SKIM_ASSET=BNB SKIM_TO=USDC`.
+If the excess is larger than the BNB held, only the BNB leaves. Try it with a
+small amount first (see the PR for the plan).
 
 ## Day to day
 

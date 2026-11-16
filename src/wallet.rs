@@ -20,6 +20,16 @@ use tracing::{error, info, warn};
 
 /// The margin and spot asset moved.
 pub const ASSET: &str = "USDC";
+/// What can be transferred between the futures wallet and others in credits
+/// mode (Binance FAQ: BTC, ETH, BNB and USDC).
+const TRANSFERABLE: [&str; 4] = ["USDC", "BNB", "BTC", "ETH"];
+/// A skim of collateral takes only this share of the excess, so rounding,
+/// price movement and the collateral haircut never leave the account under
+/// `SKIM_KEEP_USDC`.
+const COLLATERAL_SAFETY: f64 = 0.98;
+/// A transfer measured after the fact must be within this band of the nominal
+/// value to be believed; outside it the nominal value is used.
+const MEASURED_BAND: (f64, f64) = (0.5, 1.2);
 /// Smallest amount worth moving: no pocket change every cycle.
 pub const MIN_MOVE: f64 = 5.0;
 const DAY_MS: u64 = 86_400_000;
@@ -38,6 +48,11 @@ pub struct WalletConfig {
     pub skim_keep: f64,
     /// Coins (base asset, weight in percent) bought with a skim.
     pub skim_buy: Vec<(String, f64)>,
+    /// The asset that leaves futures: `USDC` (default) or the collateral the
+    /// account holds, `BNB`, `BTC` or `ETH`.
+    pub skim_asset: String,
+    /// Sell a non-USDC skim to USDC in spot (`SKIM_TO=USDC`).
+    pub skim_to_usdc: bool,
     /// Top up when futures equity is below this; `None` is off.
     pub topup_below: Option<f64>,
     /// Equity to fill up to.
@@ -53,6 +68,7 @@ impl WalletConfig {
                 .filter(|v| v.is_finite() && *v > 0.0)
         };
         let buy = std::env::var("SKIM_BUY").unwrap_or_default();
+        let text = |key: &str| std::env::var(key).unwrap_or_default();
         Self::new(
             num("SKIM_ABOVE_USDC"),
             std::env::var("SKIM_KEEP_USDC")
@@ -64,6 +80,38 @@ impl WalletConfig {
             num("TOPUP_BELOW_USDC"),
             num("TOPUP_TO_USDC").unwrap_or(0.0),
         )
+        .with_skim_asset(&text("SKIM_ASSET"), &text("SKIM_TO"))
+    }
+
+    /// `SKIM_ASSET` (blank is USDC) and `SKIM_TO`. Only the assets Binance
+    /// lets out of a credits-mode futures wallet are accepted; anything else
+    /// switches the skim off. `SKIM_TO=USDC` sells a non-USDC skim in spot.
+    pub fn with_skim_asset(mut self, asset: &str, to: &str) -> Self {
+        let asset = asset.trim().to_uppercase();
+        if !asset.is_empty() {
+            if TRANSFERABLE.contains(&asset.as_str()) {
+                self.skim_asset = asset;
+            } else {
+                warn!("SKIM_ASSET {asset:?} is not one of {TRANSFERABLE:?}: skim off");
+                self.skim_above = None;
+            }
+        }
+        match to.trim().to_uppercase().as_str() {
+            "" => {}
+            "USDC" => self.skim_to_usdc = true,
+            other => {
+                warn!("SKIM_TO {other:?} is not supported (only USDC): ignored");
+            }
+        }
+        if self.skim_asset == ASSET {
+            self.skim_to_usdc = false;
+        } else if !self.skim_to_usdc && !self.skim_buy.is_empty() {
+            warn!(
+                "SKIM_BUY needs USDC: with SKIM_ASSET not USDC it requires SKIM_TO=USDC; ignored"
+            );
+            self.skim_buy.clear();
+        }
+        self
     }
 
     /// Settings that contradict each other switch the whole feature off, with
@@ -79,6 +127,8 @@ impl WalletConfig {
             skim_above,
             skim_keep,
             skim_buy: parse_skim_buy(skim_buy),
+            skim_asset: ASSET.to_string(),
+            skim_to_usdc: false,
             topup_below,
             topup_to,
         };
@@ -186,6 +236,13 @@ impl WalletState {
 /// Round an amount down to whole cents.
 fn floor_cents(x: f64) -> f64 {
     (x * 100.0).floor() / 100.0
+}
+
+/// Round `x` down to a multiple of `step`.
+fn floor_to(x: f64, step: f64) -> f64 {
+    // Eight decimals is the finest any amount here is sent at; rounding keeps
+    // float noise out of the request.
+    (((x / step) + 1e-9).floor() * step * 1e8).round() / 1e8
 }
 
 fn is_permission_error(error: &str) -> bool {
@@ -298,31 +355,100 @@ async fn skim<W: WalletExchange, E: FuturesExchange>(
             }
         }
     }
-    // Never more than what is free, whatever the equity says.
-    let amount = floor_cents(account.available.min(account.equity) - cfg.skim_keep);
-    if amount < MIN_MOVE || amount > account.available {
+    let asset = cfg.skim_asset.as_str();
+    // The excess over the keep amount, never more than what is free.
+    let excess = account.available.min(account.equity) - cfg.skim_keep;
+    // How much leaves (in units of `asset`), its dollar value, and its price.
+    let (quantity, value, price) = if asset == ASSET {
+        let amount = floor_cents(excess);
+        (amount, amount, 1.0)
+    } else {
+        let symbol = format!("{asset}{ASSET}");
+        let price = match wallet.spot_price(&symbol).await {
+            Ok(p) => p,
+            Err(e) => {
+                failed(
+                    state,
+                    Feature::Transfer,
+                    "Enable Reading",
+                    &format!("{symbol} price"),
+                    &e,
+                    now_ms,
+                    notifier,
+                )
+                .await;
+                return Moved::Nothing;
+            }
+        };
+        let held = match ex.asset_wallet(asset).await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("Skim waits: could not read the {asset} balance: {e}");
+                return Moved::Nothing;
+            }
+        };
+        // A little under the excess, and never more than the wallet holds.
+        let wanted = excess * COLLATERAL_SAFETY / price;
+        let quantity = floor_to(wanted.min(held), 0.000001);
+        (quantity, quantity * price, price)
+    };
+    if value < MIN_MOVE || value > account.available {
         return Moved::Nothing;
     }
     match wallet
-        .universal_transfer(TransferDirection::FuturesToSpot, ASSET, amount)
+        .universal_transfer(TransferDirection::FuturesToSpot, asset, quantity)
         .await
     {
         Ok(id) => {
-            risk.record_own_transfer(-amount, now_ms);
-            let left = account.equity - amount;
-            info!("Skimmed {amount:.2} {ASSET} to spot (transfer {id}); futures equity {left:.2}");
-            let mut msg = format!(
-                "\u{1f4b0} *Profit moved to spot*\n`{amount:.2}` {ASSET} out of futures; futures \
-                 equity now about `{left:.2}`"
+            // What the account lost, as the account reports it (collateral
+            // counts at a haircut); the nominal value if that cannot be read
+            // or looks wrong.
+            let nominal = -value;
+            let change = match ex.account().await {
+                Ok(after) => {
+                    let delta = after.equity - account.equity;
+                    let (lo, hi) = MEASURED_BAND;
+                    if delta < 0.0 && delta <= nominal * lo && delta >= nominal * hi {
+                        delta
+                    } else {
+                        nominal
+                    }
+                }
+                Err(_) => nominal,
+            };
+            risk.record_own_transfer(change, now_ms);
+            let left = account.equity + change;
+            info!(
+                "Skimmed {quantity} {asset} (~{value:.2} USD, transfer {id}) to spot; futures \
+                 equity about {left:.2}"
             );
-            if !cfg.skim_buy.is_empty() {
+            let mut msg = format!(
+                "\u{1f4b0} *Profit moved to spot*\n`{quantity}` {asset} (about `{value:.2}` USD) out \
+                 of futures; futures equity now about `{left:.2}`"
+            );
+            // Back to USDC, and then on to coins if asked.
+            let mut usdc = (asset == ASSET).then_some(value);
+            if asset != ASSET && cfg.skim_to_usdc {
+                match sell_to_usdc(wallet, asset, quantity, price, state, now_ms, notifier).await {
+                    Ok((line, proceeds)) => {
+                        msg.push('\n');
+                        msg.push_str(&line);
+                        usdc = Some(proceeds);
+                    }
+                    Err(line) => {
+                        msg.push('\n');
+                        msg.push_str(&line);
+                    }
+                }
+            }
+            if let (Some(amount), false) = (usdc, cfg.skim_buy.is_empty()) {
                 for line in buy_coins(wallet, cfg, state, amount, now_ms, notifier).await {
                     msg.push('\n');
                     msg.push_str(&line);
                 }
             }
             notifier.send(&msg).await;
-            Moved::Skimmed(amount)
+            Moved::Skimmed(value)
         }
         Err(e) => {
             failed(
@@ -336,6 +462,70 @@ async fn skim<W: WalletExchange, E: FuturesExchange>(
             )
             .await;
             Moved::Nothing
+        }
+    }
+}
+
+/// Sell `quantity` of `asset` in spot for USDC, rounded down to the symbol's
+/// step and held to its minimum order. Returns a line for the owner and the
+/// USDC received, or a line saying the asset stays in spot (the transfer is
+/// not undone, and the bot goes on).
+async fn sell_to_usdc<W: WalletExchange>(
+    wallet: &W,
+    asset: &str,
+    quantity: f64,
+    price: f64,
+    state: &mut WalletState,
+    now_ms: u64,
+    notifier: &Notifier,
+) -> Result<(String, f64), String> {
+    let symbol = format!("{asset}{ASSET}");
+    let stays =
+        |why: &str| format!("{symbol}: not sold ({why}), `{quantity}` {asset} stays in spot");
+    if state.is_off(Feature::SpotTrade, now_ms) {
+        return Err(stays("spot trading is off today"));
+    }
+    let filters = wallet.spot_filters(&symbol).await.map_err(|e| stays(&e))?;
+    let step = if filters.step_size > 0.0 {
+        filters.step_size
+    } else {
+        0.000001
+    };
+    let sell = floor_to(quantity, step);
+    if sell <= 0.0 || sell < filters.min_qty || sell * price < filters.min_notional {
+        return Err(stays("under the minimum order"));
+    }
+    match wallet.sell_base(&symbol, sell).await {
+        Ok(fill) => {
+            let proceeds = if fill.average_price > 0.0 {
+                fill.filled_quantity * fill.average_price
+            } else {
+                sell * price
+            };
+            info!(
+                "Sold {} {asset} for about {proceeds:.2} {ASSET}",
+                fill.filled_quantity
+            );
+            Ok((
+                format!(
+                    "{symbol}: sold `{}` for about `{proceeds:.2}` {ASSET}",
+                    fill.filled_quantity
+                ),
+                proceeds,
+            ))
+        }
+        Err(e) => {
+            failed(
+                state,
+                Feature::SpotTrade,
+                PERMIT_SPOT,
+                &format!("{symbol} sell"),
+                &e,
+                now_ms,
+                notifier,
+            )
+            .await;
+            Err(stays("sell failed"))
         }
     }
 }

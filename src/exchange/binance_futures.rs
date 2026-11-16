@@ -251,6 +251,24 @@ impl FuturesExchange for BinanceFuturesClient {
             .await?;
         parse_transfers(&resp)
     }
+
+    async fn asset_wallet(&self, asset: &str) -> Result<f64, String> {
+        let resp = self
+            .signed(reqwest::Method::GET, "/fapi/v3/account", "")
+            .await?;
+        parse_asset_wallet(&resp, asset)
+    }
+}
+
+/// `walletBalance` of `asset` from the account's `assets` array.
+fn parse_asset_wallet(resp: &serde_json::Value, asset: &str) -> Result<f64, String> {
+    let assets = resp["assets"]
+        .as_array()
+        .ok_or_else(|| format!("no assets in account: {resp}"))?;
+    Ok(assets
+        .iter()
+        .find(|a| a["asset"].as_str() == Some(asset))
+        .map_or(0.0, |a| parse_str_f64_or_zero(&a["walletBalance"])))
 }
 
 /// Futures filters differ from spot: market orders have their own lot size,
@@ -410,6 +428,17 @@ fn parse_transfers(resp: &serde_json::Value) -> Result<Vec<Transfer>, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_collateral_asset_balance_is_read_from_the_account() {
+        let resp = json!({"assets": [
+            {"asset": "BNFCR", "walletBalance": "0.00000000"},
+            {"asset": "BNB", "walletBalance": "0.35840726", "marginBalance": "0.3584"}
+        ]});
+        assert_eq!(parse_asset_wallet(&resp, "BNB").unwrap(), 0.35840726);
+        assert_eq!(parse_asset_wallet(&resp, "ETH").unwrap(), 0.0);
+        assert!(parse_asset_wallet(&json!({}), "BNB").is_err());
+    }
 
     fn exchange_info() -> serde_json::Value {
         json!({"symbols": [{
