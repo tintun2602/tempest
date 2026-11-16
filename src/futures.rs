@@ -184,8 +184,14 @@ pub async fn run(config: &Config) {
         notifier.send(&msg).await;
     }
     let wallet_cfg = wallet::WalletConfig::from_env();
+    let mut half_out_line = None;
     let mut wallet = wallet_cfg.is_on().then(|| {
         info!("Wallet moves on: {wallet_cfg:?}");
+        let mut state = wallet::WalletState::with_file(wallet::state_file_from_env());
+        if let Some(line) = state.half_out_line(&wallet_cfg) {
+            info!("{line}");
+            half_out_line = Some(line);
+        }
         Wallet {
             client: BinanceWalletClient::new(
                 &BinanceWalletClient::base_url_from_env(),
@@ -193,9 +199,12 @@ pub async fn run(config: &Config) {
                 &config.api_secret,
             ),
             cfg: wallet_cfg,
-            state: wallet::WalletState::with_file(wallet::state_file_from_env()),
+            state,
         }
     });
+    if let Some(line) = half_out_line {
+        notifier.send(&format!("\u{1f4b0} {line}")).await;
+    }
     let mut rate_limited_cycles = 0u32;
     loop {
         let mut wait = poll;
@@ -3324,6 +3333,457 @@ mod tests {
         assert!(!wallet::WalletConfig::new(Some(200.0), 100.0, "", Some(50.0), 250.0).is_on());
         // Off unless set.
         assert!(!wallet::WalletConfig::new(None, 0.0, "", None, 0.0).is_on());
+    }
+
+    // ----- half out -----
+
+    fn half_cfg(stake: &str, step: &str, share: &str) -> wallet::WalletConfig {
+        wallet::WalletConfig::new(None, 0.0, "", None, 0.0).with_half_out(stake, step, share)
+    }
+
+    fn half() -> wallet::WalletConfig {
+        half_cfg("210", "150", "50")
+    }
+
+    const LATER: u64 = NOW + 2 * 3_600_000;
+
+    /// Run one half-out cycle on a flat account with this equity.
+    async fn half_cycle(
+        cfg: &wallet::WalletConfig,
+        state: &mut wallet::WalletState,
+        equity: f64,
+        now_ms: u64,
+    ) -> (Moved, FakeWallet) {
+        let (w, ex) = (FakeWallet::default(), Fake::default());
+        let mut risk = RiskManager::with_risk_per_trade(equity, 0.02);
+        let moved = move_money_at(
+            &w,
+            &ex,
+            cfg,
+            state,
+            acct(equity, equity),
+            &[],
+            &mut risk,
+            &quiet(),
+            now_ms,
+        )
+        .await;
+        (moved, w)
+    }
+
+    fn base_of(cfg: &wallet::WalletConfig, state: &mut wallet::WalletState) -> f64 {
+        state.base(&cfg.half_out.unwrap())
+    }
+
+    #[tokio::test]
+    async fn half_out_waits_until_equity_is_stake_plus_step() {
+        let cfg = half();
+        let mut state = wallet::WalletState::default();
+        let (moved, w) = half_cycle(&cfg, &mut state, 359.99, NOW).await;
+        assert_eq!(moved, Moved::Nothing);
+        assert!(w.log().is_empty());
+        let (moved, w) = half_cycle(&cfg, &mut state, 360.0, NOW).await;
+        assert_eq!(moved, Moved::Skimmed(75.0));
+        assert_eq!(w.log(), ["transfer UMFUTURE_MAIN USDC 75"]);
+        let mut fresh = wallet::WalletState::default();
+        let (moved, _) = half_cycle(&cfg, &mut fresh, 360.01, NOW).await;
+        assert_eq!(moved, Moved::Skimmed(75.0), "75.005 floors to whole cents");
+    }
+
+    #[tokio::test]
+    async fn half_out_example_takes_76_and_raises_the_base_to_286() {
+        let cfg = half();
+        let mut state = wallet::WalletState::default();
+        let (w, ex) = (FakeWallet::default(), Fake::default());
+        let notifier = quiet();
+        let mut risk = RiskManager::with_risk_per_trade(362.0, 0.02);
+        let moved = move_money_at(
+            &w,
+            &ex,
+            &cfg,
+            &mut state,
+            acct(362.0, 362.0),
+            &[],
+            &mut risk,
+            &notifier,
+            NOW,
+        )
+        .await;
+        assert_eq!(moved, Moved::Skimmed(76.0));
+        assert_eq!(w.log(), ["transfer UMFUTURE_MAIN USDC 76"]);
+        assert_eq!(base_of(&cfg, &mut state), 286.0);
+        assert_eq!(
+            notifier.sent(),
+            [
+                "\u{1f4b0} Took out `76.00` USDC (50 % of `152.00` earned above the `210.00` \
+                 stake) to spot; stake is now `286.00`, next withdrawal at `436.00`"
+            ]
+        );
+        // The next one is at 436, not before.
+        let (moved, _) = half_cycle(&cfg, &mut state, 435.99, LATER).await;
+        assert_eq!(moved, Moved::Nothing);
+        let (moved, w) = half_cycle(&cfg, &mut state, 436.0, LATER).await;
+        assert_eq!(moved, Moved::Skimmed(75.0));
+        assert_eq!(w.log(), ["transfer UMFUTURE_MAIN USDC 75"]);
+        assert_eq!(base_of(&cfg, &mut state), 361.0);
+    }
+
+    #[tokio::test]
+    async fn half_out_is_not_a_loss_for_the_daily_drawdown() {
+        let cfg = half();
+        let (w, ex) = (FakeWallet::default(), Fake::default());
+        let mut risk = RiskManager::with_risk_per_trade(362.0, 0.02).with_limits(2, 0.5);
+        move_money(
+            &w,
+            &ex,
+            &cfg,
+            &mut Default::default(),
+            acct(362.0, 362.0),
+            &[],
+            &mut risk,
+            &quiet(),
+        )
+        .await;
+        assert_eq!(risk.day_baseline(), 286.0);
+        assert_eq!(risk.day_pnl(286.0), 0.0);
+        assert!(!risk.check_drawdown(286.0));
+    }
+
+    #[tokio::test]
+    async fn the_base_survives_a_restart_and_a_new_stake_starts_over() {
+        let path = temp_state("half-base");
+        let cfg = half();
+        let mut state = wallet::WalletState::with_file(path.clone());
+        let (moved, _) = half_cycle(&cfg, &mut state, 362.0, NOW).await;
+        assert_eq!(moved, Moved::Skimmed(76.0));
+
+        // Restart: same settings, same base.
+        let mut state = wallet::WalletState::with_file(path.clone());
+        assert_eq!(base_of(&cfg, &mut state), 286.0);
+        let (moved, _) = half_cycle(&cfg, &mut state, 400.0, LATER).await;
+        assert_eq!(moved, Moved::Nothing);
+
+        // Only step and share changed: the base stays.
+        let other = half_cfg("210", "100", "25");
+        let mut state = wallet::WalletState::with_file(path.clone());
+        assert_eq!(base_of(&other, &mut state), 286.0);
+
+        // A new stake starts the base over from it.
+        let bigger = half_cfg("250", "150", "50");
+        let mut state = wallet::WalletState::with_file(path.clone());
+        assert_eq!(base_of(&bigger, &mut state), 250.0);
+        let (moved, _) = half_cycle(&bigger, &mut state, 400.0, LATER).await;
+        assert_eq!(moved, Moved::Skimmed(75.0));
+        let mut state = wallet::WalletState::with_file(path.clone());
+        assert_eq!(base_of(&bigger, &mut state), 325.0);
+
+        // Back to the old stake: it is 210 again, not the stale 286.
+        let mut state = wallet::WalletState::with_file(path);
+        assert_eq!(base_of(&cfg, &mut state), 210.0);
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_broken_file_starts_from_the_stake() {
+        let path = temp_state("half-broken");
+        let cfg = half();
+        let mut state = wallet::WalletState::with_file(path.clone());
+        assert_eq!(base_of(&cfg, &mut state), 210.0, "no file");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+        let mut state = wallet::WalletState::with_file(path.clone());
+        assert_eq!(base_of(&cfg, &mut state), 210.0, "corrupt file");
+        std::fs::write(
+            &path,
+            br#"{"pending":[],"half_out":{"base":-5.0,"stake":210.0,"step":150.0,"share_pct":50.0}}"#,
+        )
+        .unwrap();
+        let mut state = wallet::WalletState::with_file(path.clone());
+        assert_eq!(base_of(&cfg, &mut state), 210.0, "nonsense base");
+        // A file from before this feature has no base.
+        std::fs::write(&path, br#"{"pending":[]}"#).unwrap();
+        let mut state = wallet::WalletState::with_file(path);
+        assert_eq!(base_of(&cfg, &mut state), 210.0, "old file");
+    }
+
+    #[tokio::test]
+    async fn losses_never_lower_the_base() {
+        let cfg = half();
+        let mut state = wallet::WalletState::default();
+        half_cycle(&cfg, &mut state, 362.0, NOW).await;
+        assert_eq!(base_of(&cfg, &mut state), 286.0);
+        // The account falls to 150: the next withdrawal is still at 436.
+        let (moved, _) = half_cycle(&cfg, &mut state, 150.0, LATER).await;
+        assert_eq!(moved, Moved::Nothing);
+        assert_eq!(base_of(&cfg, &mut state), 286.0);
+        let (moved, _) = half_cycle(&cfg, &mut state, 360.0, LATER).await;
+        assert_eq!(moved, Moved::Nothing);
+        let (moved, _) = half_cycle(&cfg, &mut state, 436.0, LATER).await;
+        assert!(matches!(moved, Moved::Skimmed(_)));
+    }
+
+    #[tokio::test]
+    async fn half_out_waits_for_a_flat_account_and_the_cooldown() {
+        let cfg = half();
+        let mut risk = RiskManager::with_risk_per_trade(400.0, 0.02);
+        let (w, ex) = (FakeWallet::default(), Fake::default());
+        let moved = move_money(
+            &w,
+            &ex,
+            &cfg,
+            &mut Default::default(),
+            acct(400.0, 300.0),
+            &[position(0.1)],
+            &mut risk,
+            &quiet(),
+        )
+        .await;
+        assert_eq!(moved, Moved::Nothing, "open position");
+        let ex = resting(vec![order(1, Some(TriggerKind::Stop), Side::Sell, 1_900.0)]);
+        let moved = move_money(
+            &w,
+            &ex,
+            &cfg,
+            &mut Default::default(),
+            acct(400.0, 400.0),
+            &[],
+            &mut risk,
+            &quiet(),
+        )
+        .await;
+        assert_eq!(moved, Moved::Nothing, "resting order");
+        let ex = Fake {
+            other_orders: 1,
+            ..Default::default()
+        };
+        let moved = move_money(
+            &w,
+            &ex,
+            &cfg,
+            &mut Default::default(),
+            acct(400.0, 400.0),
+            &[],
+            &mut risk,
+            &quiet(),
+        )
+        .await;
+        assert_eq!(moved, Moved::Nothing, "regular order");
+        assert!(w.log().is_empty());
+
+        // Right after a move nothing more goes, even above the new line.
+        let mut state = wallet::WalletState::default();
+        half_cycle(&cfg, &mut state, 362.0, NOW).await;
+        let (moved, _) = half_cycle(&cfg, &mut state, 500.0, NOW + 60_000).await;
+        assert_eq!(moved, Moved::Nothing, "cooldown");
+    }
+
+    #[tokio::test]
+    async fn half_out_never_takes_more_than_is_available() {
+        let cfg = half();
+        let (w, ex) = (FakeWallet::default(), Fake::default());
+        let mut risk = RiskManager::with_risk_per_trade(362.0, 0.02);
+        let mut state = wallet::WalletState::default();
+        let moved = move_money(
+            &w,
+            &ex,
+            &cfg,
+            &mut state,
+            acct(362.0, 30.0),
+            &[],
+            &mut risk,
+            &quiet(),
+        )
+        .await;
+        assert_eq!(moved, Moved::Skimmed(30.0));
+        assert_eq!(base_of(&cfg, &mut state), 332.0, "what stays is the base");
+    }
+
+    #[tokio::test]
+    async fn share_100_takes_all_the_gain_and_share_1_a_sliver() {
+        let all = half_cfg("210", "150", "100");
+        let mut state = wallet::WalletState::default();
+        let (moved, w) = half_cycle(&all, &mut state, 362.0, NOW).await;
+        assert_eq!(moved, Moved::Skimmed(152.0));
+        assert_eq!(w.log(), ["transfer UMFUTURE_MAIN USDC 152"]);
+        assert_eq!(base_of(&all, &mut state), 210.0, "never below the base");
+
+        let one = half_cfg("210", "150", "1");
+        let mut state = wallet::WalletState::default();
+        let (moved, _) = half_cycle(&one, &mut state, 362.0, NOW).await;
+        assert_eq!(moved, Moved::Nothing, "1.52 is under the minimum move");
+        assert_eq!(base_of(&one, &mut state), 210.0);
+        let (moved, w) = half_cycle(&one, &mut state, 800.0, NOW).await;
+        assert_eq!(moved, Moved::Skimmed(5.9));
+        assert_eq!(w.log(), ["transfer UMFUTURE_MAIN USDC 5.9"]);
+        assert_eq!(base_of(&one, &mut state), 794.1);
+    }
+
+    #[test]
+    fn half_out_settings_are_checked() {
+        assert!(half().is_on());
+        assert_eq!(
+            half().half_out,
+            Some(wallet::HalfOut {
+                stake: 210.0,
+                step: 150.0,
+                share_pct: 50.0
+            })
+        );
+        // Blank share is 50; nothing set is off.
+        assert_eq!(half_cfg("210", "150", "").half_out.unwrap().share_pct, 50.0);
+        assert!(!half_cfg("", "", "").is_on());
+        for bad in ["0", "-1", "-0.5", "NaN", "inf", "abc"] {
+            assert!(!half_cfg(bad, "150", "50").is_on(), "stake {bad}");
+            assert!(!half_cfg("210", bad, "50").is_on(), "step {bad}");
+        }
+        for bad in ["0", "0.5", "-10", "101", "100.1", "NaN", "inf", "x"] {
+            assert!(!half_cfg("210", "150", bad).is_on(), "share {bad}");
+        }
+        assert!(half_cfg("210", "150", "1").is_on());
+        assert!(half_cfg("210", "150", "100").is_on());
+        // Stake or step alone is not a rule.
+        assert!(!half_cfg("210", "", "50").is_on());
+        assert!(!half_cfg("", "150", "50").is_on());
+        // A bad asset switches it off too.
+        assert!(!half().with_skim_asset("DOGE", "").is_on());
+    }
+
+    #[test]
+    fn half_out_clashing_with_above_or_keep_switches_the_skim_off() {
+        let above = wallet::WalletConfig::new(Some(300.0), 0.0, "", None, 0.0)
+            .with_half_out("210", "150", "50");
+        assert!(!above.is_on());
+        assert!(above.half_out.is_none() && above.skim_above.is_none());
+        let keep =
+            wallet::WalletConfig::new(None, 100.0, "", None, 0.0).with_half_out("210", "150", "50");
+        assert!(!keep.is_on());
+        // Top-up is not part of the clash and stays as set.
+        let with_topup = wallet::WalletConfig::new(Some(300.0), 60.0, "", Some(50.0), 100.0)
+            .with_half_out("210", "150", "50");
+        assert!(with_topup.is_on());
+        assert!(with_topup.half_out.is_none() && with_topup.skim_above.is_none());
+        assert_eq!(with_topup.topup_below, Some(50.0));
+    }
+
+    #[tokio::test]
+    async fn a_lost_reply_that_went_through_raises_the_base_from_the_account() {
+        let cfg = half();
+        let (mut w, ex) = (FakeWallet::default(), Fake::default());
+        w.transfer_error = Some("HTTP error: operation timed out".into());
+        // The transfer landed: equity fell by 74 (not quite 76).
+        *ex.account_after.lock().unwrap() = Some(acct(288.0, 288.0));
+        let mut risk = RiskManager::with_risk_per_trade(362.0, 0.02);
+        let mut state = wallet::WalletState::default();
+        let moved = move_money(
+            &w,
+            &ex,
+            &cfg,
+            &mut state,
+            acct(362.0, 362.0),
+            &[],
+            &mut risk,
+            &quiet(),
+        )
+        .await;
+        assert_eq!(moved, Moved::Skimmed(76.0));
+        assert_eq!(base_of(&cfg, &mut state), 288.0, "what the account holds");
+        assert!((risk.net_cash_flow() + 74.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_lost_reply_that_did_not_go_through_leaves_the_base() {
+        let cfg = half();
+        let (mut w, ex) = (FakeWallet::default(), Fake::default());
+        w.transfer_error = Some("HTTP error: operation timed out".into());
+        // The account still reads the old equity: nothing left.
+        *ex.account_after.lock().unwrap() = Some(acct(362.0, 362.0));
+        let mut risk = RiskManager::with_risk_per_trade(362.0, 0.02);
+        let mut state = wallet::WalletState::default();
+        let notifier = quiet();
+        let moved = move_money(
+            &w,
+            &ex,
+            &cfg,
+            &mut state,
+            acct(362.0, 362.0),
+            &[],
+            &mut risk,
+            &notifier,
+        )
+        .await;
+        assert_eq!(moved, Moved::Nothing);
+        assert_eq!(base_of(&cfg, &mut state), 210.0);
+        assert_eq!(risk.net_cash_flow(), 0.0);
+        // A refusal from Binance is definite too.
+        w.transfer_error = Some("Binance API error -1000: boom".into());
+        let moved = move_money_at(
+            &w,
+            &ex,
+            &cfg,
+            &mut state,
+            acct(362.0, 362.0),
+            &[],
+            &mut risk,
+            &notifier,
+            LATER,
+        )
+        .await;
+        assert_eq!(moved, Moved::Nothing);
+        assert_eq!(base_of(&cfg, &mut state), 210.0);
+    }
+
+    #[tokio::test]
+    async fn a_misreading_after_the_transfer_falls_back_to_the_nominal_amount() {
+        // The fake account reads 100 afterwards: far from 286, so the nominal
+        // 76 is used and the base is 362 - 76.
+        let cfg = half();
+        let mut state = wallet::WalletState::default();
+        half_cycle(&cfg, &mut state, 362.0, NOW).await;
+        assert_eq!(base_of(&cfg, &mut state), 286.0);
+    }
+
+    #[tokio::test]
+    async fn half_out_in_bnb_takes_the_share_of_the_gain() {
+        let cfg = half_cfg("200", "5", "50").with_skim_asset("bnb", "USDC");
+        let (w, ex) = bnb_world();
+        let mut risk = RiskManager::with_risk_per_trade(210.58, 0.02);
+        let notifier = quiet();
+        let mut state = wallet::WalletState::default();
+        let moved = move_money(
+            &w,
+            &ex,
+            &cfg,
+            &mut state,
+            acct(210.58, 210.58),
+            &[],
+            &mut risk,
+            &notifier,
+        )
+        .await;
+        // Half of 10.58 is 5.29; 98 % of it at the fake price.
+        assert!(
+            matches!(moved, Moved::Skimmed(v) if v < 5.29 && v > 5.0),
+            "{moved:?}"
+        );
+        let msg = notifier.sent().join("\n");
+        assert!(
+            msg.contains("BNB") && msg.contains("earned above the `200.00` stake"),
+            "{msg}"
+        );
+        assert!(base_of(&cfg, &mut state) > 204.0);
+    }
+
+    #[test]
+    fn the_startup_line_names_base_and_next_level() {
+        let cfg = half();
+        let mut state = wallet::WalletState::default();
+        let line = state.half_out_line(&cfg).unwrap();
+        assert!(
+            line.contains("210.00") && line.contains("360.00") && line.contains("50 %"),
+            "{line}"
+        );
+        assert!(wallet::WalletState::default()
+            .half_out_line(&skim_cfg(""))
+            .is_none());
     }
 
     #[tokio::test]

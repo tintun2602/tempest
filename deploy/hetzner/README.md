@@ -141,6 +141,9 @@ key stays IP-restricted to this server).
 | `SKIM_ASSET` | What leaves futures: `USDC` (default) or the collateral the account holds, `BNB`, `BTC` or `ETH` (the only ones Binance lets out of a credits-mode wallet besides USDC). For a non-USDC asset the bot prices it fresh against USDC, takes 98 % of the excess (so haircut and rounding never leave equity under the keep amount), never more than the wallet holds, and books the transfer at what equity actually fell by. |
 | `SKIM_TO` | `USDC`: sell a non-USDC skim in spot (`<ASSET>USDC` market sell, rounded to the step, held to the minimum order). A sale that cannot be made leaves the asset in spot. |
 | `SKIM_BUY` | Optional, e.g. `BNB:50,ETH:50`: percent of the skimmed amount spent on `<COIN>USDC` spot market buys (`quoteOrderQty`). Empty keeps USDC. A share under the symbol's minimum order, or a refused buy, stays as USDC; the withdrawal is not undone. |
+| `SKIM_STAKE_USDC` | Half-out mode: the stake the account starts from (the first base), e.g. `210`. |
+| `SKIM_STEP_USDC` | Half-out mode: the gain over the base that triggers a withdrawal, e.g. `150`. |
+| `SKIM_SHARE_PCT` | Half-out mode: percent of that gain taken out, 1 to 100 (blank is 50), e.g. `50`. |
 | `TOPUP_BELOW_USDC` | Top up when futures equity is below this. |
 | `TOPUP_TO_USDC` | Fill up to this equity from USDC already in spot. Never sells coins. |
 | `SPOT_BASE_URL` | Spot and `/sapi` host, default `https://api.binance.com`. |
@@ -154,7 +157,50 @@ the permission gives one Telegram message and the feature is off until the next
 UTC day; other failures retry after an hour. Moves are logged and sent to
 Telegram with amounts and the new balance.
 
+### Half out (`SKIM_STAKE_USDC`, `SKIM_STEP_USDC`, `SKIM_SHARE_PCT`)
+
+A second skim mode (owner, 2026-11-16), off until stake and step are set. The
+bot keeps a `base`, starting at `SKIM_STAKE_USDC`. When futures equity is at
+least `base + SKIM_STEP_USDC`, the account is flat (no position, no resting
+order anywhere) and no cooldown runs, it moves `SKIM_SHARE_PCT` % of
+`equity - base` to spot (whole cents, at least 5 USDC, never more than
+available), then sets `base` to the equity that stays. Example, 210 / 150 / 50:
+equity 362 takes out 76.00, the base becomes 286 and the next withdrawal is at
+436. The base never falls: if the account drops to 150, the next withdrawal is
+still at `base + step`.
+
+- The base is kept in `wallet-state.json` (`half_out`) with the settings it was
+  counted from. Changing `SKIM_STAKE_USDC` starts the base over from the new
+  value; changing only step or share leaves it. A missing or corrupt file
+  starts from `SKIM_STAKE_USDC` (logged).
+- The transfer path is the ordinary skim: same checks, `SKIM_ASSET`, `SKIM_TO`
+  and `SKIM_BUY`, a lost reply confirmed from the account (base moves only if
+  equity actually fell), and the cash-flow booking against
+  `DAILY_DRAWDOWN_PCT`. The new base is the equity measured after the transfer
+  (the nominal amount if the reading looks wrong).
+- Invalid values (stake or step 0, negative or not a number, share outside
+  1 to 100), stake without step (or the reverse), or any of it together with
+  `SKIM_ABOVE_USDC` / `SKIM_KEEP_USDC` switch the skim off with a warning.
+  Top-up is separate and unchanged.
+- Start-up logs and tells the owner the base and the next withdrawal level.
+- The withdrawal message reads: `Took out 76.00 USDC (50 % of 152.00 earned
+  above the 210.00 stake) to spot; stake is now 286.00, next withdrawal at
+  436.00`.
+
+For 210 / 150 / 50 put in `settings.env` (or `bot.env`), nothing else skim
+related:
+
+```
+SKIM_STAKE_USDC=210
+SKIM_STEP_USDC=150
+SKIM_SHARE_PCT=50
+```
+
 ### EEA credits-mode account (BNB as collateral)
+
+Since 2026-11-16 the collateral is USDC, not BNB, and a skim of USDC worked on
+the real account (6.97 USDC moved), so `SKIM_ASSET` stays blank (USDC). The rest
+of this section applies only if BNB collateral is used again.
 
 Profit is booked in BNFCR, which cannot be transferred or withdrawn; only BTC,
 ETH, BNB and USDC can leave the futures wallet. So with BNB as collateral the

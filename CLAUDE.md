@@ -47,8 +47,16 @@ at about 58 % of equity per stop).
 Profit withdrawal and top-up are code but off: `SKIM_ABOVE_USDC`,
 `SKIM_KEEP_USDC`, `SKIM_ASSET`, `SKIM_TO`, `SKIM_BUY`, `TOPUP_BELOW_USDC`, `TOPUP_TO_USDC` (`src/wallet.rs`;
 details in `deploy/hetzner/README.md`). They need "Enable Spot & Margin Trading"
-and "Permit Universal Transfer" on the key. The account is EEA credits mode: profit is BNFCR (not
-transferable), collateral is BNB, so the skim takes BNB (`SKIM_ASSET=BNB`) and sells it with `SKIM_TO=USDC`. The owner sets the numbers, not
+and "Permit Universal Transfer" on the key. The account is EEA credits mode, but
+the collateral has been USDC since 2026-11-16 and a USDC skim worked on the real
+account, so `SKIM_ASSET` stays blank (BNB collateral earlier: BNFCR profit is not
+transferable, so the skim took BNB and sold it with `SKIM_TO=USDC`).
+**Half out** (owner, 2026-11-16, off by default): `SKIM_STAKE_USDC` (start base),
+`SKIM_STEP_USDC` (gain that triggers), `SKIM_SHARE_PCT` (share of the gain taken
+out, 1-100). At equity >= base + step on a flat account, share % of
+`equity - base` goes to spot and the base becomes the equity left; it never falls
+and is kept in `wallet-state.json` (a new stake restarts it). It clashes with
+`SKIM_ABOVE_USDC`/`SKIM_KEEP_USDC` (skim off). The owner sets the numbers, not
 `settings.env` by default.
 
 In `/etc/tempest/bot.env` on the server: `MARKET=futures`,

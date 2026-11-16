@@ -7,6 +7,11 @@
 //! under that equity is filled from spot USDC that is already there (never by
 //! selling anything). All of it is off until the owner sets the numbers.
 //!
+//! Alternatively "half out" (`SKIM_STAKE_USDC`, `SKIM_STEP_USDC`,
+//! `SKIM_SHARE_PCT`): a flat account that has earned `SKIM_STEP_USDC` over its
+//! base takes `SKIM_SHARE_PCT` % of the gain to spot, and the base is raised to
+//! the equity that stays. The base never falls, whatever the account does.
+//!
 //! A failed or refused move never stops the bot: it is logged, the owner is
 //! told, and the next try waits. A key without the needed permission switches
 //! the feature off until the next UTC day, with one message.
@@ -62,6 +67,18 @@ pub struct WalletConfig {
     pub topup_below: Option<f64>,
     /// Equity to fill up to.
     pub topup_to: f64,
+    /// The half-out rule; `None` is off.
+    pub half_out: Option<HalfOut>,
+}
+
+/// "Half out": the stake the account starts from, the gain over the base that
+/// triggers a withdrawal, and the share of that gain taken out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HalfOut {
+    pub stake: f64,
+    pub step: f64,
+    /// Percent of the gain, 1 to 100.
+    pub share_pct: f64,
 }
 
 impl WalletConfig {
@@ -85,7 +102,57 @@ impl WalletConfig {
             num("TOPUP_BELOW_USDC"),
             num("TOPUP_TO_USDC").unwrap_or(0.0),
         )
+        .with_half_out(
+            &text("SKIM_STAKE_USDC"),
+            &text("SKIM_STEP_USDC"),
+            &text("SKIM_SHARE_PCT"),
+        )
         .with_skim_asset(&text("SKIM_ASSET"), &text("SKIM_TO"))
+    }
+
+    /// The half-out rule from the raw settings (blank is unset). Stake and
+    /// step switch it on together; the share defaults to 50. A bad value, only
+    /// one of stake and step, or a clash with `SKIM_ABOVE_USDC` /
+    /// `SKIM_KEEP_USDC` switches the whole skim off with a warning. Call it
+    /// before `with_skim_asset`.
+    pub fn with_half_out(mut self, stake: &str, step: &str, share: &str) -> Self {
+        let (stake, step, share) = (stake.trim(), step.trim(), share.trim());
+        if stake.is_empty() && step.is_empty() && share.is_empty() {
+            return self;
+        }
+        let positive = |v: &str| v.parse::<f64>().ok().filter(|x| x.is_finite() && *x > 0.0);
+        let share_pct = if share.is_empty() {
+            Some(50.0)
+        } else {
+            share
+                .parse::<f64>()
+                .ok()
+                .filter(|x| x.is_finite() && (1.0..=100.0).contains(x))
+        };
+        let (Some(stake_v), Some(step_v), Some(share_v)) =
+            (positive(stake), positive(step), share_pct)
+        else {
+            warn!(
+                "Half-out settings SKIM_STAKE_USDC {stake:?}, SKIM_STEP_USDC {step:?}, \
+                 SKIM_SHARE_PCT {share:?} are not all valid (stake and step above 0, share 1 to \
+                 100, stake and step both set): skim off"
+            );
+            self.skim_above = None;
+            return self;
+        };
+        if self.skim_above.is_some() || self.skim_keep > 0.0 {
+            warn!(
+                "SKIM_STAKE_USDC/SKIM_STEP_USDC contradict SKIM_ABOVE_USDC/SKIM_KEEP_USDC: skim off"
+            );
+            self.skim_above = None;
+            return self;
+        }
+        self.half_out = Some(HalfOut {
+            stake: stake_v,
+            step: step_v,
+            share_pct: share_v,
+        });
+        self
     }
 
     /// `SKIM_ASSET` (blank is USDC) and `SKIM_TO`. Only the assets Binance
@@ -99,6 +166,7 @@ impl WalletConfig {
             } else {
                 warn!("SKIM_ASSET {asset:?} is not one of {TRANSFERABLE:?}: skim off");
                 self.skim_above = None;
+                self.half_out = None;
             }
         }
         match to.trim().to_uppercase().as_str() {
@@ -136,6 +204,7 @@ impl WalletConfig {
             skim_to_usdc: false,
             topup_below,
             topup_to,
+            half_out: None,
         };
         if let Some(above) = cfg.skim_above {
             if cfg.skim_keep >= above {
@@ -167,7 +236,7 @@ impl WalletConfig {
     }
 
     pub fn is_on(&self) -> bool {
-        self.skim_above.is_some() || self.topup_below.is_some()
+        self.skim_above.is_some() || self.half_out.is_some() || self.topup_below.is_some()
     }
 }
 
@@ -223,9 +292,21 @@ struct PendingSale {
     quantity: f64,
 }
 
+/// The half-out base and the settings it was counted from. A different stake
+/// in the settings starts the base over; step and share do not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct StoredBase {
+    base: f64,
+    stake: f64,
+    step: f64,
+    share_pct: f64,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct StoredWallet {
     pending: Vec<PendingSale>,
+    #[serde(default)]
+    half_out: Option<StoredBase>,
 }
 
 const STATE_FILE: &str = "wallet-state.json";
@@ -247,6 +328,8 @@ pub struct WalletState {
     pending: Vec<PendingSale>,
     /// The owner has been told something stands unsold.
     unsold_told: bool,
+    /// The half-out base, kept on disk.
+    base: Option<StoredBase>,
     path: Option<PathBuf>,
 }
 
@@ -269,15 +352,20 @@ impl WalletState {
                             state.pending
                         );
                     }
+                    state.base = stored
+                        .half_out
+                        .filter(|b| b.base.is_finite() && b.base > 0.0);
                 }
                 Err(e) => warn!(
-                    "Wallet state {} is corrupt ({e}); starting empty",
+                    "Wallet state {} is corrupt ({e}); starting empty, the half-out base starts \
+                     from SKIM_STAKE_USDC",
                     path.display()
                 ),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => warn!(
-                "Wallet state {} not readable ({e}); starting empty",
+                "Wallet state {} not readable ({e}); starting empty, the half-out base starts \
+                 from SKIM_STAKE_USDC",
                 path.display()
             ),
         }
@@ -291,6 +379,7 @@ impl WalletState {
         };
         let stored = StoredWallet {
             pending: self.pending.clone(),
+            half_out: self.base.clone(),
         };
         let tmp = path.with_extension("json.tmp");
         let written = serde_json::to_vec(&stored)
@@ -305,6 +394,56 @@ impl WalletState {
         if let Err(e) = written {
             warn!("Wallet state not saved to {}: {e}", path.display());
         }
+    }
+
+    /// The base the half-out rule counts from: the stored one while it was
+    /// counted from the current `SKIM_STAKE_USDC`, otherwise the stake itself
+    /// (a new stake starts over, and the old base is dropped from the file).
+    pub fn base(&mut self, h: &HalfOut) -> f64 {
+        match &self.base {
+            Some(b) if (b.stake - h.stake).abs() < 1e-9 => b.base,
+            stale => {
+                if stale.is_some() {
+                    info!(
+                        "SKIM_STAKE_USDC changed to {:.2}: half-out base starts over",
+                        h.stake
+                    );
+                    self.base = None;
+                    self.persist();
+                }
+                h.stake
+            }
+        }
+    }
+
+    /// Raise the base to `equity_left`, never lowering it, and save it.
+    fn raise_base(&mut self, h: &HalfOut, equity_left: f64) -> f64 {
+        let old = self.base(h);
+        let new = if equity_left.is_finite() {
+            equity_left.max(old)
+        } else {
+            old
+        };
+        self.base = Some(StoredBase {
+            base: new,
+            stake: h.stake,
+            step: h.step,
+            share_pct: h.share_pct,
+        });
+        self.persist();
+        new
+    }
+
+    /// One line for the log and the startup message while the rule is on.
+    pub fn half_out_line(&mut self, cfg: &WalletConfig) -> Option<String> {
+        let h = cfg.half_out?;
+        let base = self.base(&h);
+        Some(format!(
+            "Half-out on: stake base {base:.2}, next withdrawal when equity reaches {:.2} \
+             ({} % of the gain above the base)",
+            base + h.step,
+            h.share_pct
+        ))
     }
 
     fn add_pending(&mut self, asset: &str, quantity: f64) {
@@ -454,6 +593,14 @@ pub async fn run<W: WalletExchange, E: FuturesExchange>(
         return Moved::Nothing;
     }
 
+    if let Some(h) = &cfg.half_out {
+        if account.equity >= state.base(h) + h.step {
+            return skim(
+                wallet, ex, cfg, state, account, positions, risk, notifier, now_ms,
+            )
+            .await;
+        }
+    }
     if let Some(above) = cfg.skim_above {
         if account.equity > above {
             return skim(
@@ -551,8 +698,17 @@ async fn skim<W: WalletExchange, E: FuturesExchange>(
         }
     }
     let asset = cfg.skim_asset.as_str();
-    // The excess over the keep amount, never more than what is free.
-    let excess = account.available.min(account.equity) - cfg.skim_keep;
+    // The excess over the keep amount, never more than what is free. In
+    // half-out mode: the share of the gain over the base, never more than free.
+    let free = account.available.min(account.equity);
+    let half = cfg.half_out.map(|h| {
+        let base = state.base(&h);
+        (h, base, account.equity - base)
+    });
+    let excess = match half {
+        Some((h, _, earned)) => free.min(earned * h.share_pct / 100.0),
+        None => free - cfg.skim_keep,
+    };
     if !excess.is_finite() || excess <= 0.0 {
         return Moved::Nothing;
     }
@@ -648,7 +804,21 @@ async fn skim<W: WalletExchange, E: FuturesExchange>(
     let left = account.equity + change;
     info!("Skimmed {quantity} {asset} (~{value:.2} USD, {how}) to spot; futures equity about {left:.2}");
     let keep = cfg.skim_keep;
-    let mut msg = if asset == ASSET {
+    let mut msg = if let Some((h, base, earned)) = half {
+        // `left` is what stays after the transfer; it is the new base.
+        let new_base = state.raise_base(&h, left);
+        let what = if asset == ASSET {
+            String::new()
+        } else {
+            format!(" (`{quantity}` {asset})")
+        };
+        format!(
+            "\u{1f4b0} Took out `{value:.2}` {ASSET}{what} ({} % of `{earned:.2}` earned above the \
+             `{base:.2}` stake) to spot; stake is now `{new_base:.2}`, next withdrawal at `{:.2}`",
+            h.share_pct,
+            new_base + h.step
+        )
+    } else if asset == ASSET {
         format!(
             "\u{1f4b0} Moved `{quantity:.2}` {ASSET} above the `{keep}` USD stake to spot; \
              futures equity now about `{left:.2}`"
