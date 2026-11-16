@@ -89,11 +89,16 @@ fn local_flow_time(id: &str) -> Option<u64> {
 /// The day-state file: `risk-state.json` in `STATE_DIR` (default
 /// `/var/lib/tempest`).
 pub fn state_file_from_env() -> PathBuf {
+    state_dir_from_env().join(STATE_FILE)
+}
+
+/// `STATE_DIR`, default `/var/lib/tempest`.
+pub fn state_dir_from_env() -> PathBuf {
     let dir = std::env::var("STATE_DIR")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "/var/lib/tempest".into());
-    PathBuf::from(dir).join(STATE_FILE)
+    PathBuf::from(dir)
 }
 
 /// Today's saved state, or `None` (with a warning unless the file is simply

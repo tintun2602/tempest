@@ -252,12 +252,31 @@ impl FuturesExchange for BinanceFuturesClient {
         parse_transfers(&resp)
     }
 
+    async fn open_order_count(&self) -> Result<usize, String> {
+        // No symbol: weight 40 each, so only asked when a withdrawal is due.
+        let regular = self
+            .signed(reqwest::Method::GET, "/fapi/v1/openOrders", "")
+            .await?;
+        let algo = self
+            .signed(reqwest::Method::GET, "/fapi/v1/openAlgoOrders", "")
+            .await?;
+        Ok(count_orders(&regular)? + count_orders(&algo)?)
+    }
+
     async fn asset_wallet(&self, asset: &str) -> Result<f64, String> {
         let resp = self
             .signed(reqwest::Method::GET, "/fapi/v3/account", "")
             .await?;
         parse_asset_wallet(&resp, asset)
     }
+}
+
+/// Orders in an open-orders answer: a list, or a list under `orders`.
+fn count_orders(resp: &serde_json::Value) -> Result<usize, String> {
+    resp.as_array()
+        .or_else(|| resp["orders"].as_array())
+        .map(Vec::len)
+        .ok_or_else(|| format!("unexpected open orders response: {resp}"))
 }
 
 /// `walletBalance` of `asset` from the account's `assets` array.
@@ -428,6 +447,14 @@ fn parse_transfers(resp: &serde_json::Value) -> Result<Vec<Transfer>, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn open_orders_are_counted_from_a_list_or_an_orders_field() {
+        assert_eq!(count_orders(&json!([{}, {}])).unwrap(), 2);
+        assert_eq!(count_orders(&json!({"orders": [{}]})).unwrap(), 1);
+        assert_eq!(count_orders(&json!([])).unwrap(), 0);
+        assert!(count_orders(&json!({"code": 1})).is_err());
+    }
 
     #[test]
     fn a_collateral_asset_balance_is_read_from_the_account() {

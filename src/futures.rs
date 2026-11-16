@@ -82,6 +82,9 @@ const RATE_LIMIT_ALERT_AFTER: u32 = 4;
 /// again or is flat.
 static TARGET_GAP_REPORTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
+/// Transfers in a non-dollar asset already warned about.
+static WARNED_TRANSFERS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
 const HEDGE_MODE_REFUSAL: &str =
     "the account is in hedge mode; switch USDⓈ-M futures to one-way mode";
 
@@ -190,7 +193,7 @@ pub async fn run(config: &Config) {
                 &config.api_secret,
             ),
             cfg: wallet_cfg,
-            state: wallet::WalletState::default(),
+            state: wallet::WalletState::with_file(wallet::state_file_from_env()),
         }
     });
     let mut rate_limited_cycles = 0u32;
@@ -371,7 +374,6 @@ async fn run_cycle<E: FuturesExchange, W: WalletExchange>(
             &mut w.state,
             account,
             &positions,
-            &config.trading_pairs,
             risk,
             notifier,
             now_ms(),
@@ -1096,10 +1098,16 @@ async fn record_transfers<E: FuturesExchange>(
                     value: t.amount,
                 })
             } else {
-                warn!(
-                    "Transfer of {} {} not counted as a cash flow",
-                    t.amount, t.asset
-                );
+                // Said once per transfer, not once per cycle.
+                let first = WARNED_TRANSFERS
+                    .lock()
+                    .map_or(true, |mut seen| seen.insert(t.id.clone()));
+                if first {
+                    warn!(
+                        "Transfer of {} {} not counted as a cash flow",
+                        t.amount, t.asset
+                    );
+                }
                 None
             }
         })
@@ -1138,6 +1146,8 @@ mod tests {
         hedge: bool,
         /// Collateral held in the futures wallet, as `asset_wallet` reports.
         held: f64,
+        /// Regular open orders on the account, besides the conditional ones.
+        other_orders: usize,
         /// What `account` reports after a transfer, when set.
         account_after: Mutex<Option<FuturesAccount>>,
     }
@@ -1260,6 +1270,9 @@ mod tests {
         }
         async fn transfers(&self, _: u64) -> Result<Vec<Transfer>, String> {
             Ok(Vec::new())
+        }
+        async fn open_order_count(&self) -> Result<usize, String> {
+            Ok(self.triggers.lock().unwrap().len() + self.other_orders)
         }
         async fn asset_wallet(&self, _: &str) -> Result<f64, String> {
             Ok(self.held)
@@ -2256,6 +2269,8 @@ mod tests {
         wallet::WalletConfig::new(None, 0.0, "", Some(50.0), 100.0)
     }
 
+    const NOW: u64 = 1_800_000_000_000;
+
     #[allow(clippy::too_many_arguments)]
     async fn move_money(
         w: &FakeWallet,
@@ -2267,17 +2282,23 @@ mod tests {
         risk: &mut RiskManager,
         notifier: &Notifier,
     ) -> Moved {
+        move_money_at(w, ex, cfg, state, account, positions, risk, notifier, NOW).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn move_money_at(
+        w: &FakeWallet,
+        ex: &Fake,
+        cfg: &wallet::WalletConfig,
+        state: &mut wallet::WalletState,
+        account: FuturesAccount,
+        positions: &[FuturesPosition],
+        risk: &mut RiskManager,
+        notifier: &Notifier,
+        now_ms: u64,
+    ) -> Moved {
         wallet::run(
-            w,
-            ex,
-            cfg,
-            state,
-            account,
-            positions,
-            &["ETHUSDC".to_string()],
-            risk,
-            notifier,
-            1_800_000_000_000,
+            w, ex, cfg, state, account, positions, risk, notifier, now_ms,
         )
         .await
     }
@@ -2904,6 +2925,373 @@ mod tests {
                 "buy ETHUSDC 5.1"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_second_move_waits_out_the_cooldown() {
+        let (w, ex) = bnb_world();
+        let mut risk = RiskManager::with_risk_per_trade(210.58, 0.02);
+        let mut state = wallet::WalletState::default();
+        let cfg = bnb_cfg("", "");
+        let first = move_money(
+            &w,
+            &ex,
+            &cfg,
+            &mut state,
+            acct(210.58, 210.58),
+            &[],
+            &mut risk,
+            &quiet(),
+        )
+        .await;
+        // The balance has not updated yet: it still reads 210.58.
+        let soon = move_money_at(
+            &w,
+            &ex,
+            &cfg,
+            &mut state,
+            acct(210.58, 210.58),
+            &[],
+            &mut risk,
+            &quiet(),
+            NOW + 5 * 60_000,
+        )
+        .await;
+        let later = move_money_at(
+            &w,
+            &ex,
+            &cfg,
+            &mut state,
+            acct(210.58, 210.58),
+            &[],
+            &mut risk,
+            &quiet(),
+            NOW + 61 * 60_000,
+        )
+        .await;
+        assert!(matches!(first, Moved::Skimmed(_)));
+        assert_eq!(soon, Moved::Nothing);
+        assert!(matches!(later, Moved::Skimmed(_)));
+        assert_eq!(w.log().len(), 2, "{:?}", w.log());
+    }
+
+    #[tokio::test]
+    async fn a_broken_reading_never_becomes_a_transfer() {
+        let (w, ex) = bnb_world();
+        let mut risk = RiskManager::with_risk_per_trade(210.58, 0.02);
+        for account in [
+            acct(210.58, f64::NAN),
+            acct(f64::NAN, 210.58),
+            acct(f64::INFINITY, f64::INFINITY),
+            acct(210.58, -1.0),
+        ] {
+            let moved = move_money(
+                &w,
+                &ex,
+                &bnb_cfg("USDC", ""),
+                &mut Default::default(),
+                account,
+                &[],
+                &mut risk,
+                &quiet(),
+            )
+            .await;
+            assert_eq!(moved, Moved::Nothing, "{account:?}");
+        }
+        let top = FakeWallet {
+            spot_usdc: f64::NAN,
+            ..Default::default()
+        };
+        let moved = move_money(
+            &top,
+            &ex,
+            &topup_cfg(),
+            &mut Default::default(),
+            acct(30.0, 30.0),
+            &[],
+            &mut risk,
+            &quiet(),
+        )
+        .await;
+        assert_eq!(moved, Moved::Nothing);
+        for price in [0.0, f64::NAN, -5.0] {
+            let w = FakeWallet {
+                price,
+                ..bnb_world().0
+            };
+            let moved = move_money(
+                &w,
+                &ex,
+                &bnb_cfg("USDC", ""),
+                &mut Default::default(),
+                acct(210.58, 210.58),
+                &[],
+                &mut risk,
+                &quiet(),
+            )
+            .await;
+            assert_eq!(moved, Moved::Nothing, "price {price}");
+        }
+        let no_bnb = Fake {
+            held: f64::NAN,
+            ..Default::default()
+        };
+        let moved = move_money(
+            &bnb_world().0,
+            &no_bnb,
+            &bnb_cfg("USDC", ""),
+            &mut Default::default(),
+            acct(210.58, 210.58),
+            &[],
+            &mut risk,
+            &quiet(),
+        )
+        .await;
+        assert_eq!(moved, Moved::Nothing);
+        assert!(w_log_empty(&w));
+    }
+
+    fn w_log_empty(w: &FakeWallet) -> bool {
+        w.log().is_empty()
+    }
+
+    #[tokio::test]
+    async fn a_lost_reply_is_confirmed_by_the_account_and_counted() {
+        let (mut w, ex) = bnb_world();
+        w.transfer_error = Some("HTTP error: operation timed out".into());
+        // The transfer went through: equity fell by 9.9.
+        *ex.account_after.lock().unwrap() = Some(acct(210.58 - 9.9, 200.0));
+        let mut risk = RiskManager::with_risk_per_trade(210.58, 0.02);
+        let moved = move_money(
+            &w,
+            &ex,
+            &bnb_cfg("USDC", ""),
+            &mut Default::default(),
+            acct(210.58, 210.58),
+            &[],
+            &mut risk,
+            &quiet(),
+        )
+        .await;
+        assert!(matches!(moved, Moved::Skimmed(_)), "{moved:?}");
+        assert!((risk.net_cash_flow() + 9.9).abs() < 1e-9);
+        assert_eq!(w.log(), ["sell BNBUSDC 0.017"], "and the sale goes on");
+    }
+
+    #[tokio::test]
+    async fn a_lost_reply_with_no_fall_in_equity_is_a_failure() {
+        let (mut w, ex) = bnb_world();
+        w.transfer_error = Some("HTTP error: operation timed out".into());
+        let mut risk = RiskManager::with_risk_per_trade(210.58, 0.02);
+        let notifier = quiet();
+        let moved = move_money(
+            &w,
+            &ex,
+            &bnb_cfg("USDC", ""),
+            &mut Default::default(),
+            acct(210.58, 210.58),
+            &[],
+            &mut risk,
+            &notifier,
+        )
+        .await;
+        // The fake account still reads 100, not near 210.58 - 10: no match.
+        assert_eq!(moved, Moved::Nothing);
+        assert_eq!(risk.net_cash_flow(), 0.0);
+        assert_eq!(notifier.sent().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lost_top_up_reply_is_confirmed_by_the_account_too() {
+        let (mut w, ex) = (
+            FakeWallet {
+                spot_usdc: 500.0,
+                ..Default::default()
+            },
+            Fake::default(),
+        );
+        w.transfer_error = Some("JSON parse error: eof".into());
+        // 30 -> topped up 70: the account now reads 100.
+        let mut risk = RiskManager::with_risk_per_trade(30.0, 0.02);
+        let moved = move_money(
+            &w,
+            &ex,
+            &topup_cfg(),
+            &mut Default::default(),
+            acct(30.0, 30.0),
+            &[],
+            &mut risk,
+            &quiet(),
+        )
+        .await;
+        assert_eq!(moved, Moved::ToppedUp(70.0));
+        assert_eq!(risk.net_cash_flow(), 70.0);
+    }
+
+    fn temp_state(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tempest-wallet-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("wallet-state.json")
+    }
+
+    #[tokio::test]
+    async fn unsold_collateral_is_remembered_across_a_restart_and_sold_later() {
+        let path = temp_state("pending");
+        let (mut w, ex) = bnb_world();
+        w.sell_error = Some("Binance API error -1000: boom".into());
+        let mut risk = RiskManager::with_risk_per_trade(210.58, 0.02);
+        let notifier = quiet();
+        let mut state = wallet::WalletState::with_file(path.clone());
+        let cfg = bnb_cfg("USDC", "");
+        let moved = move_money(
+            &w,
+            &ex,
+            &cfg,
+            &mut state,
+            acct(210.58, 210.58),
+            &[],
+            &mut risk,
+            &notifier,
+        )
+        .await;
+        assert!(matches!(moved, Moved::Skimmed(_)));
+        assert_eq!(
+            w.log(),
+            ["transfer UMFUTURE_MAIN BNB 0.01728"],
+            "the sale failed"
+        );
+
+        // Restart: a new state reads the file. The sale now works.
+        let (w2, ex2) = bnb_world();
+        let mut state = wallet::WalletState::with_file(path.clone());
+        let moved = move_money(
+            &w2,
+            &ex2,
+            &cfg,
+            &mut state,
+            acct(200.2, 200.2),
+            &[],
+            &mut risk,
+            &notifier,
+        )
+        .await;
+        assert_eq!(moved, Moved::Nothing, "nothing new to move");
+        // Only what the bot moved: 0.01728 rounded to the spot step.
+        assert_eq!(w2.log(), ["sell BNBUSDC 0.017"]);
+        assert!(
+            notifier
+                .sent()
+                .iter()
+                .any(|m| m.contains("Earlier unsold BNB sold")),
+            "{:?}",
+            notifier.sent()
+        );
+
+        // Sold: it stays sold after another restart.
+        let (w3, ex3) = bnb_world();
+        let mut state = wallet::WalletState::with_file(path);
+        move_money(
+            &w3,
+            &ex3,
+            &cfg,
+            &mut state,
+            acct(200.2, 200.2),
+            &[],
+            &mut risk,
+            &notifier,
+        )
+        .await;
+        assert!(w3.log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn something_that_stands_unsold_is_told_once() {
+        let (mut w, ex) = bnb_world();
+        w.min_notional = 50.0; // the sale is under the minimum order
+        let mut risk = RiskManager::with_risk_per_trade(210.58, 0.02);
+        let notifier = quiet();
+        let mut state = wallet::WalletState::default();
+        let cfg = bnb_cfg("USDC", "");
+        move_money(
+            &w,
+            &ex,
+            &cfg,
+            &mut state,
+            acct(210.58, 210.58),
+            &[],
+            &mut risk,
+            &notifier,
+        )
+        .await;
+        let after_skim = notifier.sent().len();
+        for hours in [2, 4, 6] {
+            move_money_at(
+                &w,
+                &ex,
+                &cfg,
+                &mut state,
+                acct(200.2, 200.2),
+                &[],
+                &mut risk,
+                &notifier,
+                NOW + hours * 3_600_000,
+            )
+            .await;
+        }
+        assert_eq!(
+            notifier.sent().len(),
+            after_skim,
+            "no new message: it was already told"
+        );
+        assert_eq!(w.log(), ["transfer UMFUTURE_MAIN BNB 0.01728"]);
+    }
+
+    #[tokio::test]
+    async fn a_manual_order_on_another_pair_blocks_the_withdrawal() {
+        let (w, mut ex) = bnb_world();
+        ex.other_orders = 1;
+        let mut risk = RiskManager::with_risk_per_trade(210.58, 0.02);
+        let moved = move_money(
+            &w,
+            &ex,
+            &bnb_cfg("USDC", ""),
+            &mut Default::default(),
+            acct(210.58, 210.58),
+            &[],
+            &mut risk,
+            &quiet(),
+        )
+        .await;
+        assert_eq!(moved, Moved::Nothing);
+        assert!(w.log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_message_says_what_happened() {
+        let (w, ex) = bnb_world();
+        let mut risk = RiskManager::with_risk_per_trade(210.58, 0.02);
+        let notifier = quiet();
+        move_money(
+            &w,
+            &ex,
+            &bnb_cfg("USDC", ""),
+            &mut Default::default(),
+            acct(210.58, 210.58),
+            &[],
+            &mut risk,
+            &notifier,
+        )
+        .await;
+        let msg = notifier.sent().join("\n");
+        assert!(
+            msg.contains(
+                "Moved `0.01728` BNB (about `10.4` USD) above the `200` USD stake to spot"
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("sold `0.017` for about `10.20` USDC"), "{msg}");
+        assert!(!msg.to_lowercase().contains("profit"), "{msg}");
     }
 
     #[test]

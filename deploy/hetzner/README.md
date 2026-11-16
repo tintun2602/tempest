@@ -161,8 +161,35 @@ ETH, BNB and USDC can leave the futures wallet. So with BNB as collateral the
 bot takes the excess out as BNB, not as the BNFCR profit: the profit stays as
 BNFCR margin and equity falls back towards `SKIM_KEEP_USDC`. Example for a
 200 stake: `SKIM_ABOVE_USDC=205 SKIM_KEEP_USDC=200 SKIM_ASSET=BNB SKIM_TO=USDC`.
-If the excess is larger than the BNB held, only the BNB leaves. Try it with a
-small amount first (see the PR for the plan).
+If the excess is larger than the BNB held, only the BNB leaves.
+
+What this means in practice:
+- BNB is sold every time the value of collateral plus BNFCR goes above the
+  limit, also when the only reason is that the BNB price rose. The bot never
+  buys BNB back, so over time the BNB collateral shrinks and BNFCR margin takes
+  its place.
+- A move needs a flat account: no open position and no open order of any kind
+  anywhere on the account (checked with `/fapi/v1/openOrders` and
+  `/fapi/v1/openAlgoOrders` without a symbol, weight 40 each, only asked when a
+  withdrawal is due), so a manual limit order on another pair blocks it too.
+- After a move the bot waits an hour before the next, so a late balance update
+  cannot cause a second transfer.
+- Broken readings (NaN, zero or negative price or equity) never turn into a
+  transfer.
+- If a transfer's answer is lost (timeout), the bot reads the account again; if
+  equity fell by about the amount it counts the transfer as done, otherwise as
+  failed. A transfer that lands late after that is not recorded as a cash flow
+  (it shows as a loss for the day against `DAILY_DRAWDOWN_PCT`).
+- Collateral moved to spot and not yet sold (a failed or too-small sale, or a
+  restart) is kept in `wallet-state.json` next to `risk-state.json`. It is sold
+  on a later cycle (retried at most hourly), never more than the bot itself
+  moved, and the owner is told once that something stands unsold. A sale rounds
+  down to the spot step; the dust is not sold.
+- Transfers in BNB are not counted from Binance's transfer history (only
+  dollar assets are); the bot's own record of the move is used, with the
+  warning logged once per transfer.
+
+Try it with a small amount first (see the PR for the plan).
 
 ## Day to day
 

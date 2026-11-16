@@ -565,6 +565,10 @@ pub trait FuturesExchange {
         since_ms: u64,
     ) -> impl Future<Output = Result<Vec<Transfer>, String>> + Send;
 
+    /// How many orders of any kind (regular and conditional) rest on the whole
+    /// account, whatever the symbol.
+    fn open_order_count(&self) -> impl Future<Output = Result<usize, String>> + Send;
+
     /// Wallet balance of one margin asset (in units of that asset) in the
     /// futures wallet; zero when the account holds none. On an account that
     /// posts BNB as collateral, this is how much BNB can leave.
