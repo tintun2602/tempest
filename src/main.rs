@@ -12,6 +12,7 @@ mod notify;
 mod risk;
 mod strategies;
 mod strategy;
+mod wallet;
 
 use config::Config;
 use exchange::binance::BinanceClient;

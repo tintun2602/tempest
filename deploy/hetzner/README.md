@@ -126,6 +126,32 @@ Add the printed line on GitHub: diablo → Settings → Deploy keys → Add depl
 key, tick **Allow write access**. Then `/opt/tempest/deploy/hetzner/status/report.sh`
 (or wait for the hour). Log: `/var/log/tempest/status.log`.
 
+## Profit withdrawal and top-up (off until set)
+
+The bot can move USDC between the futures and spot wallets itself. Both are
+off until the numbers are set in `/etc/tempest/bot.env` (or `settings.env`),
+and both need two extra permissions on the Binance API key: **Enable Spot &
+Margin Trading** and **Permit Universal Transfer** (withdrawals stay off; the
+key stays IP-restricted to this server).
+
+| Setting | Meaning |
+|---|---|
+| `SKIM_ABOVE_USDC` | Skim when futures equity is above this, and no position or resting order exists. |
+| `SKIM_KEEP_USDC` | What stays in futures after a skim (default 0). The bot moves `available - keep`, in whole cents, at least 5 USDC, never more than available. |
+| `SKIM_BUY` | Optional, e.g. `BNB:50,ETH:50`: percent of the skimmed amount spent on `<COIN>USDC` spot market buys (`quoteOrderQty`). Empty keeps USDC. A share under the symbol's minimum order, or a refused buy, stays as USDC; the withdrawal is not undone. |
+| `TOPUP_BELOW_USDC` | Top up when futures equity is below this. |
+| `TOPUP_TO_USDC` | Fill up to this equity from USDC already in spot. Never sells coins. |
+| `SPOT_BASE_URL` | Spot and `/sapi` host, default `https://api.binance.com`. |
+
+Contradicting settings (keep not below the threshold, top-up target not above
+its threshold, a top-up that lands above the skim line) switch the feature off
+with a warning in the log. Transfers are recorded in `risk-state.json` as cash
+flows, so they never count as day profit or loss against `DAILY_DRAWDOWN_PCT`.
+A cycle that moves money ends there; entries resume next cycle. A key without
+the permission gives one Telegram message and the feature is off until the next
+UTC day; other failures retry after an hour. Moves are logged and sent to
+Telegram with amounts and the new balance.
+
 ## Day to day
 
 | Task | Command |

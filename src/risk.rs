@@ -72,6 +72,20 @@ struct DayState {
 
 const STATE_FILE: &str = "risk-state.json";
 
+/// Ids of transfers the bot recorded itself start with this, then the time.
+const LOCAL_PREFIX: &str = "local:";
+/// A venue record this much before the bot's own may still be that transfer
+/// (clock skew between the two).
+const LOCAL_MATCH_WINDOW_MS: u64 = 60_000;
+
+fn local_flow_time(id: &str) -> Option<u64> {
+    id.strip_prefix(LOCAL_PREFIX)?
+        .split(':')
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// The day-state file: `risk-state.json` in `STATE_DIR` (default
 /// `/var/lib/tempest`).
 pub fn state_file_from_env() -> PathBuf {
@@ -250,9 +264,36 @@ impl RiskManager {
             let value = previous.get(&flow.id).copied().unwrap_or(flow.value);
             self.cash_flows.insert(flow.id.clone(), value);
         }
+        // A transfer the bot made itself stays until the venue reports it
+        // (the history can lag), then the venue's record replaces it.
+        for (id, value) in &previous {
+            let Some(at) = local_flow_time(id) else {
+                continue;
+            };
+            let reported = flows.iter().any(|f| {
+                f.time_ms + LOCAL_MATCH_WINDOW_MS >= at
+                    && f.value.signum() == value.signum()
+                    && (f.value - value).abs() <= (value.abs() * 0.01).max(0.01)
+            });
+            if !reported {
+                self.cash_flows.insert(id.clone(), *value);
+            }
+        }
         if self.cash_flows != previous {
             self.persist();
         }
+    }
+
+    /// Record a transfer the bot has just made itself (`value` positive into
+    /// the account, negative out), so that day's P&L and drawdown do not
+    /// count it as a gain or a loss before the venue's history shows it.
+    pub fn record_own_transfer(&mut self, value: f64, time_ms: u64) {
+        if !value.is_finite() || value == 0.0 {
+            return;
+        }
+        let id = format!("{LOCAL_PREFIX}{time_ms}:{}", self.cash_flows.len());
+        self.cash_flows.insert(id, value);
+        self.persist();
     }
 
     /// Net deposits minus withdrawals since the day opened.
@@ -657,6 +698,62 @@ mod tests {
         rm.set_cash_flows(&[flow("w", &rm, -5_000.0)]);
         // 300 lost on the remaining 5,000 is 6%.
         assert!(rm.check_drawdown(4_700.0));
+    }
+
+    #[test]
+    fn a_transfer_the_bot_made_is_not_a_loss_before_the_venue_reports_it() {
+        let mut rm = RiskManager::new(1_000.0);
+        rm.record_own_transfer(-400.0, rm.day_open_at_ms() + 5);
+        assert_eq!(rm.day_baseline(), 600.0);
+        assert!(!rm.check_drawdown(600.0));
+        // The venue's history has nothing yet: the bot's own record stays.
+        rm.set_cash_flows(&[]);
+        assert_eq!(rm.day_baseline(), 600.0);
+        assert_eq!(rm.day_pnl(600.0), 0.0);
+    }
+
+    #[test]
+    fn a_top_up_is_not_a_gain() {
+        let mut rm = RiskManager::new(100.0);
+        rm.record_own_transfer(50.0, rm.day_open_at_ms() + 5);
+        assert_eq!(rm.day_pnl(150.0), 0.0);
+    }
+
+    #[test]
+    fn the_venues_record_replaces_the_bots_own_and_counts_once() {
+        let mut rm = RiskManager::new(1_000.0);
+        let at = rm.day_open_at_ms() + 5;
+        rm.record_own_transfer(-400.0, at);
+        let reported = CashFlow {
+            id: "futures-transfer:9".into(),
+            time_ms: at + 1_000,
+            value: -400.0,
+        };
+        rm.set_cash_flows(std::slice::from_ref(&reported));
+        assert_eq!(rm.net_cash_flow(), -400.0);
+        // Seen again on every later poll, still once.
+        rm.set_cash_flows(std::slice::from_ref(&reported));
+        assert_eq!(rm.net_cash_flow(), -400.0);
+        // A second transfer of the same size is a second transfer.
+        rm.record_own_transfer(-400.0, at + 600_000);
+        rm.set_cash_flows(std::slice::from_ref(&reported));
+        assert_eq!(rm.net_cash_flow(), -800.0);
+    }
+
+    #[test]
+    fn a_trading_loss_is_still_a_loss_after_the_bot_moved_money() {
+        let mut rm = RiskManager::new(1_000.0).with_limits(2, 0.5);
+        rm.record_own_transfer(-400.0, rm.day_open_at_ms() + 5);
+        // 600 baseline, equity 250: a 58 % loss.
+        assert!(rm.check_drawdown(250.0));
+    }
+
+    #[test]
+    fn the_bots_own_transfers_survive_a_restart() {
+        let path = state_file("own-transfer");
+        let mut rm = started(1_000.0, &path);
+        rm.record_own_transfer(-400.0, rm.day_open_at_ms() + 5);
+        assert_eq!(started(1_000.0, &path).day_baseline(), 600.0);
     }
 
     #[test]

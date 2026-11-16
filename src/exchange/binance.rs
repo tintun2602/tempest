@@ -567,7 +567,7 @@ fn parse_utc_datetime_ms(text: &str) -> Option<u64> {
 /// `requested_quantity` is the fallback when the venue omits `executedQty`.
 /// `average_price` is `0.0` when no fill information is recoverable; callers
 /// decide what to substitute rather than being handed a fabricated price.
-fn parse_order_outcome(
+pub(super) fn parse_order_outcome(
     resp: &serde_json::Value,
     symbol: &str,
     side: Side,
@@ -617,7 +617,10 @@ fn parse_order_outcome(
 }
 
 /// Pull the lot/price/notional rules out of an `exchangeInfo` response.
-fn parse_symbol_filters(resp: &serde_json::Value, symbol: &str) -> Result<SymbolFilters, String> {
+pub(super) fn parse_symbol_filters(
+    resp: &serde_json::Value,
+    symbol: &str,
+) -> Result<SymbolFilters, String> {
     let entry = resp["symbols"]
         .as_array()
         .and_then(|symbols| {
