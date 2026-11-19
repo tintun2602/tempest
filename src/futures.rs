@@ -522,7 +522,7 @@ async fn manage_symbol<E: FuturesExchange>(
                 atr,
                 params.trailing_stop_atr,
             );
-            move_stop(
+            let moved = move_stop(
                 ex,
                 &filters,
                 pos,
@@ -532,7 +532,16 @@ async fn manage_symbol<E: FuturesExchange>(
                 notifier,
                 &RETRY_DELAYS,
             )
-            .await?;
+            .await;
+            // A position left without a stop, or a rate limit, ends the
+            // cycle as before; any other refusal is logged and the signal
+            // exit below still runs.
+            if let Err(e) = moved {
+                if e.contains(NO_STOP) || is_rate_limited(&e) {
+                    return Err(e);
+                }
+                warn!("{symbol}: trailing stop not moved: {e}");
+            }
         }
         let (Some(snap), Ok((_, signal))) = (snap.as_ref(), candles.as_ref()) else {
             return Ok(Traded::Nothing);
@@ -1136,8 +1145,9 @@ async fn move_stop<E: FuturesExchange>(
         .into_iter()
         .filter(|o| o.kind == Some(TriggerKind::Stop) && o.side == close_side)
         .collect();
-    if stops.is_empty() {
-        // `ensure_stop` places one first; never add a second here.
+    // Normally `ensure_stop` has placed one first. A trail never adds a
+    // stop of its own; break-even places one at the entry, as it always has.
+    if stops.is_empty() && what == StopMove::Trail {
         return Ok(());
     }
     let tight_enough = |p: f64| {
@@ -1166,7 +1176,11 @@ async fn move_stop<E: FuturesExchange>(
     })
     .await;
     if let Err(e) = placed {
-        let old = stops.first().expect("not empty");
+        let Some(old) = stops.first() else {
+            return Err(format!(
+                "{NO_STOP}: {label} stop not placed: {e}; there was no old stop"
+            ));
+        };
         let restored = with_retries(retry, &format!("{} old stop", pos.symbol), || {
             ex.place_trigger(
                 &pos.symbol,
@@ -1887,6 +1901,19 @@ mod tests {
         .await
         .unwrap();
         assert!(ex.log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn break_even_still_places_a_stop_when_there_is_none() {
+        let ex = Fake::default();
+        let short = FuturesPosition {
+            mark_price: 1_900.0,
+            ..position(-0.02)
+        };
+        move_stop_to_entry(&ex, &eth("ETHUSDC"), &short, &quiet(), &NO_WAIT)
+            .await
+            .unwrap();
+        assert_eq!(ex.log(), vec!["trigger Stop BUY 2000"]);
     }
 
     #[tokio::test]
