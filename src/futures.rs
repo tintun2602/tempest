@@ -12,8 +12,10 @@
 //! gets one at once; one found with its stop but no target gets the 2R target
 //! back, as long as the stop still shows the original risk.
 //!
-//! Not supported here, by design for a first version: the trailing stop,
-//! hedge mode (the bot refuses to start), and more than one position per pair.
+//! With `TRAILING_STOP_ATR` set, entries get no target: the stop trails the
+//! mark price at that many ATR (the strategy's trend ATR) and only ever
+//! tightens, as in the lab. Not supported: hedge mode (the bot refuses to
+//! start) and more than one position per pair.
 
 use crate::config::Config;
 use crate::exchange::binance_futures::{BinanceFuturesClient, PRODUCTION_URL};
@@ -133,7 +135,10 @@ pub async fn run(config: &Config) {
         config.signal_interval
     );
     if params.trailing_stop_atr > 0.0 {
-        warn!("TRAILING_STOP_ATR is ignored on futures: entries use a fixed 2R target");
+        info!(
+            "Trailing stop {} x ATR; new entries get no fixed target",
+            params.trailing_stop_atr
+        );
     }
 
     let poll = Duration::from_secs(config.poll_interval_secs);
@@ -492,8 +497,12 @@ async fn manage_symbol<E: FuturesExchange>(
         )
         .await?;
         // Before the break-even rule: once that has moved the stop, the
-        // original risk can no longer be read from it.
-        ensure_target(ex, &filters, pos, notifier).await?;
+        // original risk can no longer be read from it. A trailing stop takes
+        // the target's place, so none is put back then.
+        let trailing = params.trailing_stop_atr > 0.0;
+        if !trailing {
+            ensure_target(ex, &filters, pos, notifier).await?;
+        }
         if params.breakeven_reached(
             pos.is_short(),
             pos.entry_price,
@@ -501,6 +510,29 @@ async fn manage_symbol<E: FuturesExchange>(
             f64::from(leverage),
         ) {
             move_stop_to_entry(ex, &filters, pos, notifier, &RETRY_DELAYS).await?;
+        }
+        let atr = snap
+            .as_ref()
+            .map(|s| s.atr_14)
+            .filter(|a| a.is_finite() && *a > 0.0);
+        if let (true, Some(atr)) = (trailing, atr) {
+            let level = trailing_level(
+                pos.is_short(),
+                pos.mark_price,
+                atr,
+                params.trailing_stop_atr,
+            );
+            move_stop(
+                ex,
+                &filters,
+                pos,
+                level,
+                TRAIL_MIN_STEP_ATR * atr,
+                StopMove::Trail,
+                notifier,
+                &RETRY_DELAYS,
+            )
+            .await?;
         }
         let (Some(snap), Ok((_, signal))) = (snap.as_ref(), candles.as_ref()) else {
             return Ok(Traded::Nothing);
@@ -555,7 +587,18 @@ async fn manage_symbol<E: FuturesExchange>(
             return Ok(Traded::Nothing);
         }
     };
-    open_position(ex, &filters, short, plan, stop, notifier, &RETRY_DELAYS).await?;
+    let with_target = params.trailing_stop_atr <= 0.0;
+    open_position(
+        ex,
+        &filters,
+        short,
+        plan,
+        stop,
+        with_target,
+        notifier,
+        &RETRY_DELAYS,
+    )
+    .await?;
     Ok(Traded::Opened)
 }
 
@@ -692,12 +735,14 @@ fn liquidation_price(entry: f64, quantity: f64, equity: f64, short: bool) -> Opt
 
 /// Open, then protect. A position that cannot get a stop is closed again at
 /// once: an unprotected leveraged position is the one outcome not allowed.
+#[allow(clippy::too_many_arguments)]
 async fn open_position<E: FuturesExchange>(
     ex: &E,
     filters: &SymbolFilters,
     short: bool,
     plan: EntryPlan,
     stop: f64,
+    with_target: bool,
     notifier: &Notifier,
     retry: &[Duration],
 ) -> Result<(), String> {
@@ -758,6 +803,16 @@ async fn open_position<E: FuturesExchange>(
         price + REWARD_RISK * risk
     };
     let target_price = round_away(filters, target, !short);
+    if !with_target {
+        let msg = format!(
+            "{} *{symbol}* {label} `{}` @ `{price:.2}`\nStop `{stop_price}` \u{b7} Trailing stop, no fixed target",
+            if short { "\u{1f53b}" } else { "\u{1f53a}" },
+            fill.filled_quantity
+        );
+        info!("{msg}");
+        notifier.send(&msg).await;
+        return Ok(());
+    }
     if let Err(e) = ex
         .place_trigger(symbol, close_side, TriggerKind::TakeProfit, target_price)
         .await
@@ -1011,44 +1066,107 @@ async fn move_stop_to_entry<E: FuturesExchange>(
     notifier: &Notifier,
     retry: &[Duration],
 ) -> Result<(), String> {
+    move_stop(
+        ex,
+        filters,
+        pos,
+        pos.entry_price,
+        0.0,
+        StopMove::BreakEven,
+        notifier,
+        retry,
+    )
+    .await
+}
+
+/// Trailing stop moves smaller than this many ATR wait for a bigger one, so
+/// the stop is not replaced every cycle for a tick.
+const TRAIL_MIN_STEP_ATR: f64 = 0.1;
+
+/// Where a trailing stop `k` ATR behind `mark` sits.
+fn trailing_level(short: bool, mark: f64, atr: f64, k: f64) -> f64 {
+    if short {
+        mark + k * atr
+    } else {
+        mark - k * atr
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StopMove {
+    BreakEven,
+    Trail,
+}
+
+/// Tighten the stop to `level` when every stop on the closing side is
+/// looser than it by more than `min_step`; a stop never loosens. Binance
+/// allows one close-position stop per side (-4130 otherwise), so the old one
+/// goes first; if the new one is then refused, the old level is put back
+/// before the error is reported.
+#[allow(clippy::too_many_arguments)]
+async fn move_stop<E: FuturesExchange>(
+    ex: &E,
+    filters: &SymbolFilters,
+    pos: &FuturesPosition,
+    level: f64,
+    min_step: f64,
+    what: StopMove,
+    notifier: &Notifier,
+    retry: &[Duration],
+) -> Result<(), String> {
     let short = pos.is_short();
     let close_side = if short { Side::Buy } else { Side::Sell };
+    if !(level.is_finite() && level > 0.0) {
+        return Ok(());
+    }
+    // A trailing level on the wrong side of the mark would fire at once.
+    if what == StopMove::Trail
+        && (pos.mark_price <= 0.0
+            || if short {
+                level <= pos.mark_price
+            } else {
+                level >= pos.mark_price
+            })
+    {
+        return Ok(());
+    }
     let stops: Vec<TriggerOrder> = ex
         .trigger_orders(&pos.symbol)
         .await?
         .into_iter()
         .filter(|o| o.kind == Some(TriggerKind::Stop) && o.side == close_side)
         .collect();
-    let locked = |p: f64| {
+    if stops.is_empty() {
+        // `ensure_stop` places one first; never add a second here.
+        return Ok(());
+    }
+    let tight_enough = |p: f64| {
         if short {
-            p <= pos.entry_price
+            p <= level + min_step
         } else {
-            p >= pos.entry_price
+            p >= level - min_step
         }
     };
-    if stops.iter().any(|o| locked(o.trigger_price)) {
+    if stops.iter().any(|o| tight_enough(o.trigger_price)) {
         return Ok(());
     }
     // Rounded toward profit: down for a short, up for a long.
-    let stop = round_away(filters, pos.entry_price, !short);
-    // Binance allows one close-position stop per side (-4130 otherwise), so
-    // the old one goes first. If the new one is then refused, the old level
-    // is put back before the error is reported.
+    let stop = round_away(filters, level, !short);
+    let label = match what {
+        StopMove::BreakEven => "break-even",
+        StopMove::Trail => "trailing",
+    };
     for old in &stops {
         ex.cancel_trigger(&pos.symbol, old.id)
             .await
-            .map_err(|e| format!("break-even: old stop {} not cancelled: {e}", old.id))?;
+            .map_err(|e| format!("{label}: old stop {} not cancelled: {e}", old.id))?;
     }
-    let placed = with_retries(retry, &format!("{} break-even stop", pos.symbol), || {
+    let placed = with_retries(retry, &format!("{} {label} stop", pos.symbol), || {
         ex.place_trigger(&pos.symbol, close_side, TriggerKind::Stop, stop)
     })
     .await;
     if let Err(e) = placed {
-        let Some(old) = stops.first() else {
-            return Err(format!(
-                "{NO_STOP}: break-even stop not placed: {e}; there was no old stop"
-            ));
-        };
+        let old = stops.first().expect("not empty");
         let restored = with_retries(retry, &format!("{} old stop", pos.symbol), || {
             ex.place_trigger(
                 &pos.symbol,
@@ -1060,21 +1178,30 @@ async fn move_stop_to_entry<E: FuturesExchange>(
         .await;
         return Err(match restored {
             Ok(_) => format!(
-                "break-even stop not placed: {e}; old stop {} restored",
+                "{label} stop not placed: {e}; old stop {} restored",
                 old.trigger_price
             ),
             Err(r) => format!(
-                "{NO_STOP}: break-even stop not placed: {e}; old stop {} NOT RESTORED: {r}",
+                "{NO_STOP}: {label} stop not placed: {e}; old stop {} NOT RESTORED: {r}",
                 old.trigger_price
             ),
         });
     }
-    let msg = format!(
-        "\u{1f512} *{}* stop moved to entry `{stop}` (mark `{:.2}`)",
-        pos.symbol, pos.mark_price
-    );
-    info!("{msg}");
-    notifier.send(&msg).await;
+    match what {
+        StopMove::BreakEven => {
+            let msg = format!(
+                "\u{1f512} *{}* stop moved to entry `{stop}` (mark `{:.2}`)",
+                pos.symbol, pos.mark_price
+            );
+            info!("{msg}");
+            notifier.send(&msg).await;
+        }
+        // Every few cycles while a trade runs: the log, not Telegram.
+        StopMove::Trail => info!(
+            "{}: trailing stop moved to {stop} (mark {:.2})",
+            pos.symbol, pos.mark_price
+        ),
+    }
     Ok(())
 }
 
@@ -1423,6 +1550,7 @@ mod tests {
             false,
             plan,
             1_960.0,
+            true,
             &quiet(),
             &NO_WAIT,
         )
@@ -1451,6 +1579,7 @@ mod tests {
             true,
             plan,
             2_040.0,
+            true,
             &quiet(),
             &NO_WAIT,
         )
@@ -1480,6 +1609,7 @@ mod tests {
             false,
             plan,
             1_960.0,
+            true,
             &quiet(),
             &NO_WAIT,
         )
@@ -1513,6 +1643,7 @@ mod tests {
             false,
             plan,
             1_960.0,
+            true,
             &quiet(),
             &NO_WAIT,
         )
@@ -1589,6 +1720,7 @@ mod tests {
             false,
             plan,
             1_960.0,
+            true,
             &quiet(),
             &NO_WAIT,
         )
@@ -1648,6 +1780,135 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ex.log(), vec!["trigger Stop BUY 2060"]);
+    }
+
+    fn stop_at(id: u64, price: f64) -> TriggerOrder {
+        TriggerOrder {
+            id,
+            kind: Some(TriggerKind::Stop),
+            side: Side::Buy,
+            trigger_price: price,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_trailing_stop_follows_a_falling_short_down() {
+        let ex = Fake::default();
+        ex.triggers.lock().unwrap().push(stop_at(7, 2_100.0));
+        let short = FuturesPosition {
+            mark_price: 1_900.0,
+            ..position(-0.02)
+        };
+        // 3 x 20 ATR behind a 1 900 mark: 1 960.
+        let level = trailing_level(true, short.mark_price, 20.0, 3.0);
+        assert_eq!(level, 1_960.0);
+        move_stop(
+            &ex,
+            &eth("ETHUSDC"),
+            &short,
+            level,
+            2.0,
+            StopMove::Trail,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ex.log(), vec!["cancel 7", "trigger Stop BUY 1960"]);
+    }
+
+    #[tokio::test]
+    async fn the_trailing_stop_never_loosens_and_skips_tiny_steps() {
+        let short = FuturesPosition {
+            mark_price: 1_900.0,
+            ..position(-0.02)
+        };
+        let f = eth("ETHUSDC");
+        // Already tighter than the trailing level: left alone.
+        let ex = Fake::default();
+        ex.triggers.lock().unwrap().push(stop_at(7, 1_950.0));
+        move_stop(
+            &ex,
+            &f,
+            &short,
+            1_960.0,
+            2.0,
+            StopMove::Trail,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
+        assert!(ex.log().is_empty());
+        // Looser by less than the minimum step: waits.
+        let ex = Fake::default();
+        ex.triggers.lock().unwrap().push(stop_at(7, 1_961.0));
+        move_stop(
+            &ex,
+            &f,
+            &short,
+            1_960.0,
+            2.0,
+            StopMove::Trail,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
+        assert!(ex.log().is_empty());
+        // A level on the wrong side of the mark would fire at once: refused.
+        let ex = Fake::default();
+        ex.triggers.lock().unwrap().push(stop_at(7, 2_100.0));
+        move_stop(
+            &ex,
+            &f,
+            &short,
+            1_890.0,
+            2.0,
+            StopMove::Trail,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
+        assert!(ex.log().is_empty());
+        // No stop at all: ensure_stop's job, never a second one here.
+        let ex = Fake::default();
+        move_stop(
+            &ex,
+            &f,
+            &short,
+            1_960.0,
+            2.0,
+            StopMove::Trail,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
+        assert!(ex.log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_a_trailing_stop_an_entry_gets_no_target() {
+        let ex = Fake {
+            fill_price: 2_000.0,
+            ..Default::default()
+        };
+        let plan = EntryPlan { quantity: 0.025 };
+        open_position(
+            &ex,
+            &eth("ETHUSDC"),
+            true,
+            plan,
+            2_040.0,
+            false,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ex.log(), vec!["market SELL 0.025", "trigger Stop BUY 2040"]);
     }
 
     #[tokio::test]
@@ -1892,6 +2153,7 @@ mod tests {
             false,
             EntryPlan { quantity: 0.025 },
             1_960.0,
+            true,
             &quiet(),
             &NO_WAIT,
         )
