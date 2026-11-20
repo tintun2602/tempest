@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Push a status report to the private repo tintun2602/diablo: bot state, the
+# Push a status report to a private status repo (default tintun2602/diablo;
+# a fork sets STATUS_REPO and STATUS_EMAIL in /etc/tempest/bot.env): bot state, the
 # deployed commit, trades and errors from the bot's log, the non-secret
 # settings, the latest nightly lab report. Run hourly by cron and after every deploy (both from apply.sh).
 # Does nothing until the deploy key /root/.ssh/diablo_deploy exists.
@@ -8,10 +9,14 @@ key=/root/.ssh/diablo_deploy
 [[ -f "$key" ]] || exit 0
 work=/var/lib/tempest/diablo
 export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-git_id=(-c user.name="tempest-server" -c user.email="tintunn26@gmail.com")
+# STATUS_REPO / STATUS_EMAIL from bot.env, read without sourcing the file.
+conf() { grep -E "^$1=" /etc/tempest/bot.env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'"; }
+repo=$(conf STATUS_REPO); repo=${repo:-git@github.com:tintun2602/diablo.git}
+email=$(conf STATUS_EMAIL); email=${email:-tintunn26@gmail.com}
+git_id=(-c user.name="tempest-server" -c user.email="$email")
 
 if [[ ! -d "$work/.git" ]]; then
-  git clone --quiet git@github.com:tintun2602/diablo.git "$work" || exit 1
+  git clone --quiet "$repo" "$work" || exit 1
 fi
 cd "$work"
 git fetch --quiet origin main && git reset --quiet --hard origin/main

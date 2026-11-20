@@ -18,6 +18,31 @@ What is where on the server:
 Every push to master goes live within about 5 minutes (plus the build, a few
 minutes). A failed build leaves the running bot untouched and is retried.
 
+## Run your own copy (fork)
+
+This repo runs one person's account. To trade your own, run your own copy;
+never push to this repo: every push to its master goes live on its owner's
+server.
+
+1. **Fork** this repo on GitHub and work only in your fork. Check
+   `deploy/hetzner/settings.env` there: it holds the original owner's pairs
+   and risk settings and wins over `bot.env`, so set your own.
+2. **Server:** create one as in step 1 below, then run the setup from your
+   fork, pointed at your fork (otherwise the server follows the original):
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/<you>/tempest/master/deploy/hetzner/setup.sh \
+     | TEMPEST_REPO=https://github.com/<you>/tempest.git bash
+   ```
+3. **Binance:** your own API key, restricted to your server's IP, futures on,
+   withdrawals off (step 3).
+4. **Telegram:** your own bot via @BotFather; put its token and your chat id
+   in `bot.env` (step 4).
+5. **Status (optional):** create your own *private* repo, add to `bot.env`
+   `STATUS_REPO=git@github.com:<you>/<repo>.git` and
+   `STATUS_EMAIL=<your GitHub email>`, and add the deploy key to that repo
+   (see "Status reports" below).
+
 ## 1. Create the server
 
 Hetzner Cloud → new server:
@@ -111,8 +136,8 @@ the server itself.
 
 ## Status reports (server → GitHub)
 
-`status/report.sh` pushes `status.md` to the private repo
-[tintun2602/diablo](https://github.com/tintun2602/diablo) every hour and a
+`status/report.sh` pushes `status.md` to a private repo (`STATUS_REPO` in
+`bot.env`; without it [tintun2602/diablo](https://github.com/tintun2602/diablo)) every hour and a
 minute after every deploy: bot state, deployed commit, trades and errors
 from the bot's log, and the settings without keys, secrets or tokens (and
 anything key-shaped is blanked). It needs a deploy key once:
@@ -122,7 +147,7 @@ ssh-keygen -t ed25519 -N "" -C "tempest-server -> diablo" -f /root/.ssh/diablo_d
 cat /root/.ssh/diablo_deploy.pub
 ```
 
-Add the printed line on GitHub: diablo → Settings → Deploy keys → Add deploy
+Add the printed line on GitHub: your status repo → Settings → Deploy keys → Add deploy
 key, tick **Allow write access**. Then `/opt/tempest/deploy/hetzner/status/report.sh`
 (or wait for the hour). Log: `/var/log/tempest/status.log`.
 

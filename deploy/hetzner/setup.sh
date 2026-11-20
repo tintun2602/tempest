@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # One-time setup of a fresh Ubuntu 24.04 server for Tempest. Run as root:
 #   curl -fsSL https://raw.githubusercontent.com/tintun2602/tempest/master/deploy/hetzner/setup.sh | bash
+# From a fork, point it at the fork so the server follows your master, not
+# the original's (see "Run your own copy" in deploy/hetzner/README.md):
+#   curl -fsSL https://raw.githubusercontent.com/<you>/tempest/master/deploy/hetzner/setup.sh \
+#     | TEMPEST_REPO=https://github.com/<you>/tempest.git bash
 # Safe to run again. It does not start the bot: that waits until
 # /etc/tempest/bot.env exists (see deploy/hetzner/README.md).
 set -euo pipefail
-REPO=https://github.com/tintun2602/tempest.git
+REPO=${TEMPEST_REPO:-https://github.com/tintun2602/tempest.git}
+echo "== following $REPO"
 
 echo "== packages"
 export DEBIAN_FRONTEND=noninteractive
