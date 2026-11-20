@@ -764,18 +764,26 @@ async fn open_position<E: FuturesExchange>(
     let fill = ex
         .market_order(symbol, open_side, plan.quantity, false)
         .await?;
-    let price = if fill.average_price > 0.0 {
-        fill.average_price
-    } else {
-        ex.positions()
+    let mut price = fill.average_price;
+    // The order response can leave the average price at zero, and the
+    // position can take a moment to show its entry: ask twice.
+    for wait in [0, 1_000] {
+        if price > 0.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        price = ex
+            .positions()
             .await?
             .iter()
             .find(|p| p.symbol == symbol)
-            .map_or(0.0, |p| p.entry_price)
-    };
+            .map_or(0.0, |p| p.entry_price);
+    }
     let label = if short { "SHORT" } else { "LONG" };
 
-    let stop_ok = if short { stop > price } else { stop < price };
+    // An unknown fill price cannot show the stop is on the wrong side; the
+    // stop was planned from the last close, so it goes in.
+    let stop_ok = price <= 0.0 || if short { stop > price } else { stop < price };
     let stop_price = round_away(filters, stop, short);
     let placed = if stop_ok {
         with_retries(retry, &format!("{symbol} stop"), || {
@@ -1914,6 +1922,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ex.log(), vec!["trigger Stop BUY 2000"]);
+    }
+
+    #[tokio::test]
+    async fn a_long_with_an_unknown_fill_price_still_gets_its_stop() {
+        // The order response said 0 and the position did not show yet: the
+        // long must keep its planned stop, not be closed as "past the stop".
+        let ex = Fake::default();
+        let plan = EntryPlan { quantity: 0.025 };
+        open_position(
+            &ex,
+            &eth("ETHUSDC"),
+            false,
+            plan,
+            1_960.0,
+            false,
+            &quiet(),
+            &NO_WAIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ex.log(), vec!["market BUY 0.025", "trigger Stop SELL 1960"]);
     }
 
     #[tokio::test]
