@@ -76,6 +76,9 @@ pub struct StrategyParams {
     /// Move the stop to the entry price once the position's return on margin
     /// (price move x leverage) reaches this many percent. Zero disables it.
     pub breakeven_roi_pct: f64,
+    /// With the trailing stop on: the share of the position (0-1) sold at
+    /// the 2R level, the rest left to the trail. Zero sells nothing early.
+    pub partial_tp_share: f64,
 }
 
 /// Buffers used when `ENTRY_BUFFER_ATR` / `EXIT_BUFFER_ATR` are unset. Change
@@ -90,6 +93,7 @@ impl Default for StrategyParams {
             exit_buffer_atr: DEFAULT_EXIT_BUFFER_ATR,
             trailing_stop_atr: 0.0,
             breakeven_roi_pct: 0.0,
+            partial_tp_share: 0.0,
         }
     }
 }
@@ -109,6 +113,7 @@ impl StrategyParams {
             exit_buffer_atr: read("EXIT_BUFFER_ATR", defaults.exit_buffer_atr),
             trailing_stop_atr: read("TRAILING_STOP_ATR", defaults.trailing_stop_atr),
             breakeven_roi_pct: read("BREAKEVEN_ROI_PCT", defaults.breakeven_roi_pct),
+            partial_tp_share: (read("PARTIAL_TP_PCT", 0.0) / 100.0).min(1.0),
         }
     }
 
@@ -607,6 +612,7 @@ mod tests {
     fn break_even_triggers_at_the_return_on_margin() {
         let p = StrategyParams {
             breakeven_roi_pct: 100.0,
+            partial_tp_share: 0.0,
             ..bare()
         };
         // 20x: a 5 % move is 100 % on margin.

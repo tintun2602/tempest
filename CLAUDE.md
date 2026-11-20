@@ -41,8 +41,8 @@ ten pairs before that, so its numbers are not confirmed for these four), `MAX_OP
 gets at most a third of the margin (equity / MAX_OPEN_POSITIONS).
 `BREAKEVEN_ROI_PCT=100`: at +100 % on margin the stop moves to the entry
 (owner, 2026-11-10; a stop already at or past the entry is left alone).
-`TRAILING_STOP_ATR=3` (owner, 2026-11-19): no fixed target; the stop trails the
-mark at 3 x the trend ATR, tightening only, moved at most every 0.1 ATR.
+`TRAILING_STOP_ATR=2` (owner, 2026-11-20; 3 from 2026-11-19): no fixed target; the stop trails the
+mark at 2 x the trend ATR, tightening only, moved at most every 0.1 ATR.
 `RISK_PER_TRADE_PCT=30` (owner, 2026-11-14 evening; 20 earlier that day; was 80, which the margin cap held
 at about 58 % of equity per stop).
 

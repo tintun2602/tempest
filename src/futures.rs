@@ -2092,6 +2092,7 @@ mod tests {
         let config = test_config();
         let params = StrategyParams {
             breakeven_roi_pct: 100.0,
+            partial_tp_share: 0.0,
             ..StrategyParams::default()
         };
         let mut risk = RiskManager::with_risk_per_trade(100.0, 0.02);
@@ -2338,6 +2339,7 @@ mod tests {
         ex.positions.lock().unwrap().push(short);
         let params = StrategyParams {
             breakeven_roi_pct: 100.0,
+            partial_tp_share: 0.0,
             ..StrategyParams::default()
         };
         let mut risk = RiskManager::with_risk_per_trade(100.0, 0.02);

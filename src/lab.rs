@@ -184,6 +184,10 @@ struct OpenTrade {
     funding: f64,
     /// Where the venue would liquidate, if it can.
     liquidation: Option<f64>,
+    /// Net return already banked by a partial take-profit, as a share of
+    /// equity; `notional` is what is still open.
+    realized: f64,
+    partial_done: bool,
 }
 
 pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
@@ -400,6 +404,15 @@ fn simulate(
         // as the stop; a bar that opens through the stop fills at its open.
         for (k, slot) in open.iter_mut().enumerate() {
             let Some(pos) = slot.as_mut() else { continue };
+            // A stop touched in the same bar wins, as everywhere in the lab.
+            let stopped = if pos.short {
+                bar.high >= effective_stop(pos, params)
+            } else {
+                bar.low <= effective_stop(pos, params)
+            };
+            if !stopped {
+                take_partial(pos, bar, params, venue, costs);
+            }
             if let Some((price, resting)) = exit_on_bar(pos, bar, params, costs) {
                 let (price, resting) = venue_fill(pos, price, resting, venue, costs);
                 trades.push(close(kinds[k], pos, price, resting, bar, split_time, costs));
@@ -577,6 +590,8 @@ fn open_position(
         atr_at_entry: atr,
         funding: 0.0,
         liquidation,
+        realized: 0.0,
+        partial_done: false,
     })
 }
 
@@ -648,6 +663,53 @@ fn effective_stop(pos: &OpenTrade, params: &StrategyParams) -> f64 {
     }
 }
 
+/// With the trailing stop on, sell `partial_tp_share` of the position the
+/// first time a bar reaches the 2R level, as a market take-profit does.
+fn take_partial(
+    pos: &mut OpenTrade,
+    bar: &Candle,
+    params: &StrategyParams,
+    venue: Venue,
+    costs: &CostModel,
+) {
+    let share = params.partial_tp_share;
+    if pos.partial_done || share <= 0.0 || params.trailing_stop_atr <= 0.0 {
+        return;
+    }
+    let reached = if pos.short {
+        bar.low <= pos.target
+    } else {
+        bar.high >= pos.target
+    };
+    if !reached {
+        return;
+    }
+    let level = if pos.short {
+        pos.target.min(bar.open)
+    } else {
+        pos.target.max(bar.open)
+    };
+    let (price, resting) = venue_fill(pos, level, true, venue, costs);
+    let part = OpenTrade {
+        notional: pos.notional * share,
+        funding: 0.0,
+        realized: 0.0,
+        ..*pos
+    };
+    let moved = price / part.entry_price - 1.0;
+    let gross = part.notional * if part.short { -moved } else { moved };
+    let exit_notional = part.notional * price / part.entry_price;
+    let fees = costs.taker_cost(part.notional)
+        + if resting {
+            costs.maker_cost(exit_notional)
+        } else {
+            costs.taker_cost(exit_notional)
+        };
+    pos.realized += gross - fees;
+    pos.notional *= 1.0 - share;
+    pos.partial_done = true;
+}
+
 fn close(
     strategy: StrategyKind,
     pos: &OpenTrade,
@@ -670,7 +732,7 @@ fn close(
         strategy,
         short: pos.short,
         exit_time: bar.close_time,
-        ret: gross - fees - pos.funding,
+        ret: gross - fees - pos.funding + pos.realized,
         out_of_sample: pos.entry_time >= split_time,
     }
 }
@@ -1393,7 +1455,48 @@ mod tests {
             atr_at_entry: 2.0,
             funding: 0.0,
             liquidation: None,
+            realized: 0.0,
+            partial_done: false,
         }
+    }
+
+    #[test]
+    fn half_comes_off_at_2r_and_the_rest_trails() {
+        let free = CostModel::frictionless();
+        let p = StrategyParams {
+            trailing_stop_atr: 3.0,
+            partial_tp_share: 0.5,
+            ..StrategyParams::default()
+        };
+        let mut long = open_trade();
+        // The bar reaches the 110 target: half is sold there, +10 % on 0.25.
+        let bar = Candle {
+            open_time: 0,
+            open: 105.0,
+            high: 111.0,
+            low: 104.0,
+            close: 110.0,
+            volume: 1.0,
+            close_time: 1,
+        };
+        take_partial(&mut long, &bar, &p, futures(5.0), &free);
+        assert!(long.partial_done);
+        assert!((long.notional - 0.25).abs() < 1e-12);
+        assert!((long.realized - 0.025).abs() < 1e-12);
+        // Only once.
+        take_partial(&mut long, &bar, &p, futures(5.0), &free);
+        assert!((long.notional - 0.25).abs() < 1e-12);
+        // Closing the rest at 120 adds +5 % (0.25 x 20 %).
+        let t = close(StrategyKind::Breakout, &long, 120.0, false, &bar, 10, &free);
+        assert!((t.ret - 0.075).abs() < 1e-12, "{}", t.ret);
+        // Off without the trailing stop.
+        let mut plain = open_trade();
+        let fixed = StrategyParams {
+            partial_tp_share: 0.5,
+            ..StrategyParams::default()
+        };
+        take_partial(&mut plain, &bar, &fixed, futures(5.0), &free);
+        assert!(!plain.partial_done);
     }
 
     fn open_short() -> OpenTrade {
