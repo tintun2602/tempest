@@ -36,14 +36,14 @@ asks.
 
 In git, `deploy/hetzner/settings.env` (wins over bot.env; change by pushing):
 `TRADING_PAIRS` = BTC, ETH, BNB, XRP (owner, 2026-11-14 evening; the lab's
-ten pairs before that, so its numbers are not confirmed for these four), `MAX_OPEN_POSITIONS=4` (owner, 2026-11-20; two from 2026-11-14 evening),
+ten pairs before that, so its numbers are not confirmed for these four), `MAX_OPEN_POSITIONS=3` (owner, 2026-11-20; two from 2026-11-14 evening),
 `TREND_INTERVAL=1d`, `SIGNAL_INTERVAL=4h` (owner, 2026-11-07). Each position
-gets at most a quarter of the margin (equity / MAX_OPEN_POSITIONS).
+gets at most a third of the margin (equity / MAX_OPEN_POSITIONS).
 `BREAKEVEN_ROI_PCT=100`: at +100 % on margin the stop moves to the entry
 (owner, 2026-11-10; a stop already at or past the entry is left alone).
 `TRAILING_STOP_ATR=3` (owner, 2026-11-19): no fixed target; the stop trails the
 mark at 3 x the trend ATR, tightening only, moved at most every 0.1 ATR.
-`RISK_PER_TRADE_PCT=40` (owner, 2026-11-20; 30 from 2026-11-14 evening, 20 earlier that day; was 80, which the margin cap held
+`RISK_PER_TRADE_PCT=30` (owner, 2026-11-14 evening; 20 earlier that day; was 80, which the margin cap held
 at about 58 % of equity per stop).
 
 Profit withdrawal and top-up are code but off: `SKIM_ABOVE_USDC`,
