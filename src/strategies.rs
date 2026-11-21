@@ -28,6 +28,15 @@ pub enum StrategyKind {
     /// Signal-interval RSI washed out below `OVERSOLD` while price holds above
     /// the trend EMA200; out once RSI recovers past `RECOVERED`.
     MeanReversion,
+    /// Close above the highest high of the last `DONCHIAN_ENTRY` signal bars
+    /// with the trend EMA50 above EMA200; out below the `DONCHIAN_EXIT` low.
+    Donchian,
+    /// Signal-interval EMA20 crossing up through EMA50 while price is above
+    /// the trend EMA200; out when EMA20 falls back under EMA50.
+    EmaCross,
+    /// Close above the upper Bollinger band right after a volatility squeeze,
+    /// price above the trend EMA200; out below the middle line.
+    Squeeze,
 }
 
 /// One day of bars on the live 15m signal interval. A five-hour channel fired
@@ -38,6 +47,17 @@ const BREAKOUT_LOOKBACK: usize = 96;
 const _: () = assert!(BREAKOUT_LOOKBACK < crate::lab::SIGNAL_WINDOW);
 /// Breakout exit: a close below the lowest low of this many signal bars.
 const BREAKOUT_EXIT_LOOKBACK: usize = 10;
+const DONCHIAN_ENTRY: usize = 20;
+const DONCHIAN_EXIT: usize = 10;
+const EMA_FAST: usize = 20;
+const EMA_SLOW: usize = 50;
+const BB_PERIOD: usize = 20;
+const BB_MULT: f64 = 2.0;
+/// Squeeze: the previous bar's bandwidth must rank among the lowest
+/// `SQUEEZE_PCT` percent of the last `SQUEEZE_WINDOW` bandwidths.
+const SQUEEZE_WINDOW: usize = 80;
+const SQUEEZE_PCT: usize = 20;
+const _: () = assert!(SQUEEZE_WINDOW + BB_PERIOD <= crate::lab::SIGNAL_WINDOW);
 const OVERSOLD: f64 = 30.0;
 const RECOVERED: f64 = 60.0;
 /// Mean-reversion short: signal RSI above `OVERBOUGHT` below the trend EMA200,
@@ -50,10 +70,13 @@ const FADED: f64 = 40.0;
 const STOP_ATR: f64 = 1.5;
 
 impl StrategyKind {
-    pub const ALL: [StrategyKind; 3] = [
+    pub const ALL: [StrategyKind; 6] = [
         StrategyKind::TrendPullback,
         StrategyKind::Breakout,
         StrategyKind::MeanReversion,
+        StrategyKind::Donchian,
+        StrategyKind::EmaCross,
+        StrategyKind::Squeeze,
     ];
 
     pub fn name(self) -> &'static str {
@@ -61,6 +84,9 @@ impl StrategyKind {
             StrategyKind::TrendPullback => "trend_pullback",
             StrategyKind::Breakout => "breakout",
             StrategyKind::MeanReversion => "mean_reversion",
+            StrategyKind::Donchian => "donchian",
+            StrategyKind::EmaCross => "ema_cross",
+            StrategyKind::Squeeze => "squeeze",
         }
     }
 
@@ -95,6 +121,9 @@ impl StrategyKind {
             StrategyKind::TrendPullback => strategy::evaluate(symbol, snap, params),
             StrategyKind::Breakout => breakout(symbol, snap, signal_candles),
             StrategyKind::MeanReversion => mean_reversion(symbol, snap, signal_candles),
+            StrategyKind::Donchian => donchian(symbol, snap, signal_candles),
+            StrategyKind::EmaCross => ema_cross(symbol, snap, signal_candles),
+            StrategyKind::Squeeze => squeeze(symbol, snap, signal_candles),
         }
     }
 }
@@ -112,6 +141,9 @@ impl StrategyKind {
             StrategyKind::TrendPullback => strategy::evaluate_short(snap, params),
             StrategyKind::Breakout => breakout_short(snap, signal_candles),
             StrategyKind::MeanReversion => mean_reversion_short(snap, signal_candles),
+            StrategyKind::Donchian => donchian_short(snap, signal_candles),
+            StrategyKind::EmaCross => ema_cross_short(snap, signal_candles),
+            StrategyKind::Squeeze => squeeze_short(snap, signal_candles),
         }
     }
 }
@@ -289,6 +321,185 @@ fn hold(symbol: &str, snap: &IndicatorSnapshot, reasoning: &str) -> TradeSignal 
         warnings: Vec::new(),
         atr: snap.atr_14,
     }
+}
+
+/// Highest high and lowest low of the `n` bars before the last one.
+fn prior_range(bars: &[Candle], n: usize) -> (f64, f64) {
+    let len = bars.len();
+    let prior = &bars[len.saturating_sub(1 + n)..len - 1];
+    let high = prior.iter().map(|c| c.high).fold(f64::MIN, f64::max);
+    let low = prior.iter().map(|c| c.low).fold(f64::MAX, f64::min);
+    (high, low)
+}
+
+fn donchian(symbol: &str, snap: &IndicatorSnapshot, bars: &[Candle]) -> TradeSignal {
+    let price = snap.current_price;
+    if bars.len() < DONCHIAN_ENTRY + 1 {
+        return hold(symbol, snap, "not enough signal bars");
+    }
+    let (channel_high, _) = prior_range(bars, DONCHIAN_ENTRY);
+    let (_, exit_low) = prior_range(bars, DONCHIAN_EXIT);
+    if price < exit_low {
+        return sell(
+            symbol,
+            snap,
+            format!("Close {price:.2} below {DONCHIAN_EXIT}-bar low {exit_low:.2}"),
+        );
+    }
+    if price > channel_high && snap.ema_50 > snap.ema_200 {
+        return buy_with_atr_stop(
+            symbol,
+            snap,
+            format!(
+                "Donchian: {price:.2} above {DONCHIAN_ENTRY}-bar high {channel_high:.2}, \
+                 EMA50 {:.2} above EMA200 {:.2}",
+                snap.ema_50, snap.ema_200
+            ),
+        );
+    }
+    hold(symbol, snap, "no donchian breakout")
+}
+
+fn donchian_short(snap: &IndicatorSnapshot, bars: &[Candle]) -> ShortDecision {
+    let price = snap.current_price;
+    if bars.len() < DONCHIAN_ENTRY + 1 {
+        return ShortDecision::Hold;
+    }
+    let (_, channel_low) = prior_range(bars, DONCHIAN_ENTRY);
+    let (exit_high, _) = prior_range(bars, DONCHIAN_EXIT);
+    if price > exit_high {
+        return ShortDecision::Cover;
+    }
+    if price < channel_low && snap.ema_50 < snap.ema_200 {
+        return short_with_atr_stop(snap);
+    }
+    ShortDecision::Hold
+}
+
+/// (previous, current) of EMA20 and EMA50 on the signal closes, if both exist.
+fn ema_pair(bars: &[Candle]) -> Option<((f64, f64), (f64, f64))> {
+    let closes: Vec<f64> = bars.iter().map(|c| c.close).collect();
+    let n = closes.len();
+    if n < EMA_SLOW + 1 {
+        return None;
+    }
+    let fast = indicators::ema(&closes, EMA_FAST);
+    let slow = indicators::ema(&closes, EMA_SLOW);
+    let v = [fast[n - 2], slow[n - 2], fast[n - 1], slow[n - 1]];
+    if v.iter().any(|x| !x.is_finite()) {
+        return None;
+    }
+    Some(((v[0], v[1]), (v[2], v[3])))
+}
+
+fn ema_cross(symbol: &str, snap: &IndicatorSnapshot, bars: &[Candle]) -> TradeSignal {
+    let Some(((pf, ps), (f, s))) = ema_pair(bars) else {
+        return hold(symbol, snap, "not enough signal bars");
+    };
+    if f < s {
+        return sell(
+            symbol,
+            snap,
+            format!("EMA{EMA_FAST} {f:.2} below EMA{EMA_SLOW} {s:.2}"),
+        );
+    }
+    if pf <= ps && f > s && snap.current_price > snap.ema_200 {
+        return buy_with_atr_stop(
+            symbol,
+            snap,
+            format!(
+                "EMA{EMA_FAST} crossed above EMA{EMA_SLOW}, above EMA200 {:.2}",
+                snap.ema_200
+            ),
+        );
+    }
+    hold(symbol, snap, "no ema cross")
+}
+
+fn ema_cross_short(snap: &IndicatorSnapshot, bars: &[Candle]) -> ShortDecision {
+    let Some(((pf, ps), (f, s))) = ema_pair(bars) else {
+        return ShortDecision::Hold;
+    };
+    if f > s {
+        return ShortDecision::Cover;
+    }
+    if pf >= ps && f < s && snap.current_price < snap.ema_200 {
+        return short_with_atr_stop(snap);
+    }
+    ShortDecision::Hold
+}
+
+/// Bollinger(20, 2) at bar `i` of `closes`: (upper, middle, lower).
+fn bollinger_at(closes: &[f64], i: usize) -> (f64, f64, f64) {
+    let w = &closes[i + 1 - BB_PERIOD..=i];
+    let mid = w.iter().sum::<f64>() / BB_PERIOD as f64;
+    let var = w.iter().map(|c| (c - mid).powi(2)).sum::<f64>() / BB_PERIOD as f64;
+    let sd = var.sqrt();
+    (mid + BB_MULT * sd, mid, mid - BB_MULT * sd)
+}
+
+fn bandwidth_at(closes: &[f64], i: usize) -> f64 {
+    let (up, mid, lo) = bollinger_at(closes, i);
+    (up - lo) / mid
+}
+
+/// Bands of the last bar plus whether the bar before it was in a squeeze.
+/// `None` until `SQUEEZE_WINDOW` earlier bandwidths exist.
+fn squeeze_state(bars: &[Candle]) -> Option<(bool, (f64, f64, f64))> {
+    let closes: Vec<f64> = bars.iter().map(|c| c.close).collect();
+    let n = closes.len();
+    if n < SQUEEZE_WINDOW + BB_PERIOD {
+        return None;
+    }
+    let prev = bandwidth_at(&closes, n - 2);
+    if !prev.is_finite() {
+        return None;
+    }
+    // Bandwidths of the SQUEEZE_WINDOW bars ending with the previous bar.
+    let lower = (n - 1 - SQUEEZE_WINDOW..n - 1)
+        .filter(|&i| bandwidth_at(&closes, i) < prev)
+        .count();
+    let squeezed = lower < SQUEEZE_WINDOW * SQUEEZE_PCT / 100;
+    Some((squeezed, bollinger_at(&closes, n - 1)))
+}
+
+fn squeeze(symbol: &str, snap: &IndicatorSnapshot, bars: &[Candle]) -> TradeSignal {
+    let price = snap.current_price;
+    let Some((squeezed, (upper, mid, _))) = squeeze_state(bars) else {
+        return hold(symbol, snap, "not enough signal bars");
+    };
+    if price < mid {
+        return sell(
+            symbol,
+            snap,
+            format!("Close {price:.2} below Bollinger middle {mid:.2}"),
+        );
+    }
+    if squeezed && price > upper && price > snap.ema_200 {
+        return buy_with_atr_stop(
+            symbol,
+            snap,
+            format!(
+                "Squeeze breakout: {price:.2} above upper band {upper:.2}, above EMA200 {:.2}",
+                snap.ema_200
+            ),
+        );
+    }
+    hold(symbol, snap, "no squeeze breakout")
+}
+
+fn squeeze_short(snap: &IndicatorSnapshot, bars: &[Candle]) -> ShortDecision {
+    let price = snap.current_price;
+    let Some((squeezed, (_, mid, lower))) = squeeze_state(bars) else {
+        return ShortDecision::Hold;
+    };
+    if price > mid {
+        return ShortDecision::Cover;
+    }
+    if squeezed && price < lower && price < snap.ema_200 {
+        return short_with_atr_stop(snap);
+    }
+    ShortDecision::Hold
 }
 
 #[cfg(test)]
@@ -487,5 +698,148 @@ mod tests {
         no_atr.atr_14 = f64::NAN;
         let s = StrategyKind::Breakout.evaluate("X", &no_atr, &bars, &Default::default());
         assert_ne!(s.signal, Signal::Buy);
+    }
+
+    fn closes_to_bars(closes: &[f64]) -> Vec<Candle> {
+        closes
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| bar(i as u64, c - 0.1, c + 0.1, c))
+            .collect()
+    }
+
+    fn eval_long(kind: StrategyKind, s: &IndicatorSnapshot, bars: &[Candle]) -> TradeSignal {
+        kind.evaluate("X", s, bars, &Default::default())
+    }
+
+    fn eval_short(kind: StrategyKind, s: &IndicatorSnapshot, bars: &[Candle]) -> ShortDecision {
+        kind.evaluate_short(s, bars, &Default::default())
+    }
+
+    fn enter(price: f64) -> ShortDecision {
+        ShortDecision::Enter { stop_loss: price + 3.0 }
+    }
+
+    // Donchian: 25 flat bars (99-101) then a final bar.
+    fn donchian_bars(last: f64) -> Vec<Candle> {
+        let mut bars: Vec<Candle> = (0..25).map(|i| bar(i, 99.0, 101.0, 100.0)).collect();
+        bars.push(bar(25, last - 0.5, last + 0.5, last));
+        bars
+    }
+
+    #[test]
+    fn donchian_long_short_and_exits() {
+        let k = StrategyKind::Donchian;
+        let s = eval_long(k, &snap(103.0), &donchian_bars(103.0));
+        assert_eq!(s.signal, Signal::Buy, "{}", s.reasoning);
+        // EMA50 below EMA200 blocks the long.
+        let mut down = snap(103.0);
+        down.ema_50 = 85.0;
+        assert_eq!(eval_long(k, &down, &donchian_bars(103.0)).signal, Signal::Hold);
+        // Exit below the 10-bar low.
+        assert_eq!(eval_long(k, &snap(97.0), &donchian_bars(97.0)).signal, Signal::Sell);
+        // Short: close under the 20-bar low with EMA50 < EMA200.
+        let mut down97 = snap(97.0);
+        down97.ema_50 = 85.0;
+        assert_eq!(eval_short(k, &down97, &donchian_bars(97.0)), enter(97.0));
+        // Uptrend blocks the short; cover above the 10-bar high.
+        assert_eq!(eval_short(k, &snap(97.0), &donchian_bars(97.0)), ShortDecision::Hold);
+        assert_eq!(eval_short(k, &snap(103.0), &donchian_bars(103.0)), ShortDecision::Cover);
+        // Too few bars.
+        assert_eq!(eval_short(k, &down97, &donchian_bars(97.0)[10..]), ShortDecision::Hold);
+    }
+
+    /// Flat 100s, a rally and a fall make EMA20 cross EMA50 on the last bar.
+    fn cross_up_bars() -> Vec<Candle> {
+        // 60 bars sliding from 110 to 100.5, then rising until EMA20 > EMA50
+        // for the first time; the returned set ends exactly on that bar.
+        let mut closes: Vec<f64> = (0..60).map(|i| 110.0 - i as f64 * 0.16).collect();
+        let mut last = *closes.last().unwrap();
+        loop {
+            last += 0.8;
+            closes.push(last);
+            let n = closes.len();
+            let f = indicators::ema(&closes, EMA_FAST);
+            let s = indicators::ema(&closes, EMA_SLOW);
+            if f[n - 1] > s[n - 1] {
+                return closes_to_bars(&closes);
+            }
+            assert!(n < 200, "no cross");
+        }
+    }
+
+    fn mirror(bars: &[Candle]) -> Vec<Candle> {
+        let closes: Vec<f64> = bars.iter().map(|c| 200.0 - c.close).collect();
+        closes_to_bars(&closes)
+    }
+
+    #[test]
+    fn ema_cross_long_short_and_exits() {
+        let k = StrategyKind::EmaCross;
+        let up = cross_up_bars();
+        let price = up.last().unwrap().close;
+        let s = eval_long(k, &snap(price), &up);
+        assert_eq!(s.signal, Signal::Buy, "{}", s.reasoning);
+        // Below EMA200 it stays out.
+        let mut under = snap(price);
+        under.ema_200 = price + 10.0;
+        assert_eq!(eval_long(k, &under, &up).signal, Signal::Hold);
+        // Exit while EMA20 < EMA50: the slide before the cross.
+        let slide: Vec<Candle> = closes_to_bars(
+            &(0..60).map(|i| 110.0 - i as f64 * 0.16).collect::<Vec<_>>(),
+        );
+        assert_eq!(eval_long(k, &snap(100.0), &slide).signal, Signal::Sell);
+        // Mirror image: cross down, price below EMA200.
+        let down = mirror(&up);
+        let dprice = down.last().unwrap().close;
+        let mut d = snap(dprice);
+        d.ema_200 = dprice + 10.0;
+        assert_eq!(eval_short(k, &d, &down), enter(dprice));
+        let mut above = snap(dprice);
+        above.ema_200 = dprice - 10.0;
+        assert_eq!(eval_short(k, &above, &down), ShortDecision::Hold);
+        // Cover while EMA20 > EMA50: the mirrored slide is a rise.
+        let rise = mirror(&slide);
+        assert_eq!(eval_short(k, &snap(100.0), &rise), ShortDecision::Cover);
+    }
+
+    /// 80 quiet-ish bars with wide swings, then 20 very tight bars (the
+    /// squeeze), then a final bar closing at `last`.
+    fn squeeze_bars(last: f64) -> Vec<Candle> {
+        let mut closes: Vec<f64> = (0..60)
+            .map(|i| 100.0 + if i % 2 == 0 { 3.0 } else { -3.0 })
+            .collect();
+        closes.extend((0..39).map(|i| 100.0 + if i % 2 == 0 { 0.05 } else { -0.05 }));
+        closes.push(last);
+        closes_to_bars(&closes)
+    }
+
+    #[test]
+    fn squeeze_long_short_and_exits() {
+        let k = StrategyKind::Squeeze;
+        let up = squeeze_bars(101.0);
+        let s = eval_long(k, &snap(101.0), &up);
+        assert_eq!(s.signal, Signal::Buy, "{}", s.reasoning);
+        // Below EMA200 it stays out.
+        let mut under = snap(101.0);
+        under.ema_200 = 105.0;
+        assert_eq!(eval_long(k, &under, &up).signal, Signal::Hold);
+        // Exit below the middle line.
+        assert_eq!(eval_long(k, &snap(99.5), &squeeze_bars(99.5)).signal, Signal::Sell);
+        // No squeeze (wide bands throughout): no entry.
+        let wide: Vec<f64> = (0..100)
+            .map(|i| 100.0 + (1.0 + i as f64 * 0.05) * if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let mut wide_bars = closes_to_bars(&wide[..99]);
+        wide_bars.push(bar(99, 109.5, 110.5, 110.0));
+        assert_ne!(eval_long(k, &snap(110.0), &wide_bars).signal, Signal::Buy);
+        // Short mirror: close below the lower band, price under EMA200.
+        let dn = squeeze_bars(99.0);
+        let mut d = snap(99.0);
+        d.ema_200 = 105.0;
+        assert_eq!(eval_short(k, &d, &dn), enter(99.0));
+        assert_eq!(eval_short(k, &snap(99.0), &dn), ShortDecision::Hold);
+        // Cover above the middle line.
+        assert_eq!(eval_short(k, &snap(100.5), &squeeze_bars(100.5)), ShortDecision::Cover);
     }
 }
