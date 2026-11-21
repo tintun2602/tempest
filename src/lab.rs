@@ -270,6 +270,15 @@ pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
         feeds.push(feed);
     }
 
+    // `LAB_DUMP_TRADES=true`: one line per trade of the live strategy, for
+    // equity-path studies outside the lab (risk steps, Monte Carlo).
+    if std::env::var("LAB_DUMP_TRADES").is_ok_and(|v| v == "true") {
+        let mut mine: Vec<&LabTrade> = trades.iter().filter(|t| t.strategy == live).collect();
+        mine.sort_by_key(|t| t.exit_time);
+        for t in mine {
+            println!("LAB_TRADE {} {} {} {:.6}", t.exit_time, t.short, t.out_of_sample, t.ret);
+        }
+    }
     let mut report = build_report(&trades, live, days, config, venue);
     let grid = buffer_grid(&feeds, config.risk_per_trade, &costs, &params, venue);
     report["buffer_grid"] = buffer_grid_json(&grid, &params);
