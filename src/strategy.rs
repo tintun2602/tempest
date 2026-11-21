@@ -87,6 +87,9 @@ pub struct StrategyParams {
     /// 1h timing (lab): no short while the 1h RSI(14) is under this, no long
     /// while it is over 100 minus it. Zero is off.
     pub entry_rsi_1h: f64,
+    /// Volume confirmation (lab): enter only when the signal bar's volume is
+    /// at least this many times the mean of the 20 bars before it. Zero is off.
+    pub entry_volume_mult: f64,
 }
 
 /// Buffers used when `ENTRY_BUFFER_ATR` / `EXIT_BUFFER_ATR` are unset. Change
@@ -105,6 +108,7 @@ impl Default for StrategyParams {
             lock_rsi: 0.0,
             lock_share: 0.0,
             entry_rsi_1h: 0.0,
+            entry_volume_mult: 0.0,
         }
     }
 }
@@ -128,6 +132,7 @@ impl StrategyParams {
             lock_rsi: read("LOCK_RSI", 0.0).min(50.0),
             lock_share: (read("LOCK_PCT", 50.0) / 100.0).min(1.0),
             entry_rsi_1h: read("ENTRY_RSI_1H", 0.0).min(50.0),
+            entry_volume_mult: read("ENTRY_VOLUME_MULT", 0.0),
         }
     }
 
@@ -630,6 +635,7 @@ mod tests {
             lock_rsi: 0.0,
             lock_share: 0.0,
             entry_rsi_1h: 0.0,
+            entry_volume_mult: 0.0,
             ..bare()
         };
         // 20x: a 5 % move is 100 % on margin.
