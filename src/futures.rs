@@ -547,6 +547,15 @@ async fn manage_symbol<E: FuturesExchange>(
                 warn!("{symbol}: trailing stop not moved: {e}");
             }
         }
+        if let Some(s) = snap.as_ref() {
+            if lock_due(pos, s.rsi_14, params) {
+                let file = crate::risk::state_dir_from_env().join(LOCK_FILE);
+                if !lock_done(&file, pos) {
+                    lock_position(ex, &filters, pos, params.lock_share, s.rsi_14, notifier).await?;
+                    mark_locked(&file, pos);
+                }
+            }
+        }
         let (Some(snap), Ok((_, signal))) = (snap.as_ref(), candles.as_ref()) else {
             return Ok(Traded::Nothing);
         };
@@ -558,6 +567,7 @@ async fn manage_symbol<E: FuturesExchange>(
     }
 
     target_gap_cleared(symbol);
+    clear_locks(&crate::risk::state_dir_from_env().join(LOCK_FILE), symbol);
     // Flat: whatever is still resting belongs to a position that is gone.
     if !ex.trigger_orders(symbol).await?.is_empty() {
         info!("{symbol}: flat with leftover orders; cancelling them");
@@ -1228,6 +1238,111 @@ async fn move_stop<E: FuturesExchange>(
             pos.symbol, pos.mark_price
         ),
     }
+    Ok(())
+}
+
+/// Positions the lock rule has already sold its share of, as
+/// `SYMBOL@entry` lines, so a restart does not sell a second share.
+const LOCK_FILE: &str = "lock-state.txt";
+
+/// The lock rule (`LOCK_RSI`, `LOCK_PCT`): with the daily RSI(14) below
+/// `lock_rsi` on a short (above 100 minus it on a long) and the position in
+/// profit at the mark, sell `lock_share` of it once. Lab, 2 years: at 15 and
+/// half, a small gain on both four and ten pairs in and out of sample.
+fn lock_due(pos: &FuturesPosition, rsi: f64, params: &StrategyParams) -> bool {
+    if params.lock_rsi <= 0.0 || params.lock_share <= 0.0 || !rsi.is_finite() {
+        return false;
+    }
+    let short = pos.is_short();
+    let extreme = if short {
+        rsi < params.lock_rsi
+    } else {
+        rsi > 100.0 - params.lock_rsi
+    };
+    let in_profit = pos.mark_price > 0.0
+        && if short {
+            pos.mark_price < pos.entry_price
+        } else {
+            pos.mark_price > pos.entry_price
+        };
+    extreme && in_profit
+}
+
+fn lock_key(pos: &FuturesPosition) -> String {
+    format!("{}@{}", pos.symbol, pos.entry_price)
+}
+
+fn lock_done(file: &std::path::Path, pos: &FuturesPosition) -> bool {
+    let key = lock_key(pos);
+    std::fs::read_to_string(file)
+        .map(|s| s.lines().any(|l| l == key))
+        .unwrap_or(false)
+}
+
+fn mark_locked(file: &std::path::Path, pos: &FuturesPosition) {
+    let mut lines: Vec<String> = std::fs::read_to_string(file)
+        .map(|s| s.lines().map(String::from).collect())
+        .unwrap_or_default();
+    lines.push(lock_key(pos));
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(file, lines.join("\n") + "\n") {
+        warn!(
+            "lock state not saved ({e}); a restart may lock {} again",
+            pos.symbol
+        );
+    }
+}
+
+/// A flat pair forgets its lock, so its next position can lock again.
+fn clear_locks(file: &std::path::Path, symbol: &str) {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return;
+    };
+    let prefix = format!("{symbol}@");
+    let kept: Vec<&str> = text.lines().filter(|l| !l.starts_with(&prefix)).collect();
+    if kept.len() != text.lines().count() {
+        let _ = std::fs::write(
+            file,
+            kept.join("\n") + if kept.is_empty() { "" } else { "\n" },
+        );
+    }
+}
+
+/// Sell `share` of `pos` at market, reduce-only. A share too small to trade
+/// is skipped (and counts as done): the stop and trail still manage it all.
+async fn lock_position<E: FuturesExchange>(
+    ex: &E,
+    filters: &SymbolFilters,
+    pos: &FuturesPosition,
+    share: f64,
+    rsi: f64,
+    notifier: &Notifier,
+) -> Result<(), String> {
+    let quantity = filters.round_quantity(pos.amount.abs() * share.min(1.0));
+    if quantity <= 0.0 || filters.check_order(quantity, pos.mark_price).is_err() {
+        info!(
+            "{}: lock skipped, {quantity} is below the venue minimum",
+            pos.symbol
+        );
+        return Ok(());
+    }
+    let side = if pos.is_short() {
+        Side::Buy
+    } else {
+        Side::Sell
+    };
+    ex.market_order(&pos.symbol, side, quantity, true).await?;
+    let msg = format!(
+        "\u{1f510} *{}* locked {:.0} % at RSI `{rsi:.1}` (mark `{:.2}`, entry `{:.2}`); the rest rides the trail",
+        pos.symbol,
+        share * 100.0,
+        pos.mark_price,
+        pos.entry_price
+    );
+    info!("{msg}");
+    notifier.send(&msg).await;
     Ok(())
 }
 
@@ -1958,6 +2073,62 @@ mod tests {
         assert_eq!(ex.log(), vec!["market BUY 0.025", "trigger Stop SELL 1960"]);
     }
 
+    #[test]
+    fn the_lock_rule_fires_at_an_rsi_extreme_in_profit_only() {
+        let p = StrategyParams {
+            lock_rsi: 15.0,
+            lock_share: 0.5,
+            ..StrategyParams::default()
+        };
+        let short = FuturesPosition {
+            mark_price: 1_900.0,
+            ..position(-0.02)
+        };
+        assert!(lock_due(&short, 10.0, &p));
+        assert!(!lock_due(&short, 20.0, &p));
+        let losing = FuturesPosition {
+            mark_price: 2_050.0,
+            ..position(-0.02)
+        };
+        assert!(!lock_due(&losing, 10.0, &p));
+        let long = FuturesPosition {
+            mark_price: 2_100.0,
+            ..position(0.02)
+        };
+        assert!(lock_due(&long, 90.0, &p));
+        assert!(!lock_due(&long, 10.0, &p));
+        assert!(!lock_due(&short, 10.0, &StrategyParams::default()));
+    }
+
+    #[test]
+    fn a_lock_is_remembered_until_the_pair_is_flat() {
+        let dir = std::env::temp_dir().join(format!("tempest-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join(LOCK_FILE);
+        let short = position(-0.02);
+        assert!(!lock_done(&file, &short));
+        mark_locked(&file, &short);
+        assert!(lock_done(&file, &short));
+        clear_locks(&file, "BTCUSDC");
+        assert!(lock_done(&file, &short));
+        clear_locks(&file, "ETHUSDC");
+        assert!(!lock_done(&file, &short));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn locking_sells_half_reduce_only() {
+        let ex = Fake::default();
+        let short = FuturesPosition {
+            mark_price: 1_900.0,
+            ..position(-0.1)
+        };
+        lock_position(&ex, &eth("ETHUSDC"), &short, 0.5, 10.0, &quiet())
+            .await
+            .unwrap();
+        assert_eq!(ex.log(), vec!["market BUY 0.05 reduce"]);
+    }
+
     #[tokio::test]
     async fn with_a_trailing_stop_an_entry_gets_no_target() {
         let ex = Fake {
@@ -2106,6 +2277,8 @@ mod tests {
         let params = StrategyParams {
             breakeven_roi_pct: 100.0,
             partial_tp_share: 0.0,
+            lock_rsi: 0.0,
+            lock_share: 0.0,
             ..StrategyParams::default()
         };
         let mut risk = RiskManager::with_risk_per_trade(100.0, 0.02);
@@ -2353,6 +2526,8 @@ mod tests {
         let params = StrategyParams {
             breakeven_roi_pct: 100.0,
             partial_tp_share: 0.0,
+            lock_rsi: 0.0,
+            lock_share: 0.0,
             ..StrategyParams::default()
         };
         let mut risk = RiskManager::with_risk_per_trade(100.0, 0.02);

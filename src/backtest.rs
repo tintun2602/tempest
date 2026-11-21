@@ -1318,6 +1318,8 @@ fn print_buffer_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_trad
             trailing_stop_atr: 0.0,
             breakeven_roi_pct: 0.0,
             partial_tp_share: 0.0,
+            lock_rsi: 0.0,
+            lock_share: 0.0,
         };
         let (r, _) = simulate_portfolio(feeds, costs, risk_per_trade, &params);
         let wins = r.trades.iter().filter(|t| t.pnl > 0.0).count();
@@ -1359,6 +1361,8 @@ fn print_trailing_sweep(feeds: &mut [SymbolFeed], costs: &CostModel, risk_per_tr
             trailing_stop_atr: trail,
             breakeven_roi_pct: 0.0,
             partial_tp_share: 0.0,
+            lock_rsi: 0.0,
+            lock_share: 0.0,
         };
         let (r, _) = simulate_portfolio(feeds, costs, risk_per_trade, &params);
         let wins: Vec<f64> = r

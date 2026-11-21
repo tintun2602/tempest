@@ -188,6 +188,8 @@ struct OpenTrade {
     /// equity; `notional` is what is still open.
     realized: f64,
     partial_done: bool,
+    /// The lock rule has sold its share.
+    locked: bool,
 }
 
 pub async fn run<M: MarketDataProvider>(client: &M, config: &Config) {
@@ -461,6 +463,9 @@ fn simulate(
         let Some(snap) = strategy::compute_indicators(&trend_view, signal_view, bar.close) else {
             continue;
         };
+        for pos in open.iter_mut().flatten() {
+            lock_on_extreme(pos, snap.rsi_14, bar.close, params, costs);
+        }
 
         for (k, &kind) in kinds.iter().enumerate() {
             match open[k] {
@@ -592,6 +597,7 @@ fn open_position(
         liquidation,
         realized: 0.0,
         partial_done: false,
+        locked: false,
     })
 }
 
@@ -661,6 +667,57 @@ fn effective_stop(pos: &OpenTrade, params: &StrategyParams) -> f64 {
     } else {
         pos.stop.max(pos.extreme - trail)
     }
+}
+
+/// The lock rule: with the daily RSI at an extreme in the trade's favour and
+/// the trade in profit at this close, sell `lock_share` of it at market,
+/// once.
+fn lock_on_extreme(
+    pos: &mut OpenTrade,
+    rsi: f64,
+    close: f64,
+    params: &StrategyParams,
+    costs: &CostModel,
+) {
+    if pos.locked || params.lock_rsi <= 0.0 || params.lock_share <= 0.0 || !rsi.is_finite() {
+        return;
+    }
+    let extreme = if pos.short {
+        rsi < params.lock_rsi
+    } else {
+        rsi > 100.0 - params.lock_rsi
+    };
+    let in_profit = if pos.short {
+        close < pos.entry_price
+    } else {
+        close > pos.entry_price
+    };
+    if !(extreme && in_profit) {
+        return;
+    }
+    let price = if pos.short {
+        costs.buy_fill(close)
+    } else {
+        costs.sell_fill(close)
+    };
+    bank_share(pos, price, params.lock_share, false, costs);
+    pos.locked = true;
+}
+
+/// Close `share` of what is open at `price` and bank its net return.
+fn bank_share(pos: &mut OpenTrade, price: f64, share: f64, resting: bool, costs: &CostModel) {
+    let notional = pos.notional * share;
+    let moved = price / pos.entry_price - 1.0;
+    let gross = notional * if pos.short { -moved } else { moved };
+    let exit_notional = notional * price / pos.entry_price;
+    let fees = costs.taker_cost(notional)
+        + if resting {
+            costs.maker_cost(exit_notional)
+        } else {
+            costs.taker_cost(exit_notional)
+        };
+    pos.realized += gross - fees;
+    pos.notional -= notional;
 }
 
 /// With the trailing stop on, sell `partial_tp_share` of the position the
@@ -1457,6 +1514,7 @@ mod tests {
             liquidation: None,
             realized: 0.0,
             partial_done: false,
+            locked: false,
         }
     }
 
@@ -1497,6 +1555,31 @@ mod tests {
         };
         take_partial(&mut plain, &bar, &fixed, futures(5.0), &free);
         assert!(!plain.partial_done);
+    }
+
+    #[test]
+    fn the_lock_rule_banks_half_once_at_an_rsi_extreme_in_profit() {
+        let free = CostModel::frictionless();
+        let p = StrategyParams {
+            lock_rsi: 15.0,
+            lock_share: 0.5,
+            ..StrategyParams::default()
+        };
+        let mut short = open_short();
+        // RSI 20: not extreme enough.
+        lock_on_extreme(&mut short, 20.0, 90.0, &p, &free);
+        assert!(!short.locked);
+        // In loss at RSI 10: nothing to lock.
+        lock_on_extreme(&mut short, 10.0, 101.0, &p, &free);
+        assert!(!short.locked);
+        // RSI 10 and 10 % in profit: half banked, +10 % on 0.25.
+        lock_on_extreme(&mut short, 10.0, 90.0, &p, &free);
+        assert!(short.locked);
+        assert!((short.notional - 0.25).abs() < 1e-12);
+        assert!((short.realized - 0.025).abs() < 1e-12);
+        // Once only.
+        lock_on_extreme(&mut short, 5.0, 80.0, &p, &free);
+        assert!((short.notional - 0.25).abs() < 1e-12);
     }
 
     fn open_short() -> OpenTrade {

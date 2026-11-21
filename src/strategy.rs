@@ -79,6 +79,11 @@ pub struct StrategyParams {
     /// With the trailing stop on: the share of the position (0-1) sold at
     /// the 2R level, the rest left to the trail. Zero sells nothing early.
     pub partial_tp_share: f64,
+    /// Lock rule (lab): when the daily RSI(14) is below this on a short (or
+    /// above 100 minus it on a long) and the trade is in profit, sell
+    /// `lock_share` of it once. Zero is off.
+    pub lock_rsi: f64,
+    pub lock_share: f64,
 }
 
 /// Buffers used when `ENTRY_BUFFER_ATR` / `EXIT_BUFFER_ATR` are unset. Change
@@ -94,6 +99,8 @@ impl Default for StrategyParams {
             trailing_stop_atr: 0.0,
             breakeven_roi_pct: 0.0,
             partial_tp_share: 0.0,
+            lock_rsi: 0.0,
+            lock_share: 0.0,
         }
     }
 }
@@ -114,6 +121,8 @@ impl StrategyParams {
             trailing_stop_atr: read("TRAILING_STOP_ATR", defaults.trailing_stop_atr),
             breakeven_roi_pct: read("BREAKEVEN_ROI_PCT", defaults.breakeven_roi_pct),
             partial_tp_share: (read("PARTIAL_TP_PCT", 0.0) / 100.0).min(1.0),
+            lock_rsi: read("LOCK_RSI", 0.0).min(50.0),
+            lock_share: (read("LOCK_PCT", 50.0) / 100.0).min(1.0),
         }
     }
 
@@ -613,6 +622,8 @@ mod tests {
         let p = StrategyParams {
             breakeven_roi_pct: 100.0,
             partial_tp_share: 0.0,
+            lock_rsi: 0.0,
+            lock_share: 0.0,
             ..bare()
         };
         // 20x: a 5 % move is 100 % on margin.
