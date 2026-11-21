@@ -2279,6 +2279,7 @@ mod tests {
             partial_tp_share: 0.0,
             lock_rsi: 0.0,
             lock_share: 0.0,
+            entry_rsi_1h: 0.0,
             ..StrategyParams::default()
         };
         let mut risk = RiskManager::with_risk_per_trade(100.0, 0.02);
@@ -2528,6 +2529,7 @@ mod tests {
             partial_tp_share: 0.0,
             lock_rsi: 0.0,
             lock_share: 0.0,
+            entry_rsi_1h: 0.0,
             ..StrategyParams::default()
         };
         let mut risk = RiskManager::with_risk_per_trade(100.0, 0.02);

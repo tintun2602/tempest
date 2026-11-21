@@ -84,6 +84,9 @@ pub struct StrategyParams {
     /// `lock_share` of it once. Zero is off.
     pub lock_rsi: f64,
     pub lock_share: f64,
+    /// 1h timing (lab): no short while the 1h RSI(14) is under this, no long
+    /// while it is over 100 minus it. Zero is off.
+    pub entry_rsi_1h: f64,
 }
 
 /// Buffers used when `ENTRY_BUFFER_ATR` / `EXIT_BUFFER_ATR` are unset. Change
@@ -101,6 +104,7 @@ impl Default for StrategyParams {
             partial_tp_share: 0.0,
             lock_rsi: 0.0,
             lock_share: 0.0,
+            entry_rsi_1h: 0.0,
         }
     }
 }
@@ -123,6 +127,7 @@ impl StrategyParams {
             partial_tp_share: (read("PARTIAL_TP_PCT", 0.0) / 100.0).min(1.0),
             lock_rsi: read("LOCK_RSI", 0.0).min(50.0),
             lock_share: (read("LOCK_PCT", 50.0) / 100.0).min(1.0),
+            entry_rsi_1h: read("ENTRY_RSI_1H", 0.0).min(50.0),
         }
     }
 
@@ -624,6 +629,7 @@ mod tests {
             partial_tp_share: 0.0,
             lock_rsi: 0.0,
             lock_share: 0.0,
+            entry_rsi_1h: 0.0,
             ..bare()
         };
         // 20x: a 5 % move is 100 % on margin.

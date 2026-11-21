@@ -154,6 +154,8 @@ struct Feed {
     trend: Vec<Candle>,
     signal: Vec<Candle>,
     funding: Vec<(u64, f64)>,
+    /// 1h candles, loaded only for the 1h timing filter (`ENTRY_RSI_1H`).
+    hour: Vec<Candle>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +295,7 @@ async fn load_spot<M: MarketDataProvider>(
         .await
         .map_err(|e| format!("signal klines failed: {e}"))?;
     Ok(closed_only(Feed {
+        hour: Vec::new(),
         trend,
         signal,
         funding: Vec::new(),
@@ -318,6 +321,18 @@ async fn load_futures(
     let signal =
         archive::futures_klines(http, symbol, &config.signal_interval, signal_start, end).await?;
     let mut funding = archive::funding_rates(http, symbol, signal_start, end).await?;
+    let hour = if StrategyParams::from_env().entry_rsi_1h > 0.0 {
+        archive::futures_klines(
+            http,
+            symbol,
+            "1h",
+            signal_start.saturating_sub(40 * 3_600_000),
+            end,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
     if signal.is_empty() {
         return Err("no futures candles in the archive".into());
     }
@@ -332,6 +347,7 @@ async fn load_futures(
         );
     }
     Ok(closed_only(Feed {
+        hour,
         trend,
         signal,
         funding,
@@ -394,6 +410,7 @@ fn simulate(
     let mut closed_trend = 0usize;
     let mut next_funding = 0usize;
     let mut trend_view: Vec<Candle> = Vec::with_capacity(TREND_WINDOW);
+    let mut closed_hour = 0usize;
 
     for j in 0..signal.len() {
         let bar = &signal[j];
@@ -466,6 +483,22 @@ fn simulate(
         for pos in open.iter_mut().flatten() {
             lock_on_extreme(pos, snap.rsi_14, bar.close, params, costs);
         }
+        // 1h RSI as of this bar's close: only hours that have closed.
+        while closed_hour < feed.hour.len() && feed.hour[closed_hour].close_time <= bar.close_time {
+            closed_hour += 1;
+        }
+        let rsi_1h = if params.entry_rsi_1h > 0.0 && closed_hour >= 30 {
+            let closes: Vec<f64> = feed.hour[closed_hour.saturating_sub(100)..closed_hour]
+                .iter()
+                .map(|c| c.close)
+                .collect();
+            crate::indicators::rsi(&closes, 14)
+                .last()
+                .copied()
+                .filter(|v| v.is_finite())
+        } else {
+            None
+        };
 
         for (k, &kind) in kinds.iter().enumerate() {
             match open[k] {
@@ -488,6 +521,9 @@ fn simulate(
                     let decision = kind.evaluate("LAB", &snap, signal_view, params);
                     let last_rate = next_funding.checked_sub(1).map(|i| feed.funding[i].1);
                     open[k] = if decision.signal == Signal::Buy {
+                        if timing_blocks(false, rsi_1h, params) {
+                            continue;
+                        }
                         if !venue.funding_allows(false, last_rate) {
                             continue;
                         }
@@ -504,7 +540,8 @@ fn simulate(
                     } else if venue.futures {
                         match kind.evaluate_short(&snap, signal_view, params) {
                             ShortDecision::Enter { stop_loss }
-                                if venue.funding_allows(true, last_rate) =>
+                                if venue.funding_allows(true, last_rate)
+                                    && !timing_blocks(true, rsi_1h, params) =>
                             {
                                 open_position(
                                     true,
@@ -666,6 +703,18 @@ fn effective_stop(pos: &OpenTrade, params: &StrategyParams) -> f64 {
         pos.stop.min(pos.extreme + trail)
     } else {
         pos.stop.max(pos.extreme - trail)
+    }
+}
+
+/// 1h timing: no short into an oversold hour, no long into an overbought one.
+fn timing_blocks(short: bool, rsi_1h: Option<f64>, params: &StrategyParams) -> bool {
+    let (Some(rsi), true) = (rsi_1h, params.entry_rsi_1h > 0.0) else {
+        return false;
+    };
+    if short {
+        rsi < params.entry_rsi_1h
+    } else {
+        rsi > 100.0 - params.entry_rsi_1h
     }
 }
 
@@ -1327,6 +1376,7 @@ mod tests {
             .collect();
         let warmup_end = signal[34].close_time;
         let feed = Feed {
+            hour: Vec::new(),
             trend,
             signal,
             funding: Vec::new(),
@@ -1373,6 +1423,7 @@ mod tests {
             .map(|i| (start + i * FUNDING_INTERVAL_MS, 0.0001))
             .collect();
         Feed {
+            hour: Vec::new(),
             trend,
             signal,
             funding,
@@ -1896,6 +1947,7 @@ mod tests {
             .map(|i| (i * FUNDING_INTERVAL_MS, rng.gen_range(-0.0006..0.0006)))
             .collect();
         Feed {
+            hour: Vec::new(),
             trend,
             signal,
             funding,
@@ -1923,6 +1975,7 @@ mod tests {
             for cut in [400usize, 900, 1_600] {
                 let cutoff = full.signal[cut].close_time;
                 let part = Feed {
+                    hour: Vec::new(),
                     trend: full
                         .trend
                         .iter()
