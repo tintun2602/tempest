@@ -613,7 +613,11 @@ async fn manage_symbol<E: FuturesExchange>(
         stop,
         account.equity,
         account.available,
-        config.risk_per_trade,
+        risk_for_equity(
+            account.equity,
+            config.risk_per_trade,
+            &parse_risk_steps(&std::env::var("RISK_STEPS").unwrap_or_default()),
+        ),
         leverage,
         config.max_open_positions,
         &filters,
@@ -1363,6 +1367,33 @@ async fn lock_position<E: FuturesExchange>(
     Ok(())
 }
 
+/// `RISK_STEPS`: lower risk as the futures equity grows, as
+/// `equity:percent` pairs ("1000:35,2500:30"). Below the first step the risk
+/// is `RISK_PER_TRADE_PCT`; at or above a step, that step's percent. Bad
+/// entries are skipped.
+fn parse_risk_steps(text: &str) -> Vec<(f64, f64)> {
+    let mut steps: Vec<(f64, f64)> = text
+        .split(',')
+        .filter_map(|part| {
+            let (eq, pct) = part.trim().split_once(':')?;
+            let eq = eq.trim().parse::<f64>().ok()?;
+            let pct = pct.trim().parse::<f64>().ok()?;
+            (eq.is_finite() && pct.is_finite() && eq > 0.0 && pct > 0.0 && pct <= 100.0)
+                .then_some((eq, pct / 100.0))
+        })
+        .collect();
+    steps.sort_by(|a, b| a.0.total_cmp(&b.0));
+    steps
+}
+
+fn risk_for_equity(equity: f64, base: f64, steps: &[(f64, f64)]) -> f64 {
+    steps
+        .iter()
+        .rev()
+        .find(|(at, _)| equity >= *at)
+        .map_or(base, |(_, risk)| *risk)
+}
+
 /// 1h timing (`ENTRY_RSI_1H`): no short while the last closed hour's RSI(14)
 /// is under the limit, no long while it is over 100 minus it. The 4h
 /// breakout is checked again next cycle, so a held-back entry can still come.
@@ -2101,6 +2132,17 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ex.log(), vec!["market BUY 0.025", "trigger Stop SELL 1960"]);
+    }
+
+    #[test]
+    fn risk_steps_down_as_the_account_grows() {
+        let steps = parse_risk_steps("2500:30, 1000:35,oops,5000:25");
+        assert_eq!(steps, vec![(1000.0, 0.35), (2500.0, 0.30), (5000.0, 0.25)]);
+        assert_eq!(risk_for_equity(200.0, 0.40, &steps), 0.40);
+        assert_eq!(risk_for_equity(1000.0, 0.40, &steps), 0.35);
+        assert_eq!(risk_for_equity(3000.0, 0.40, &steps), 0.30);
+        assert_eq!(risk_for_equity(9000.0, 0.40, &steps), 0.25);
+        assert_eq!(risk_for_equity(9000.0, 0.40, &[]), 0.40);
     }
 
     #[test]
