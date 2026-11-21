@@ -141,6 +141,10 @@ pub async fn run(config: &Config) {
         );
     }
 
+    if entries_paused() {
+        warn!("PAUSE_ENTRIES=true: no new positions; open ones keep their stops and exits");
+    }
+
     let poll = Duration::from_secs(config.poll_interval_secs);
     let mut last_error = String::new();
     // Retried until it works: a network blip or a key still missing its
@@ -405,7 +409,7 @@ async fn run_cycle<E: FuturesExchange, W: WalletExchange>(
     let mut traded = false;
     for symbol in &config.trading_pairs {
         let pos = positions.iter().find(|p| &p.symbol == symbol);
-        let entries_allowed = !risk.halted && open < config.max_open_positions;
+        let entries_allowed = !risk.halted && !entries_paused() && open < config.max_open_positions;
         match manage_symbol(
             ex,
             config,
@@ -1225,6 +1229,15 @@ async fn move_stop<E: FuturesExchange>(
         ),
     }
     Ok(())
+}
+
+/// `PAUSE_ENTRIES=true`: the owner wants no new positions. Open ones are
+/// still managed (stop, break-even, trail, signal exit) and the wallet rules
+/// still run.
+fn entries_paused() -> bool {
+    std::env::var("PAUSE_ENTRIES")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Round `price` to the tick, up when `up` (a short's stop, a long's target:

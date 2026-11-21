@@ -43,6 +43,7 @@ gets at most a third of the margin (equity / MAX_OPEN_POSITIONS).
 (owner, 2026-11-10; a stop already at or past the entry is left alone).
 `TRAILING_STOP_ATR=2` (owner, 2026-11-20; 3 from 2026-11-19): no fixed target; the stop trails the
 mark at 2 x the trend ATR, tightening only, moved at most every 0.1 ATR.
+`PAUSE_ENTRIES=true` (owner, 2026-11-21): no new positions; open ones are still managed.
 `RISK_PER_TRADE_PCT=30` (owner, 2026-11-14 evening; 20 earlier that day; was 80, which the margin cap held
 at about 58 % of equity per stop).
 
