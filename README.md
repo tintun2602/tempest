@@ -1,8 +1,64 @@
 # Tempest
 
-A Binance swing trading bot.
+A Rust trading bot for Binance USDⓈ-M futures (USDC perpetuals), long and
+short. It trades a 4h breakout in the direction of the daily trend, sizes each
+trade from its stop, and manages the exit with a break-even move, a lock rule
+and a trailing stop. Live settings are in `deploy/hetzner/settings.env`; how
+it runs on the server is in `deploy/hetzner/README.md`.
 
-A Rust-based Binance spot trading bot for swing trading (1-7 day holds). Runs as a persistent polling loop, evaluates technical indicators, enforces strict risk management, and executes trades via the Binance REST API.
+The original spot bot (swing trades with an OCO bracket) is still in the code
+but no longer runs; its rules are under [Spot mode (legacy)](#spot-mode-legacy).
+
+## Live strategy
+
+1. **Signal:** a closed 4h candle below the lowest low of the last 96 candles
+   (16 days) with the price under the daily EMA200 opens a short; above the
+   highest high and over the EMA200 opens a long.
+2. **1h timing** (`ENTRY_RSI_1H=25`): no short while the last closed hour's
+   RSI(14) is under 25, no long while it is over 75; the 4h signal is checked
+   again on the next cycle.
+3. **Size:** the stop sits 1.5 x the daily ATR(14) from the entry, and the
+   size makes a stop-out cost `RISK_PER_TRADE_PCT` of the futures equity,
+   lowered in steps as the account grows (`RISK_STEPS`), capped by margin per
+   open slot (`MAX_OPEN_POSITIONS`).
+4. **Break-even** (`BREAKEVEN_ROI_PCT=100`): at +100 % on margin the stop
+   moves to the entry.
+5. **Lock** (`LOCK_RSI=15`, `LOCK_PCT=50`): with the daily RSI under 15 on a
+   short (over 85 on a long) and the trade in profit, half is sold once.
+6. **Trailing stop** (`TRAILING_STOP_ATR=2`): no fixed target; the stop
+   follows the mark at 2 x ATR and only tightens. The trade also closes when a
+   4h candle breaks the 10-candle range against it.
+7. **Half out** (`SKIM_*`): on a flat account, half of each 100 USDC gained
+   over the base moves to spot.
+
+Each rule went into the lab first (`MODE=lab LAB_MARKET=futures`, two years,
+70 % in sample, 30 % out of sample) and stayed only if it held in both parts.
+Rules that did not hold and stay off: half out at 2R (`PARTIAL_TP_PCT`),
+funding filter (`LAB_FUNDING_MAX`), volume confirmation
+(`ENTRY_VOLUME_MULT`), squeeze filter (`ENTRY_SQUEEZE_BARS`), and three
+other strategies (`donchian`, `ema_cross`, `squeeze`) tested against
+breakout.
+
+### Tested on other markets (2026-11-21)
+
+The live rules (lab stand-in: 10x, risk 30 %, break-even at a 5 % move) on
+USDT perpetuals, which reach back further than USDC. Profit factor is gains
+divided by losses; above 1 makes money.
+
+| Market | Period | In sample PF (trades) | Out of sample PF (trades) |
+|---|---|---|---|
+| BTC, ETH, BNB, XRP | Nov 2024 - Nov 2026 | 1.93 (51) | 3.99 (25) |
+| BTC, ETH, BNB, XRP | Nov 2022 - Nov 2024 | 1.87 (56) | 0.88 (37) |
+| BTC, ETH, BNB, XRP | Nov 2020 - Nov 2022 | 1.42 (44) | 2.43 (13) |
+| 8 altcoins (SOL, DOGE, ADA, LINK, AVAX, LTC, DOT, TRX) | Nov 2024 - Nov 2026 | 0.75 (69) | 2.94 (43) |
+| 8 altcoins | Nov 2022 - Nov 2024 | 0.97 (114) | 1.87 (48) |
+| 8 altcoins | Nov 2020 - Nov 2022 | 0.31 (18) | 0.82 (15) |
+| Gold (PAXG) | Oct 2025 - Nov 2026 | 2.39 (10) | 1.02 (10) |
+
+It makes money on the four majors in five of six periods, and its one losing
+stretch was the sideways second half of 2024. On altcoins it loses as often
+as it wins, so live stays on the majors. Gold barely trades. Trade counts are
+small; treat these as direction, not forecasts.
 
 ## Features
 
@@ -171,8 +227,10 @@ in the lab. The API key needs **Enable Futures**.
 - **Risk:** the daily drawdown halt stops new entries but keeps managing open
   positions. Transfers into and out of the futures wallet are cash flows, not
   P&L.
-- **Not supported:** the trailing stop, hedge mode, more than one position
-  per pair.
+- **Exit management:** break-even, the lock rule and the trailing stop as
+  described under [Live strategy](#live-strategy); with `TRAILING_STOP_ATR`
+  set, entries get no fixed target.
+- **Not supported:** hedge mode, more than one position per pair.
 
 `FUTURES_BASE_URL=https://testnet.binancefuture.com` runs it against Binance's
 futures testnet with testnet keys. Binance refuses futures API access from
@@ -183,7 +241,7 @@ The live loop trades `STRATEGY` if set, otherwise `LIVE_STRATEGY` in
 `src/strategies.rs`. Switching strategies is a reviewed pull request that
 changes that constant.
 
-## Trading Logic
+## Spot mode (legacy)
 
 ### Entry (BUY) — all must be true:
 
