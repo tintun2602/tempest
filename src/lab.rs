@@ -492,6 +492,12 @@ fn simulate(
             let mean = prior.iter().map(|c| c.volume).sum::<f64>() / prior.len().max(1) as f64;
             prior.len() == 20 && bar.volume >= params.entry_volume_mult * mean
         };
+        let volume_ok = volume_ok
+            && (params.entry_squeeze_bars <= 0.0
+                || crate::strategies::recent_squeeze(
+                    signal_view,
+                    params.entry_squeeze_bars as usize,
+                ));
         let rsi_1h = if params.entry_rsi_1h > 0.0 && closed_hour >= 30 {
             let closes: Vec<f64> = feed.hour[closed_hour.saturating_sub(100)..closed_hour]
                 .iter()

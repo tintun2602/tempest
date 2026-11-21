@@ -2361,6 +2361,7 @@ mod tests {
             lock_share: 0.0,
             entry_rsi_1h: 0.0,
             entry_volume_mult: 0.0,
+            entry_squeeze_bars: 0.0,
             ..StrategyParams::default()
         };
         let mut risk = RiskManager::with_risk_per_trade(100.0, 0.02);
@@ -2612,6 +2613,7 @@ mod tests {
             lock_share: 0.0,
             entry_rsi_1h: 0.0,
             entry_volume_mult: 0.0,
+            entry_squeeze_bars: 0.0,
             ..StrategyParams::default()
         };
         let mut risk = RiskManager::with_risk_per_trade(100.0, 0.02);

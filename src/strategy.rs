@@ -90,6 +90,9 @@ pub struct StrategyParams {
     /// Volume confirmation (lab): enter only when the signal bar's volume is
     /// at least this many times the mean of the 20 bars before it. Zero is off.
     pub entry_volume_mult: f64,
+    /// Squeeze filter (lab): enter only when one of this many bars before the
+    /// signal bar was in a Bollinger squeeze. Zero is off.
+    pub entry_squeeze_bars: f64,
 }
 
 /// Buffers used when `ENTRY_BUFFER_ATR` / `EXIT_BUFFER_ATR` are unset. Change
@@ -109,6 +112,7 @@ impl Default for StrategyParams {
             lock_share: 0.0,
             entry_rsi_1h: 0.0,
             entry_volume_mult: 0.0,
+            entry_squeeze_bars: 0.0,
         }
     }
 }
@@ -133,6 +137,7 @@ impl StrategyParams {
             lock_share: (read("LOCK_PCT", 50.0) / 100.0).min(1.0),
             entry_rsi_1h: read("ENTRY_RSI_1H", 0.0).min(50.0),
             entry_volume_mult: read("ENTRY_VOLUME_MULT", 0.0),
+            entry_squeeze_bars: read("ENTRY_SQUEEZE_BARS", 0.0),
         }
     }
 
@@ -636,6 +641,7 @@ mod tests {
             lock_share: 0.0,
             entry_rsi_1h: 0.0,
             entry_volume_mult: 0.0,
+            entry_squeeze_bars: 0.0,
             ..bare()
         };
         // 20x: a 5 % move is 100 % on margin.

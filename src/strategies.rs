@@ -443,6 +443,27 @@ fn bandwidth_at(closes: &[f64], i: usize) -> f64 {
     (up - lo) / mid
 }
 
+/// Squeeze filter (lab): whether any of the `k` bars before the last one had
+/// a Bollinger bandwidth among the lowest `SQUEEZE_PCT` percent of all the
+/// bandwidths `bars` allows. False when there is too little history.
+pub fn recent_squeeze(bars: &[Candle], k: usize) -> bool {
+    let closes: Vec<f64> = bars.iter().map(|c| c.close).collect();
+    let n = closes.len();
+    if k == 0 || n < BB_PERIOD + 40 || n < k + 1 {
+        return false;
+    }
+    let widths: Vec<f64> = (BB_PERIOD - 1..n)
+        .map(|i| bandwidth_at(&closes, i))
+        .collect();
+    let mut sorted = widths.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let cut = sorted[(sorted.len() * SQUEEZE_PCT / 100).min(sorted.len() - 1)];
+    let m = widths.len();
+    widths[m.saturating_sub(k + 1)..m - 1]
+        .iter()
+        .any(|w| *w <= cut)
+}
+
 /// Bands of the last bar plus whether the bar before it was in a squeeze.
 /// `None` until `SQUEEZE_WINDOW` earlier bandwidths exist.
 fn squeeze_state(bars: &[Candle]) -> Option<(bool, (f64, f64, f64))> {
@@ -717,7 +738,9 @@ mod tests {
     }
 
     fn enter(price: f64) -> ShortDecision {
-        ShortDecision::Enter { stop_loss: price + 3.0 }
+        ShortDecision::Enter {
+            stop_loss: price + 3.0,
+        }
     }
 
     // Donchian: 25 flat bars (99-101) then a final bar.
@@ -735,18 +758,33 @@ mod tests {
         // EMA50 below EMA200 blocks the long.
         let mut down = snap(103.0);
         down.ema_50 = 85.0;
-        assert_eq!(eval_long(k, &down, &donchian_bars(103.0)).signal, Signal::Hold);
+        assert_eq!(
+            eval_long(k, &down, &donchian_bars(103.0)).signal,
+            Signal::Hold
+        );
         // Exit below the 10-bar low.
-        assert_eq!(eval_long(k, &snap(97.0), &donchian_bars(97.0)).signal, Signal::Sell);
+        assert_eq!(
+            eval_long(k, &snap(97.0), &donchian_bars(97.0)).signal,
+            Signal::Sell
+        );
         // Short: close under the 20-bar low with EMA50 < EMA200.
         let mut down97 = snap(97.0);
         down97.ema_50 = 85.0;
         assert_eq!(eval_short(k, &down97, &donchian_bars(97.0)), enter(97.0));
         // Uptrend blocks the short; cover above the 10-bar high.
-        assert_eq!(eval_short(k, &snap(97.0), &donchian_bars(97.0)), ShortDecision::Hold);
-        assert_eq!(eval_short(k, &snap(103.0), &donchian_bars(103.0)), ShortDecision::Cover);
+        assert_eq!(
+            eval_short(k, &snap(97.0), &donchian_bars(97.0)),
+            ShortDecision::Hold
+        );
+        assert_eq!(
+            eval_short(k, &snap(103.0), &donchian_bars(103.0)),
+            ShortDecision::Cover
+        );
         // Too few bars.
-        assert_eq!(eval_short(k, &down97, &donchian_bars(97.0)[10..]), ShortDecision::Hold);
+        assert_eq!(
+            eval_short(k, &down97, &donchian_bars(97.0)[10..]),
+            ShortDecision::Hold
+        );
     }
 
     /// Flat 100s, a rally and a fall make EMA20 cross EMA50 on the last bar.
@@ -785,9 +823,8 @@ mod tests {
         under.ema_200 = price + 10.0;
         assert_eq!(eval_long(k, &under, &up).signal, Signal::Hold);
         // Exit while EMA20 < EMA50: the slide before the cross.
-        let slide: Vec<Candle> = closes_to_bars(
-            &(0..60).map(|i| 110.0 - i as f64 * 0.16).collect::<Vec<_>>(),
-        );
+        let slide: Vec<Candle> =
+            closes_to_bars(&(0..60).map(|i| 110.0 - i as f64 * 0.16).collect::<Vec<_>>());
         assert_eq!(eval_long(k, &snap(100.0), &slide).signal, Signal::Sell);
         // Mirror image: cross down, price below EMA200.
         let down = mirror(&up);
@@ -825,7 +862,10 @@ mod tests {
         under.ema_200 = 105.0;
         assert_eq!(eval_long(k, &under, &up).signal, Signal::Hold);
         // Exit below the middle line.
-        assert_eq!(eval_long(k, &snap(99.5), &squeeze_bars(99.5)).signal, Signal::Sell);
+        assert_eq!(
+            eval_long(k, &snap(99.5), &squeeze_bars(99.5)).signal,
+            Signal::Sell
+        );
         // No squeeze (wide bands throughout): no entry.
         let wide: Vec<f64> = (0..100)
             .map(|i| 100.0 + (1.0 + i as f64 * 0.05) * if i % 2 == 0 { 1.0 } else { -1.0 })
@@ -840,6 +880,9 @@ mod tests {
         assert_eq!(eval_short(k, &d, &dn), enter(99.0));
         assert_eq!(eval_short(k, &snap(99.0), &dn), ShortDecision::Hold);
         // Cover above the middle line.
-        assert_eq!(eval_short(k, &snap(100.5), &squeeze_bars(100.5)), ShortDecision::Cover);
+        assert_eq!(
+            eval_short(k, &snap(100.5), &squeeze_bars(100.5)),
+            ShortDecision::Cover
+        );
     }
 }
