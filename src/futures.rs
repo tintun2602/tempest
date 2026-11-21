@@ -589,6 +589,23 @@ async fn manage_symbol<E: FuturesExchange>(
         Action::OpenShort { stop } => (true, stop),
         _ => return Ok(Traded::Nothing),
     };
+    if params.entry_rsi_1h > 0.0 {
+        let mut hours = ex.klines(symbol, "1h", 100).await?;
+        let now = now_ms();
+        hours.retain(|c| c.close_time <= now);
+        let closes: Vec<f64> = hours.iter().map(|c| c.close).collect();
+        let rsi = crate::indicators::rsi(&closes, 14)
+            .last()
+            .copied()
+            .filter(|v| v.is_finite());
+        if let Some(rsi) = rsi.filter(|r| hour_blocks(short, *r, params.entry_rsi_1h)) {
+            info!(
+                "{symbol}: {} signal held back: 1h RSI {rsi:.1} is already at an extreme",
+                if short { "SHORT" } else { "LONG" }
+            );
+            return Ok(Traded::Nothing);
+        }
+    }
     let account = ex.account().await?;
     let plan = match plan_entry(
         short,
@@ -1346,6 +1363,19 @@ async fn lock_position<E: FuturesExchange>(
     Ok(())
 }
 
+/// 1h timing (`ENTRY_RSI_1H`): no short while the last closed hour's RSI(14)
+/// is under the limit, no long while it is over 100 minus it. The 4h
+/// breakout is checked again next cycle, so a held-back entry can still come.
+/// Lab, 2 years, at 25: better on four and ten pairs in and out of sample,
+/// lower drawdowns, a third fewer trades.
+fn hour_blocks(short: bool, rsi_1h: f64, limit: f64) -> bool {
+    if short {
+        rsi_1h < limit
+    } else {
+        rsi_1h > 100.0 - limit
+    }
+}
+
 /// `PAUSE_ENTRIES=true`: the owner wants no new positions. Open ones are
 /// still managed (stop, break-even, trail, signal exit) and the wallet rules
 /// still run.
@@ -2071,6 +2101,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ex.log(), vec!["market BUY 0.025", "trigger Stop SELL 1960"]);
+    }
+
+    #[test]
+    fn the_1h_timing_holds_back_entries_into_an_extreme_hour() {
+        assert!(hour_blocks(true, 20.0, 25.0));
+        assert!(!hour_blocks(true, 30.0, 25.0));
+        assert!(hour_blocks(false, 80.0, 25.0));
+        assert!(!hour_blocks(false, 70.0, 25.0));
     }
 
     #[test]

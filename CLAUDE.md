@@ -46,6 +46,8 @@ mark at 2 x the trend ATR, tightening only, moved at most every 0.1 ATR.
 `PAUSE_ENTRIES=true` (owner, 2026-11-21): no new positions; open ones are still managed.
 `LOCK_RSI=15`, `LOCK_PCT=50` (owner, 2026-11-21): daily RSI under 15 on a short (over 85 on a
 long) with the trade in profit sells half once; remembered in `/var/lib/tempest/lock-state.txt`.
+`ENTRY_RSI_1H=25` (owner, 2026-11-21): no short while the last closed hour's RSI(14) is under 25,
+no long while it is over 75.
 `RISK_PER_TRADE_PCT=30` (owner, 2026-11-14 evening; 20 earlier that day; was 80, which the margin cap held
 at about 58 % of equity per stop).
 
